@@ -1,8 +1,32 @@
 
-# binary files
-*
-!*/
-!*.*
+# ---- runtime outputs / datasets (do not commit) ----
+vp_data/
+realtime_output/
+RaceData/
+logs/
+excepts/
+runs/
+backups/
+config.json
+global_config.json
+*.db
+*.db-wal
+*.db-shm
+
+# ---- model files ----
+*.pt
+*.pth
+*.engine
+*.trt
+*.onnx
+
+# ---- stray temp files in repo root ----
+Good
+Hard
+Next
+Undo
+nul
+Trash
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

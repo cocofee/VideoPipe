@@ -21,6 +21,7 @@ def test_regression_metrics_reports_detection_layers_and_latency():
             "total_ms": 20.0,
         },
         crossing_events=[object(), object()],
+        rejected_candidates=[{"reason": "no_bicycle"}],
     )
 
     report = metrics.to_report()
@@ -31,6 +32,7 @@ def test_regression_metrics_reports_detection_layers_and_latency():
         "validated_track_observations": 2,
         "synthetic_track_observations": 1,
         "crossing_events": 2,
+        "rejected_candidates": 1,
     }
     assert report["latency_ms"]["inference"]["p95"] == 12.0
     assert report["latency_ms"]["postprocess"]["p95"] == 8.0
@@ -146,3 +148,49 @@ def test_save_event_evidence_keeps_ranked_bib_candidates(tmp_path):
 
     assert evidence["bib_candidate_01"].exists()
     assert evidence["fallback_candidate_01"].exists()
+
+
+def test_build_rejected_candidate_record_keeps_audit_fields():
+    candidate = {
+        "track_id": 31,
+        "reason": "no_bicycle",
+        "bbox": [10, 20, 30, 40],
+        "position": [20, 40],
+        "has_bib_box": True,
+    }
+
+    record = regression_report.build_rejected_candidate_record(
+        candidate,
+        rejection_id=4,
+        frame_index=90,
+        media_time=3.0,
+    )
+
+    assert record == {
+        "rejection_id": 4,
+        "track_id": 31,
+        "reason": "no_bicycle",
+        "frame_index": 90,
+        "media_time": 3.0,
+        "has_bib_box": True,
+        "bbox": [10, 20, 30, 40],
+        "position": [20, 40],
+    }
+
+
+def test_save_rejected_candidate_evidence_is_separate_from_events(tmp_path):
+    candidate = {
+        "frame": np.full((24, 32, 3), 20, dtype=np.uint8),
+        "crop": np.full((12, 10, 3), 40, dtype=np.uint8),
+        "bib_crop": np.full((6, 8, 3), 60, dtype=np.uint8),
+    }
+    record = {"rejection_id": 2, "track_id": 31, "frame_index": 90}
+
+    evidence = regression_report.save_rejected_candidate_evidence(
+        candidate,
+        record,
+        tmp_path / "evidence",
+    )
+
+    assert set(evidence) == {"frame", "athlete", "bib"}
+    assert all(path.parent.name == "rejected" for path in evidence.values())

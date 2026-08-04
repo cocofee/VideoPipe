@@ -23,17 +23,24 @@ class RegressionMetrics:
     validated_track_observations: int = 0
     synthetic_track_observations: int = 0
     crossing_events: int = 0
+    rejected_candidates: int = 0
     _inference_ms: List[float] = field(default_factory=list)
     _postprocess_ms: List[float] = field(default_factory=list)
     _total_ms: List[float] = field(default_factory=list)
 
-    def observe_frame(self, frame_metrics: Dict[str, Any], crossing_events: Iterable[Any]) -> None:
+    def observe_frame(
+        self,
+        frame_metrics: Dict[str, Any],
+        crossing_events: Iterable[Any],
+        rejected_candidates: Iterable[Any] = (),
+    ) -> None:
         self.frames_processed += 1
         self.raw_bike_detections += int(frame_metrics.get("raw_bikes", 0) or 0)
         self.raw_bib_detections += int(frame_metrics.get("raw_bibs", 0) or 0)
         self.validated_track_observations += int(frame_metrics.get("validated_tracks", 0) or 0)
         self.synthetic_track_observations += int(frame_metrics.get("synthetic_tracks", 0) or 0)
         self.crossing_events += sum(1 for _ in crossing_events)
+        self.rejected_candidates += sum(1 for _ in rejected_candidates)
         self._inference_ms.append(float(frame_metrics.get("inference_ms", 0.0) or 0.0))
         self._postprocess_ms.append(float(frame_metrics.get("postprocess_ms", 0.0) or 0.0))
         self._total_ms.append(float(frame_metrics.get("total_ms", 0.0) or 0.0))
@@ -65,6 +72,7 @@ class RegressionMetrics:
                 "validated_track_observations": self.validated_track_observations,
                 "synthetic_track_observations": self.synthetic_track_observations,
                 "crossing_events": self.crossing_events,
+                "rejected_candidates": self.rejected_candidates,
             },
             "latency_ms": {
                 "inference": self._latency_summary(self._inference_ms),
@@ -109,6 +117,26 @@ def build_event_record(event: Any, state: Any, frame_index: int, media_time: flo
         "synthetic_kind": getattr(state, "synthetic_kind", None) if state else None,
         "bbox": list(event.bbox),
         "position": list(event.position),
+    }
+
+
+def build_rejected_candidate_record(
+    candidate: Dict[str, Any],
+    rejection_id: int,
+    frame_index: int,
+    media_time: float,
+) -> Dict[str, Any]:
+    """Build a reviewable record without allocating an official event ID."""
+
+    return {
+        "rejection_id": int(rejection_id),
+        "track_id": int(candidate.get("track_id", -1)),
+        "reason": str(candidate.get("reason") or "unknown"),
+        "frame_index": int(frame_index),
+        "media_time": float(media_time),
+        "has_bib_box": bool(candidate.get("has_bib_box", False)),
+        "bbox": list(candidate.get("bbox") or []),
+        "position": list(candidate.get("position") or []),
     }
 
 
@@ -158,6 +186,35 @@ def save_event_evidence(
     return evidence
 
 
+def save_rejected_candidate_evidence(
+    candidate: Dict[str, Any],
+    record: Dict[str, Any],
+    evidence_dir: Path,
+) -> Dict[str, Path]:
+    """Persist rejected evidence separately from official crossing events."""
+
+    import cv2
+
+    output_dir = validate_report_output_path(Path(evidence_dir)) / "rejected"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = (
+        f"rejected_{int(record['rejection_id']):03d}_track_{int(record['track_id'])}"
+        f"_frame_{int(record['frame_index']):06d}"
+    )
+    evidence: Dict[str, Path] = {}
+    for name, image in (
+        ("frame", candidate.get("frame")),
+        ("athlete", candidate.get("crop")),
+        ("bib", candidate.get("bib_crop")),
+    ):
+        if image is None or not hasattr(image, "size") or image.size == 0:
+            continue
+        path = output_dir / f"{stem}_{name}.jpg"
+        if cv2.imwrite(str(path), image):
+            evidence[name] = path
+    return evidence
+
+
 def result_signature(report: Dict[str, Any]) -> str:
     """Hash deterministic detection results while excluding runtime-only fields."""
 
@@ -179,6 +236,23 @@ def result_signature(report: Dict[str, Any]) -> str:
         "events": [
             {key: event.get(key) for key in event_keys if key in event}
             for event in report.get("events", [])
+        ],
+        "rejected_candidates": [
+            {
+                key: candidate.get(key)
+                for key in (
+                    "rejection_id",
+                    "track_id",
+                    "reason",
+                    "frame_index",
+                    "media_time",
+                    "has_bib_box",
+                    "bbox",
+                    "position",
+                )
+                if key in candidate
+            }
+            for candidate in report.get("rejected_candidates", [])
         ],
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -344,6 +418,7 @@ def main() -> int:
     athletes_max = 0
     bibs_sum = 0
     events = []
+    rejected_candidates = []
     regression_metrics = RegressionMetrics()
     evidence_dir = Path(args.evidence_dir) if args.evidence_dir else None
 
@@ -359,7 +434,12 @@ def main() -> int:
             fps=fps,
         )
         crossing_events, athletes, bibs = detector.process_frame(frame, timestamp=video_timestamp)
-        regression_metrics.observe_frame(detector.last_frame_metrics, crossing_events)
+        frame_rejections = list(detector.last_rejected_candidates)
+        regression_metrics.observe_frame(
+            detector.last_frame_metrics,
+            crossing_events,
+            rejected_candidates=frame_rejections,
+        )
 
         athletes_sum += len(athletes)
         athletes_max = max(athletes_max, len(athletes))
@@ -379,6 +459,18 @@ def main() -> int:
                         saved = save_event_evidence(ev, record, evidence_dir, state=state)
                         record["evidence"] = {name: str(path) for name, path in saved.items()}
                     events.append(record)
+
+        for candidate in frame_rejections:
+            record = build_rejected_candidate_record(
+                candidate,
+                rejection_id=len(rejected_candidates) + 1,
+                frame_index=int(args.start_frame) + frames_done,
+                media_time=video_timestamp,
+            )
+            if evidence_dir is not None:
+                saved = save_rejected_candidate_evidence(candidate, record, evidence_dir)
+                record["evidence"] = {name: str(path) for name, path in saved.items()}
+            rejected_candidates.append(record)
 
         frames_done += 1
 
@@ -406,12 +498,14 @@ def main() -> int:
             **metric_report["counts"],
             "events": len(events),
             "events_unique_tracks": len({e["track_id"] for e in events}),
+            "rejected_candidates": len(rejected_candidates),
             "athletes_avg_per_frame": float(round(athletes_sum / max(1, frames_done), 3)),
             "athletes_max_per_frame": int(athletes_max),
             "bibs_avg_per_frame": float(round(bibs_sum / max(1, frames_done), 3)),
         },
         "latency_ms": metric_report["latency_ms"],
         "events": events,
+        "rejected_candidates": rejected_candidates,
     }
     report["result_signature"] = result_signature(report)
 
@@ -430,6 +524,7 @@ def main() -> int:
     print(f"- frames: {frames_done}/{frames_target}")
     print(f"- processing_fps: {proc_fps:.1f}")
     print(f"- events: {report['counts']['events']} (unique_tracks: {report['counts']['events_unique_tracks']})")
+    print(f"- rejected_candidates: {report['counts']['rejected_candidates']}")
     print(f"- athletes_avg_per_frame: {report['counts']['athletes_avg_per_frame']} (max: {athletes_max})")
     print(f"- bibs_avg_per_frame: {report['counts']['bibs_avg_per_frame']}")
     return 0

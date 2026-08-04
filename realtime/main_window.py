@@ -73,6 +73,10 @@ class OCRInitThread(QThread):
 
                 from paddleocr import PaddleOCR
                 try:
+                    from paddleocr import TextRecognition
+                except ImportError:
+                    TextRecognition = None
+                try:
                     import paddle
                     import paddleocr as _paddleocr_mod
                     try:
@@ -91,7 +95,19 @@ class OCRInitThread(QThread):
                     # Paddle 3.3 CPU oneDNN fails on PP-OCRv5 PIR attributes on Windows.
                     enable_mkldnn=False,
                 )
-                adapter = PaddleOcrAdapter(ocr)
+                recognizer = None
+                if TextRecognition is not None:
+                    try:
+                        recognizer = TextRecognition(
+                            model_name="en_PP-OCRv5_mobile_rec",
+                            device="cpu",
+                            enable_mkldnn=False,
+                        )
+                    except Exception as recognition_error:
+                        logger.warning(
+                            f"[OCR-Init] Recognition-only fallback unavailable: {recognition_error}"
+                        )
+                adapter = PaddleOcrAdapter(ocr, recognizer=recognizer)
                 logger.info("[OCR-Init] PaddleOCR 初始化成功 (CPU模式，不影响YOLO实时检测)")
                 self.finished.emit(adapter, "")
             else:

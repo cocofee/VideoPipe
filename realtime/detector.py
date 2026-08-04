@@ -85,7 +85,7 @@ def resolve_performance_profile(
         },
         "laptop": {
             "name": "laptop",
-            "process_imgsz": 640,
+            "process_imgsz": 896,
             "adaptive_frame_skip": True,
         },
     }
@@ -117,15 +117,84 @@ def resolve_performance_profile(
 # ============================================================================
 
 class PaddleOcrAdapter:
-    def __init__(self, ocr):
+    def __init__(self, ocr, recognizer=None):
         self.ocr = ocr
+        self.recognizer = recognizer
+
+    @staticmethod
+    def _parse_paddle_predictions(result):
+        lines = []
+        if result is None:
+            return lines
+
+        for item in result:
+            payload = item
+            if not hasattr(payload, "get"):
+                payload = getattr(item, "json", None)
+                if callable(payload):
+                    payload = payload()
+
+            if hasattr(payload, "get"):
+                nested = payload.get("res")
+                data = nested if hasattr(nested, "get") else payload
+                texts = data.get("rec_texts")
+                scores = data.get("rec_scores")
+                if texts is not None and scores is not None:
+                    for text, conf in zip(texts, scores):
+                        normalized_text = str(text or "").strip()
+                        if normalized_text:
+                            lines.append([None, normalized_text, float(conf)])
+
+                text = str(data.get("rec_text") or "").strip()
+                if text:
+                    lines.append([None, text, float(data.get("rec_score") or 0.0)])
+                continue
+
+            if isinstance(item, list):
+                for sub in item:
+                    if sub and len(sub) >= 2 and isinstance(sub[1], (list, tuple)) and len(sub[1]) >= 2:
+                        text = str(sub[1][0] or "").strip()
+                        if text:
+                            lines.append([sub[0], text, float(sub[1][1])])
+        return lines
 
     def __call__(self, img):
         lines = []
 
+        modern_predict_attempted = False
+        if self.recognizer is not None and hasattr(self.ocr, "predict"):
+            modern_predict_attempted = True
+            try:
+                result = self.ocr.predict(
+                    img,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    text_det_thresh=0.1,
+                    text_det_box_thresh=0.2,
+                    text_det_unclip_ratio=1.5,
+                    text_det_limit_side_len=960,
+                    text_det_limit_type="max",
+                    text_rec_score_thresh=0.0,
+                )
+                lines = self._parse_paddle_predictions(result)
+                if lines:
+                    return lines, 0.0
+            except Exception as e:
+                logger.debug(f"PaddleOCR predict failed, trying recognition-only: {e}")
+
+            try:
+                result = self.recognizer.predict(img, batch_size=1)
+                lines = self._parse_paddle_predictions(result)
+                if lines:
+                    return lines, 0.0
+            except Exception as e:
+                logger.debug(f"PaddleOCR recognition-only failed: {e}")
+
         # ✅ 改进：优先使用 det=True 模式，先定位文字区域再识别
         # 原因：号码牌剪裁图通常包含运动员身体、车架等干扰
-        if hasattr(self.ocr, "ocr"):
+        if not modern_predict_attempted and hasattr(self.ocr, "ocr"):
+            detection_failed = False
             try:
                 # 方案A: 完整检测+识别模式 (更准确，但稍慢)
                 result = self.ocr.ocr(img, det=True, cls=True)
@@ -140,6 +209,7 @@ class PaddleOcrAdapter:
                     if lines:
                         return lines, 0.0
             except Exception as e:
+                detection_failed = True
                 logger.debug(f"PaddleOCR detection mode failed, trying recognition-only: {e}")
 
                 # 方案B: 仅识别模式（快速回退）
@@ -153,8 +223,19 @@ class PaddleOcrAdapter:
                 except Exception as e2:
                     logger.debug(f"PaddleOCR recognition-only also failed: {e2}")
 
+            if not lines and not detection_failed:
+                try:
+                    result = self.ocr.ocr(img, det=False, cls=False)
+                    if result and result[0] and result[0][0]:
+                        text = result[0][0][0]
+                        conf = result[0][0][1]
+                        if text:
+                            return [[None, text, float(conf)]], 0.0
+                except Exception as e2:
+                    logger.debug(f"PaddleOCR recognition-only also failed: {e2}")
+
         # 如果 ocr 方法不可用，尝试 predict 方法（部分 OCR 引擎）
-        if hasattr(self.ocr, "predict"):
+        if not modern_predict_attempted and hasattr(self.ocr, "predict"):
             try:
                 result = self.ocr.predict(
                     img,
@@ -1223,7 +1304,7 @@ class Detector:
                  model: Optional[YOLO] = None, ocr: Optional[Any] = None, ocr_engine: str = "rapidocr",
                  only_numeric: bool = False, realtime_ocr: bool = False,
                  gate_guard_enabled: bool = True, athlete_validator: Optional[Any] = None,
-                 performance_profile: str = "auto"):
+                 performance_profile: str = "auto", sport_profile: str = "cycling"):
         self.model_path = model_path
         self.source_id = source_id
         self._model = model
@@ -1233,8 +1314,15 @@ class Detector:
         self.realtime_ocr_enabled = realtime_ocr # 是否启用实时 OCR
         self.enable_gate_guard = bool(gate_guard_enabled) # 龙门安全模式（抑制龙门/拱门误检）
         self._athlete_validator = athlete_validator
+        normalized_sport_profile = str(sport_profile or "cycling").strip().lower()
+        if normalized_sport_profile != "cycling":
+            raise ValueError(f"Unsupported sport profile in this release: {normalized_sport_profile}")
+        self.sport_profile = normalized_sport_profile
         self.athlete_validator_imgsz = 320
         self.athlete_validator_conf = 0.20
+        self.athlete_validator_min_bicycle_area_ratio = 0.05
+        self.athlete_validator_bicycle_center_x_min = 0.25
+        self.athlete_validator_bicycle_center_x_max = 0.75
         resolved_profile = resolve_performance_profile(performance_profile)
         self.performance_profile = str(resolved_profile["name"])
         self._merged_pairs = set() # 用于减少重复合并日志
@@ -1260,6 +1348,10 @@ class Detector:
         self.detection_conf = 0.08  # 马拉松连续人流：继续提高召回，优先不漏人
         self.iou_threshold = 0.65 if source_id == 0 else 0.60  # 马拉松并排人流：提高NMS阈值，减少互相压框
         self.ocr_conf_threshold = 0.55  # ✅ 优化: 拒绝低质量OCR
+        self.bib_assignment_min_score_margin = 0.05
+        self.ocr_detected_bib_min_width = 40
+        self.ocr_detected_bib_min_height = 32
+        self.ocr_detected_bib_min_quality = 0.55
         self.crossing_direction: Optional[str] = None
         self.cross_confirm_frames = 1          # 过线最少确认帧数（低FPS下避免漏判）
         self.cross_signal_window = 0.45        # 连续过线信号合并窗口（秒）
@@ -1323,6 +1415,7 @@ class Detector:
             "postprocess_ms": 0.0,
             "total_ms": 0.0,
         }
+        self.last_rejected_candidates: List[Dict[str, Any]] = []
         self.max_athletes_per_frame = 24       # 马拉松场景提高上限，避免人群被截断
         self.ocr_queue_limit = 20              # OCR 队列限制，超过则丢弃
         self.process_imgsz = int(resolved_profile["process_imgsz"])
@@ -1581,7 +1674,7 @@ class Detector:
         time_diff: float,
     ) -> bool:
         """Match nested detector boxes only at the final event boundary."""
-        if time_diff < 0.0 or time_diff >= 0.45:
+        if time_diff < 0.0 or time_diff >= 1.20:
             return False
 
         cx1, cy1, cx2, cy2 = [float(value) for value in current_bbox]
@@ -1602,9 +1695,9 @@ class Detector:
         width_ratio = max(current_w, previous_w) / min_w
 
         return (
-            containment >= 0.88
-            and width_ratio <= 1.25
-            and center_dx <= max(12.0, min_w * 0.12)
+            containment >= 0.85
+            and width_ratio <= 1.40
+            and center_dx <= max(16.0, min_w * 0.16)
             and bottom_diff <= max(12.0, min_h * 0.08)
         )
 
@@ -1771,6 +1864,7 @@ class Detector:
 
             best_athlete_idx = None
             best_score = -1.0
+            second_best_score = -1.0
             for athlete_idx, athlete in enumerate(athletes):
                 athlete_bbox = athlete.get('bbox') or []
                 if len(athlete_bbox) != 4:
@@ -1824,10 +1918,20 @@ class Detector:
                     + bib_conf * 0.05
                 )
                 if score > best_score:
+                    second_best_score = best_score
                     best_score = score
                     best_athlete_idx = athlete_idx
+                elif score > second_best_score:
+                    second_best_score = score
 
-            if best_athlete_idx is not None:
+            score_margin = best_score - second_best_score
+            if (
+                best_athlete_idx is not None
+                and (
+                    second_best_score < 0.0
+                    or score_margin >= self.bib_assignment_min_score_margin
+                )
+            ):
                 assignments.setdefault(best_athlete_idx, []).append(bib_idx)
                 unmatched.discard(bib_idx)
 
@@ -3069,8 +3173,11 @@ class Detector:
         """设置龙门安全模式开关"""
         self.enable_gate_guard = bool(enabled)
 
-    def _verify_bicycle_in_crop(self, crop: Optional[np.ndarray]) -> Optional[bool]:
-        """Use the optional event-only validator to confirm bicycle presence."""
+    def _bicycle_evidence_in_crop(
+        self,
+        crop: Optional[np.ndarray],
+    ) -> Optional[Tuple[bool, bool, bool]]:
+        """Return bicycle presence, ownership, and overlapping cycle ambiguity."""
         if self._athlete_validator is None or crop is None or crop.size == 0:
             return None
 
@@ -3084,31 +3191,148 @@ class Detector:
                 device="cpu",
             )
             if not results:
-                return False
+                return False, False, False
 
             result = results[0]
             boxes = getattr(result, "boxes", None)
             class_values = getattr(boxes, "cls", None) if boxes is not None else None
             if class_values is None:
-                return False
+                return False, False, False
             class_ids = class_values.tolist() if hasattr(class_values, "tolist") else list(class_values)
+            xyxy_values = getattr(boxes, "xyxy", None)
+            if xyxy_values is not None:
+                xyxy_values = (
+                    xyxy_values.tolist()
+                    if hasattr(xyxy_values, "tolist")
+                    else list(xyxy_values)
+                )
             names = getattr(result, "names", {}) or {}
+            class_names = []
             for class_id in class_ids:
                 index = int(class_id)
                 name = names.get(index, "") if isinstance(names, dict) else names[index]
-                if str(name).strip().lower() == "bicycle":
-                    return True
-            return False
+                class_names.append(str(name).strip().lower())
+            if xyxy_values is None:
+                has_bicycle = "bicycle" in class_names
+                has_motorcycle = "motorcycle" in class_names
+                return has_bicycle, has_bicycle, has_bicycle and has_motorcycle
+
+            crop_height, crop_width = crop.shape[:2]
+            crop_area = max(1, crop_width * crop_height)
+            has_bicycle = False
+            has_centered_bicycle = False
+            bicycle_boxes: List[List[float]] = []
+            motorcycle_boxes: List[List[float]] = []
+            for box_index, class_id in enumerate(class_ids):
+                index = int(class_id)
+                name = names.get(index, "") if isinstance(names, dict) else names[index]
+                normalized_name = str(name).strip().lower()
+                if normalized_name not in {"bicycle", "motorcycle"}:
+                    continue
+                if box_index >= len(xyxy_values) or len(xyxy_values[box_index]) < 4:
+                    continue
+                x1, y1, x2, y2 = [float(value) for value in xyxy_values[box_index][:4]]
+                clipped_x1 = max(0.0, x1)
+                clipped_y1 = max(0.0, y1)
+                clipped_x2 = min(float(crop_width), x2)
+                clipped_y2 = min(float(crop_height), y2)
+                clipped_width = max(0.0, clipped_x2 - clipped_x1)
+                clipped_height = max(0.0, clipped_y2 - clipped_y1)
+                area_ratio = (clipped_width * clipped_height) / crop_area
+                if area_ratio < self.athlete_validator_min_bicycle_area_ratio:
+                    continue
+
+                clipped_box = [clipped_x1, clipped_y1, clipped_x2, clipped_y2]
+                if normalized_name == "motorcycle":
+                    motorcycle_boxes.append(clipped_box)
+                    continue
+
+                has_bicycle = True
+                bicycle_boxes.append(clipped_box)
+                center_x_ratio = ((clipped_x1 + clipped_x2) * 0.5) / max(1.0, float(crop_width))
+                if (
+                    self.athlete_validator_bicycle_center_x_min
+                    <= center_x_ratio
+                    <= self.athlete_validator_bicycle_center_x_max
+                ):
+                    has_centered_bicycle = True
+
+            has_cycle_ambiguity = has_centered_bicycle and any(
+                bbox_iou(bicycle_box, motorcycle_box) >= 0.50
+                for bicycle_box in bicycle_boxes
+                for motorcycle_box in motorcycle_boxes
+            )
+            return has_bicycle, has_centered_bicycle, has_cycle_ambiguity
         except Exception as exc:
             logger.warning(f"[Detector-{self.source_id}] 运动员二次校验失败，保留事件: {exc}")
             return None
 
-    def _passes_athlete_event_validation(self, state: TrackState, crop: Optional[np.ndarray]) -> bool:
-        """Reject only candidates explicitly shown to have no bicycle."""
-        if state.best_bib or state.has_bib_box:
+    def _verify_bicycle_in_crop(self, crop: Optional[np.ndarray]) -> Optional[bool]:
+        """Use the optional event-only validator to confirm bicycle presence."""
+        evidence = self._bicycle_evidence_in_crop(crop)
+        return evidence[0] if evidence is not None else None
+
+    @staticmethod
+    def _build_athlete_validation_context_crops(
+        frame: Optional[np.ndarray],
+        bbox: List[int],
+    ) -> List[np.ndarray]:
+        """Build wider event-only bicycle evidence from the original frame."""
+        if frame is None or frame.size == 0 or not bbox or len(bbox) != 4:
+            return []
+
+        height, width = frame.shape[:2]
+        x1, y1, x2, y2 = [int(value) for value in bbox]
+        box_width = max(1, x2 - x1)
+        box_height = max(1, y2 - y1)
+        crops: List[np.ndarray] = []
+        for padding_ratio in (0.25, 0.50):
+            pad_x = int(round(box_width * padding_ratio))
+            pad_y = int(round(box_height * padding_ratio))
+            crop = frame[
+                max(0, y1 - pad_y):min(height, y2 + pad_y),
+                max(0, x1 - pad_x):min(width, x2 + pad_x),
+            ].copy()
+            if crop.size > 0:
+                crops.append(crop)
+        return crops
+
+    def _passes_athlete_event_validation(
+        self,
+        state: TrackState,
+        crop: Optional[np.ndarray],
+        context_crops: Optional[List[np.ndarray]] = None,
+        allow_edge_bicycle: bool = False,
+    ) -> bool:
+        """Require owned bicycle evidence while failing open on validator errors."""
+        athlete_evidence = self._bicycle_evidence_in_crop(crop)
+        if athlete_evidence is None:
             return True
-        verdict = self._verify_bicycle_in_crop(crop)
-        return verdict is not False
+        has_bicycle, has_centered_bicycle, has_cycle_ambiguity = athlete_evidence
+        if not has_bicycle:
+            return False
+        if has_cycle_ambiguity:
+            return True
+
+        valid_context_crops = [
+            context_crop
+            for context_crop in (context_crops or [])
+            if context_crop is not None and context_crop.size > 0
+        ]
+        if not valid_context_crops:
+            return True
+
+        for context_crop in valid_context_crops:
+            context_evidence = self._bicycle_evidence_in_crop(context_crop)
+            if context_evidence is None:
+                return True
+            context_has_bicycle, context_has_centered_bicycle, _ = context_evidence
+            if has_centered_bicycle or allow_edge_bicycle:
+                if context_has_bicycle:
+                    return True
+            elif context_has_centered_bicycle:
+                return True
+        return False
 
     def set_crossing_direction(self, direction: Optional[str] = None):
         """设置过线方向"""
@@ -3575,7 +3799,17 @@ class Detector:
     def _get_ocr_candidates(self, state: TrackState) -> List[Tuple[float, np.ndarray, np.ndarray, List[int]]]:
         """Prefer detector-backed bib crops, falling back to continuously refreshed torso crops."""
         if state.bib_crops_cache:
-            return state.bib_crops_cache
+            best_detected = state.bib_crops_cache[0]
+            quality, crop = best_detected[0], best_detected[1]
+            crop_height, crop_width = crop.shape[:2] if crop is not None and crop.size > 0 else (0, 0)
+            detected_is_usable = (
+                crop_width >= self.ocr_detected_bib_min_width
+                and crop_height >= self.ocr_detected_bib_min_height
+                and quality >= self.ocr_detected_bib_min_quality
+            )
+            if detected_is_usable or not state.fallback_bib_crops_cache:
+                return state.bib_crops_cache
+            return [best_detected, state.fallback_bib_crops_cache[0]]
         return state.fallback_bib_crops_cache
 
     def _cache_ocr_candidate(
@@ -3623,6 +3857,7 @@ class Detector:
         """
         处理一帧（增强版）
         """
+        self.last_rejected_candidates = []
         if self._model is None:
             self.last_frame_metrics = {
                 "raw_bikes": 0,
@@ -4965,9 +5200,42 @@ class Detector:
                         crop = data['frame'][max(0, by1-p_pad):min(height, by2+p_pad),
                                            max(0, bx1-p_pad):min(width, bx2+p_pad)].copy()
 
-                    if not self._passes_athlete_event_validation(state, crop):
+                    validation_frame = data.get('frame')
+                    validation_bbox = data.get('bbox') or []
+                    validation_context_crops = self._build_athlete_validation_context_crops(
+                        validation_frame,
+                        validation_bbox,
+                    )
+                    allow_edge_bicycle = False
+                    if validation_frame is not None and len(validation_bbox) == 4:
+                        frame_width = validation_frame.shape[1]
+                        allow_edge_bicycle = (
+                            int(validation_bbox[0]) <= 1
+                            or int(validation_bbox[2]) >= frame_width - 1
+                        )
+                    if not self._passes_athlete_event_validation(
+                        state,
+                        crop,
+                        validation_context_crops,
+                        allow_edge_bicycle=allow_edge_bicycle,
+                    ):
                         state.vlm_is_background = True
                         state.event_emitted = True
+                        rejected_bib_crop = state.best_bib_crop
+                        if rejected_bib_crop is None:
+                            rejected_candidates = self._get_ocr_candidates(state)
+                            if rejected_candidates:
+                                rejected_bib_crop = rejected_candidates[0][1]
+                        self.last_rejected_candidates.append({
+                            "track_id": int(tid),
+                            "reason": "no_bicycle",
+                            "bbox": list(data['bbox']),
+                            "position": list(data['position']),
+                            "has_bib_box": bool(state.has_bib_box),
+                            "frame": data.get('frame'),
+                            "crop": crop,
+                            "bib_crop": rejected_bib_crop,
+                        })
                         logger.info(f"[Detector-{self.source_id}] ID {tid} 未检测到自行车，取消非运动员事件")
                         continue
 

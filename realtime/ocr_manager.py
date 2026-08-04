@@ -225,6 +225,42 @@ class OCRManager:
         if vlm_engine:
             self.vlm = vlm_engine
 
+    def _persist_ocr_resolution(
+        self,
+        event_id: int,
+        bib: Optional[str],
+        conf: float,
+        status: str,
+        evidence_dir: str,
+        notes: str,
+        merged_to: Optional[int] = None,
+    ) -> bool:
+        if merged_to is not None and bib:
+            merge_method = getattr(self.db, 'merge_ocr_duplicate_event', None)
+            if merge_method is not None:
+                merged = merge_method(
+                    duplicate_event_id=int(event_id),
+                    target_event_id=int(merged_to),
+                    bib=bib,
+                    conf=float(conf or 0.0),
+                    ocr_state=status,
+                    evidence_dir=evidence_dir,
+                    notes=notes,
+                    use_ocr_conn=True,
+                )
+                if merged:
+                    return True
+
+        return self.db.update_event_ocr_result(
+            event_id,
+            bib,
+            conf,
+            status,
+            evidence_dir=evidence_dir,
+            notes=notes,
+            use_ocr_conn=True,
+        )
+
     def _calc_progress_current(self) -> int:
         """计算已处理进度（成功 + 待补 + 失败）。"""
         return (
@@ -728,14 +764,14 @@ class OCRManager:
                 crop_applied=False
             )
             
-            self.db.update_event_ocr_result(
-                event_id, 
-                best_bib, 
-                best_conf, 
-                status,
+            self._persist_ocr_resolution(
+                event_id=event_id,
+                bib=best_bib,
+                conf=best_conf,
+                status=status,
                 evidence_dir=str(event_dir),
                 notes=f"Source: {source}. Merged to {merged_to}" if merged_to else f"Source: {source}",
-                use_ocr_conn=True
+                merged_to=merged_to,
             )
             
             if status == "DONE":

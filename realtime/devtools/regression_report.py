@@ -93,16 +93,83 @@ def video_timestamp_seconds(position_ms: float, frame_index: int, fps: float) ->
     return float(frame_index)
 
 
+def build_event_record(event: Any, state: Any, frame_index: int, media_time: float) -> Dict[str, Any]:
+    """Build a deterministic event record with its offline video position."""
+
+    return {
+        "event_id": event.event_id,
+        "track_id": event.track_id,
+        "cross_time": event.cross_time,
+        "cross_realtime": event.cross_realtime,
+        "frame_index": int(frame_index),
+        "media_time": float(media_time),
+        "bib_number": event.bib_number,
+        "bib_status": str(event.bib_status),
+        "has_bib_box": bool(getattr(state, "has_bib_box", False)) if state else False,
+        "synthetic_kind": getattr(state, "synthetic_kind", None) if state else None,
+        "bbox": list(event.bbox),
+        "position": list(event.position),
+    }
+
+
+def save_event_evidence(
+    event: Any,
+    record: Dict[str, Any],
+    evidence_dir: Path,
+    state: Any = None,
+) -> Dict[str, Path]:
+    """Persist the exact frame and crops captured by the crossing event."""
+
+    import cv2
+
+    output_dir = validate_report_output_path(Path(evidence_dir))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = (
+        f"event_{int(record['event_id']):03d}_track_{int(record['track_id'])}"
+        f"_frame_{int(record['frame_index']):06d}"
+    )
+    evidence: Dict[str, Path] = {}
+    for name, image in (
+        ("frame", getattr(event, "frame", None)),
+        ("athlete", getattr(event, "crop", None)),
+        ("bib", getattr(event, "bib_crop", None)),
+    ):
+        if image is None or not hasattr(image, "size") or image.size == 0:
+            continue
+        path = output_dir / f"{stem}_{name}.jpg"
+        if cv2.imwrite(str(path), image):
+            evidence[name] = path
+
+    if state is not None:
+        for prefix, cache in (
+            ("bib_candidate", getattr(state, "bib_crops_cache", [])),
+            ("fallback_candidate", getattr(state, "fallback_bib_crops_cache", [])),
+        ):
+            for index, candidate in enumerate(cache[:4], start=1):
+                if len(candidate) < 2:
+                    continue
+                image = candidate[1]
+                if image is None or not hasattr(image, "size") or image.size == 0:
+                    continue
+                key = f"{prefix}_{index:02d}"
+                path = output_dir / f"{stem}_{key}.jpg"
+                if cv2.imwrite(str(path), image):
+                    evidence[key] = path
+    return evidence
+
+
 def result_signature(report: Dict[str, Any]) -> str:
     """Hash deterministic detection results while excluding runtime-only fields."""
 
     event_keys = (
         "event_id",
         "track_id",
-        "cross_time",
+        "frame_index",
+        "media_time",
         "bib_number",
         "bib_status",
         "has_bib_box",
+        "synthetic_kind",
         "bbox",
         "position",
     )
@@ -171,10 +238,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="VideoPipe regression report (offline video, no parameter changes)")
     parser.add_argument("--video", required=True, help="视频路径")
     parser.add_argument("--model", required=True, help="模型路径（.pt 或 .engine）")
+    parser.add_argument("--validator-model", type=str, default="", help="可选：无号码事件的自行车二次校验模型")
     parser.add_argument("--frames", type=int, default=1800, help="处理帧数（默认 1800 帧 ≈ 60 秒@30fps）")
     parser.add_argument("--start-frame", type=int, default=0, help="起始帧（默认 0）")
     parser.add_argument("--config", type=str, default="", help="可选：config.json 或 config_preset_*.json（用于复用终点线/ROI）")
     parser.add_argument("--out", type=str, default="", help="输出报告 json 路径（默认放到当前目录）")
+    parser.add_argument("--evidence-dir", type=str, default="", help="可选：保存事件原始帧、运动员裁剪和号码牌裁剪")
     parser.add_argument("--verbose", action="store_true", help="打印检测器 INFO 日志")
     args = parser.parse_args()
 
@@ -197,6 +266,11 @@ def main() -> int:
         return 2
     if not model_path.exists():
         print(f"[FAIL] 模型不存在: {model_path}")
+        return 2
+
+    validator_model_path = Path(args.validator_model) if args.validator_model else None
+    if validator_model_path is not None and not validator_model_path.exists():
+        print(f"[FAIL] 二次校验模型不存在: {validator_model_path}")
         return 2
 
     config = None
@@ -222,7 +296,24 @@ def main() -> int:
     dummy = np.zeros((640, 640, 3), dtype=np.uint8)
     yolo.predict(source=dummy, verbose=False)
 
-    detector = Detector(model_path=str(model_path), source_id=0, model=yolo, ocr=None)
+    athlete_validator = None
+    if validator_model_path is not None:
+        athlete_validator = YOLO(str(validator_model_path))
+        athlete_validator.predict(
+            source=np.zeros((320, 320, 3), dtype=np.uint8),
+            imgsz=320,
+            conf=0.20,
+            verbose=False,
+            device="cpu",
+        )
+
+    detector = Detector(
+        model_path=str(model_path),
+        source_id=0,
+        model=yolo,
+        ocr=None,
+        athlete_validator=athlete_validator,
+    )
     detector.realtime_ocr_enabled = False
 
     line_cfg = None
@@ -254,6 +345,7 @@ def main() -> int:
     bibs_sum = 0
     events = []
     regression_metrics = RegressionMetrics()
+    evidence_dir = Path(args.evidence_dir) if args.evidence_dir else None
 
     t0 = time.time()
     while frames_done < frames_target:
@@ -277,19 +369,16 @@ def main() -> int:
             with detector._lock:
                 for ev in crossing_events:
                     state = detector._track_states.get(ev.track_id)
-                    events.append(
-                        {
-                            "event_id": ev.event_id,
-                            "track_id": ev.track_id,
-                            "cross_time": ev.cross_time,
-                            "cross_realtime": ev.cross_realtime,
-                            "bib_number": ev.bib_number,
-                            "bib_status": str(ev.bib_status),
-                            "has_bib_box": bool(getattr(state, "has_bib_box", False)) if state else False,
-                            "bbox": list(ev.bbox),
-                            "position": list(ev.position),
-                        }
+                    record = build_event_record(
+                        ev,
+                        state,
+                        frame_index=int(args.start_frame) + frames_done,
+                        media_time=video_timestamp,
                     )
+                    if evidence_dir is not None:
+                        saved = save_event_evidence(ev, record, evidence_dir, state=state)
+                        record["evidence"] = {name: str(path) for name, path in saved.items()}
+                    events.append(record)
 
         frames_done += 1
 

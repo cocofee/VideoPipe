@@ -42,6 +42,76 @@ except ImportError:
     logger = logging.getLogger("Detector")
 
 
+def resolve_athlete_validator_model(configured_path: str, search_roots: List[Path]) -> Optional[Path]:
+    """Resolve an optional generic bicycle detector without requiring it."""
+    roots = [Path(root).expanduser() for root in search_roots]
+    candidates: List[Path] = []
+    if configured_path:
+        configured = Path(configured_path).expanduser()
+        if configured.is_absolute():
+            candidates.append(configured)
+        else:
+            candidates.extend(root / configured for root in roots)
+            candidates.append(configured)
+    candidates.extend(root / "yolov8s.pt" for root in roots)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def resolve_performance_profile(
+    requested: str = "auto",
+    *,
+    cuda_available: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Resolve detection cost without changing source-frame evidence resolution."""
+    profiles = {
+        "accuracy": {
+            "name": "accuracy",
+            "process_imgsz": 896,
+            "adaptive_frame_skip": False,
+        },
+        "gpu": {
+            "name": "gpu",
+            "process_imgsz": 896,
+            "adaptive_frame_skip": True,
+        },
+        "balanced": {
+            "name": "balanced",
+            "process_imgsz": 768,
+            "adaptive_frame_skip": True,
+        },
+        "laptop": {
+            "name": "laptop",
+            "process_imgsz": 640,
+            "adaptive_frame_skip": True,
+        },
+    }
+    aliases = {
+        "cpu": "laptop",
+        "low_power": "laptop",
+        "low-power": "laptop",
+    }
+    name = aliases.get(str(requested or "auto").strip().lower(), str(requested or "auto").strip().lower())
+
+    if name == "auto":
+        if cuda_available is None:
+            try:
+                import torch
+
+                cuda_available = bool(torch.cuda.is_available())
+            except Exception:
+                cuda_available = False
+        name = "gpu" if cuda_available else "laptop"
+
+    if name not in profiles:
+        logger.warning(f"未知性能档 {requested!r}，回退到自动档")
+        return resolve_performance_profile("auto", cuda_available=cuda_available)
+    return dict(profiles[name])
+
+
 # ============================================================================
 # 数据类定义
 # ============================================================================
@@ -220,6 +290,7 @@ class TrackState:
     # 【新增】高质量截图缓存
     # 存储格式: [(quality_score, crop, frame, bib_bbox), ...]
     bib_crops_cache: List[Tuple[float, np.ndarray, np.ndarray, List[int]]] = field(default_factory=list)
+    fallback_bib_crops_cache: List[Tuple[float, np.ndarray, np.ndarray, List[int]]] = field(default_factory=list)
     max_cache_size: int = 8
     
     # 运动活性检查
@@ -246,6 +317,8 @@ class TrackState:
     # Evidence from bib detector (not OCR).
     has_bib_box: bool = False
     start_line_dist: Optional[float] = None
+    observation_count: int = 0
+    synthetic_kind: str = ""
 
 
 # ============================================================================
@@ -1149,7 +1222,8 @@ class Detector:
     def __init__(self, model_path: str, allow_recross: bool = False, source_id: int = 0,
                  model: Optional[YOLO] = None, ocr: Optional[Any] = None, ocr_engine: str = "rapidocr",
                  only_numeric: bool = False, realtime_ocr: bool = False,
-                 gate_guard_enabled: bool = True):
+                 gate_guard_enabled: bool = True, athlete_validator: Optional[Any] = None,
+                 performance_profile: str = "auto"):
         self.model_path = model_path
         self.source_id = source_id
         self._model = model
@@ -1158,6 +1232,11 @@ class Detector:
         self.only_numeric = only_numeric # 新增：是否仅允许纯数字号码
         self.realtime_ocr_enabled = realtime_ocr # 是否启用实时 OCR
         self.enable_gate_guard = bool(gate_guard_enabled) # 龙门安全模式（抑制龙门/拱门误检）
+        self._athlete_validator = athlete_validator
+        self.athlete_validator_imgsz = 320
+        self.athlete_validator_conf = 0.20
+        resolved_profile = resolve_performance_profile(performance_profile)
+        self.performance_profile = str(resolved_profile["name"])
         self._merged_pairs = set() # 用于减少重复合并日志
 
         self.allow_recross = allow_recross
@@ -1175,7 +1254,7 @@ class Detector:
         # 误判为静态后，只要出现明显位移也会自动恢复，不会长期吞掉真正运动员
         self.enable_static_background_filter = True
         self.enable_semantic_merge = False            # 极限抓人模式：关闭深度语义合并，避免并排吞人
-        self.adaptive_frame_skip = False
+        self.adaptive_frame_skip = bool(resolved_profile["adaptive_frame_skip"])
 
         # ===== 检测参数（优化版）=====
         self.detection_conf = 0.08  # 马拉松连续人流：继续提高召回，优先不漏人
@@ -1246,7 +1325,11 @@ class Detector:
         }
         self.max_athletes_per_frame = 24       # 马拉松场景提高上限，避免人群被截断
         self.ocr_queue_limit = 20              # OCR 队列限制，超过则丢弃
-        self.process_imgsz = 896               # 继续提高分辨率，增强远端与并排人检出
+        self.process_imgsz = int(resolved_profile["process_imgsz"])
+        logger.info(
+            f"[Detector-{self.source_id}] 性能档: {self.performance_profile}, "
+            f"imgsz={self.process_imgsz}, adaptive_skip={self.adaptive_frame_skip}"
+        )
 
         # 抓人优先：提高每帧允许处理的运动员上限，减少“人太多被截断导致漏框”
         # 同时显式设置 OCR 队列上限（历史上这里容易被注释串行影响）
@@ -1478,7 +1561,6 @@ class Detector:
                     min_w = max(1.0, min(curr['bbox'][2] - curr['bbox'][0], other['bbox'][2] - other['bbox'][0]))
                     min_h = max(1.0, min(curr['bbox'][3] - curr['bbox'][1], other['bbox'][3] - other['bbox'][1]))
 
-                    # 更保守：仅“几乎同心同尺寸”的框才做同帧去重，避免并排多人被误并
                     if dx > max(10.0, min_w * 0.18) or dy > max(12.0, min_h * 0.18):
                         continue
 
@@ -1491,6 +1573,40 @@ class Detector:
                             tid_bib_centers.setdefault(tid_curr, []).extend(bibs_to_move)
             deduped.append(curr)
         return deduped
+
+    def _is_duplicate_unknown_event_bbox(
+        self,
+        current_bbox: List[int],
+        previous_bbox: List[int],
+        time_diff: float,
+    ) -> bool:
+        """Match nested detector boxes only at the final event boundary."""
+        if time_diff < 0.0 or time_diff >= 0.45:
+            return False
+
+        cx1, cy1, cx2, cy2 = [float(value) for value in current_bbox]
+        px1, py1, px2, py2 = [float(value) for value in previous_bbox]
+        current_w = max(1.0, cx2 - cx1)
+        current_h = max(1.0, cy2 - cy1)
+        previous_w = max(1.0, px2 - px1)
+        previous_h = max(1.0, py2 - py1)
+        min_w = min(current_w, previous_w)
+        min_h = min(current_h, previous_h)
+
+        intersection_w = max(0.0, min(cx2, px2) - max(cx1, px1))
+        intersection_h = max(0.0, min(cy2, py2) - max(cy1, py1))
+        intersection = intersection_w * intersection_h
+        containment = intersection / max(1.0, min(current_w * current_h, previous_w * previous_h))
+        center_dx = abs((cx1 + cx2 - px1 - px2) * 0.5)
+        bottom_diff = abs(cy2 - py2)
+        width_ratio = max(current_w, previous_w) / min_w
+
+        return (
+            containment >= 0.88
+            and width_ratio <= 1.25
+            and center_dx <= max(12.0, min_w * 0.12)
+            and bottom_diff <= max(12.0, min_h * 0.08)
+        )
 
     # =========================================================================
     # 并排过线判定
@@ -1635,6 +1751,97 @@ class Detector:
     # 号码牌驱动检测补全
     # =========================================================================
     
+    def _assign_bibs_to_athletes(self, athletes: List[dict], bibs: List[dict]) -> Tuple[Dict[int, List[int]], Set[int]]:
+        """Assign each bib detection to at most one physically plausible athlete."""
+        assignments: Dict[int, List[int]] = {}
+        unmatched = set(range(len(bibs)))
+
+        for bib_idx, bib in enumerate(bibs):
+            bib_bbox = bib.get('bbox') or []
+            if len(bib_bbox) != 4:
+                continue
+
+            bx1, by1, bx2, by2 = [float(v) for v in bib_bbox]
+            bib_w = max(1.0, bx2 - bx1)
+            bib_h = max(1.0, by2 - by1)
+            bib_area = bib_w * bib_h
+            bib_cx = float(bib.get('center_x', (bx1 + bx2) * 0.5))
+            bib_cy = float(bib.get('center_y', (by1 + by2) * 0.5))
+            bib_conf = float(bib.get('conf', 0.0) or 0.0)
+
+            best_athlete_idx = None
+            best_score = -1.0
+            for athlete_idx, athlete in enumerate(athletes):
+                athlete_bbox = athlete.get('bbox') or []
+                if len(athlete_bbox) != 4:
+                    continue
+
+                ax1, ay1, ax2, ay2 = [float(v) for v in athlete_bbox]
+                aw = max(1.0, ax2 - ax1)
+                ah = max(1.0, ay2 - ay1)
+
+                if not (ax1 <= bib_cx <= ax2 and ay1 <= bib_cy <= ay2):
+                    continue
+
+                ix1 = max(ax1, bx1)
+                iy1 = max(ay1, by1)
+                ix2 = min(ax2, bx2)
+                iy2 = min(ay2, by2)
+                overlap_ratio = (max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)) / bib_area
+                if overlap_ratio < 0.65:
+                    continue
+
+                rel_x = (bib_cx - ax1) / aw
+                rel_y = (bib_cy - ay1) / ah
+                if rel_y < 0.12 or rel_y > 0.92:
+                    continue
+
+                center_score = max(0.0, 1.0 - abs(rel_x - 0.5) * 2.0)
+                if 0.28 <= rel_y <= 0.86:
+                    vertical_score = 1.0
+                else:
+                    vertical_score = max(0.0, 1.0 - min(abs(rel_y - 0.28), abs(rel_y - 0.86)) * 4.0)
+
+                athlete_cx = float(athlete.get('center_x', (ax1 + ax2) * 0.5))
+                athlete_cy = float(athlete.get('center_y', (ay1 + ay2) * 0.5))
+                normalized_dist = np.hypot(bib_cx - athlete_cx, bib_cy - athlete_cy) / max(aw, ah)
+                distance_score = float(np.exp(-normalized_dist * 3.0))
+
+                history_score = 0.5
+                tid = athlete.get('track_id', -1)
+                with self._lock:
+                    state = self._track_states.get(tid)
+                    if state and state.last_bib_rel_pos:
+                        last_rx, last_ry = state.last_bib_rel_pos
+                        history_score = float(np.exp(-np.hypot(rel_x - last_rx, rel_y - last_ry) * 5.0))
+
+                score = (
+                    overlap_ratio * 0.35
+                    + center_score * 0.20
+                    + vertical_score * 0.15
+                    + distance_score * 0.15
+                    + history_score * 0.10
+                    + bib_conf * 0.05
+                )
+                if score > best_score:
+                    best_score = score
+                    best_athlete_idx = athlete_idx
+
+            if best_athlete_idx is not None:
+                assignments.setdefault(best_athlete_idx, []).append(bib_idx)
+                unmatched.discard(bib_idx)
+
+        return assignments, unmatched
+
+    @staticmethod
+    def _is_event_eligible_athlete(athlete: dict, observation_count: int) -> bool:
+        synthetic_kind = str(athlete.get('synthetic_kind') or '')
+        if not synthetic_kind:
+            return True
+        if synthetic_kind == 'bib_split':
+            return int(observation_count) >= 3
+        return False
+
     def _ensure_athletes_from_bibs(self, athletes: List[dict], bibs: List[dict],
                                     frame_original: np.ndarray, current_time: float) -> List[dict]:
         """号码牌驱动检测：有号码牌的地方一定有运动员 (针对自行车优化)"""
@@ -1646,24 +1853,10 @@ class Detector:
             return athletes
 
         # 先把每个运动员关联到号码牌，再做“一个框多人”拆分
+        assigned_candidates, _ = self._assign_bibs_to_athletes(athletes, bibs)
         matched_bib_indices = set()
         athlete_bib_map: Dict[int, List[int]] = {}
-        for athlete_idx, athlete in enumerate(athletes):
-            ax1, ay1, ax2, ay2 = athlete['bbox']
-            ath_w = max(1, ax2 - ax1)
-            ath_h = max(1, ay2 - ay1)
-
-            h_margin = max(4.0, ath_w * 0.15)
-            v_margin = max(4.0, ath_h * 0.10)
-
-            candidate_indices: List[int] = []
-            for i, bib in enumerate(bibs):
-                bx, by = bib['center_x'], bib['center_y']
-                if (ax1 - h_margin <= bx <= ax2 + h_margin) and (ay1 - v_margin <= by <= ay2 + v_margin):
-                    candidate_indices.append(i)
-
-            if not candidate_indices:
-                continue
+        for athlete_idx, candidate_indices in assigned_candidates.items():
 
             # 去掉同一号码牌的重复检测框，避免把“一个人”拆成多人
             unique_indices: List[int] = []
@@ -1788,9 +1981,10 @@ class Detector:
                     'center_x': (new_bbox[0] + new_bbox[2]) // 2,
                     'center_y': (new_bbox[1] + new_bbox[3]) // 2,
                     'bottom_y': new_bbox[3],
-                    'bib_driven': True,
-                    'split_from_track': base_tid,
-                })
+                'bib_driven': True,
+                'split_from_track': base_tid,
+                'synthetic_kind': 'bib_split',
+            })
 
             if len(generated) >= 2:
                 split_athletes.extend(generated)
@@ -1798,62 +1992,7 @@ class Detector:
             else:
                 split_athletes.append(athlete)
 
-        new_athletes = []
-        for i, bib in enumerate(bibs):
-            if i in matched_bib_indices:
-                continue
-            
-            bx1, by1, bx2, by2 = bib['bbox']
-            bib_h = by2 - by1
-            bib_w = bx2 - bx1
-            
-            # 自行车虚拟运动员尺寸估算
-            estimated_h = int(bib_h * 4.0)
-            estimated_w = int(bib_w * 3.0)
-            
-            cx = (bx1 + bx2) // 2
-            cy_bib = (by1 + by2) // 2
-            
-            # 虚拟框生成：中心对齐，高度大部分在号码牌上方
-            ax1 = max(0, cx - estimated_w // 2)
-            ax2 = min(width, cx + estimated_w // 2)
-            ay1 = max(0, cy_bib - int(estimated_h * 0.7))
-            ay2 = min(height, cy_bib + int(estimated_h * 0.3))
-            
-            new_bbox = [ax1, ay1, ax2, ay2]
-            
-            # 严格去重
-            is_duplicate = False
-            for athlete in split_athletes:
-                if bbox_iou(new_bbox, athlete['bbox']) > 0.2:
-                    is_duplicate = True
-                    break
-            
-            if is_duplicate: continue
-            
-            for new_ath in new_athletes:
-                if bbox_iou(new_bbox, new_ath['bbox']) > 0.2:
-                    is_duplicate = True
-                    break
-            
-            if is_duplicate: continue
-                
-            # 分配可参与过线的稳定ID（正数），避免“有框不刷新”
-            virtual_id = self._allocate_split_track_id(cx, ay2, current_time, (height, width))
-            
-            new_athlete = {
-                'bbox': [ax1, ay1, ax2, ay2],
-                'conf': bib['conf'] * 0.7,
-                'track_id': virtual_id,
-                'center_x': cx,
-                'center_y': (ay1 + ay2) // 2,
-                'bottom_y': ay2,
-                'bib_driven': True
-            }
-            new_athletes.append(new_athlete)
-            logger.debug(f"[Detector] 补全虚拟运动员: ID {virtual_id}")
-        
-        return split_athletes + new_athletes
+        return split_athletes
 
     def _rescue_athletes_from_bibs_forced(self, athletes: List[dict], bibs: List[dict],
                                           frame_shape: Tuple[int, int], current_time: float) -> List[dict]:
@@ -2058,14 +2197,10 @@ class Detector:
             # 1) 有多个号码牌直接拆分
             # 2) 仅1个号码牌但框明显过宽，也允许拆2人
             # 3) 无号码牌时启用几何估算兜底
-            if len(inside_bibs) >= 2:
-                split_n = min(5, max(2, len(inside_bibs)))
-            elif len(inside_bibs) == 1 and bw >= max(120, int(w * 0.14)):
-                split_n = 3 if bw >= max(170, int(w * 0.20)) else 2
-            else:
-                expected_person_w = max(20.0, bh * 0.30)
-                split_n = int(round(bw / expected_person_w))
-                split_n = max(1, min(4, split_n))
+            if len(inside_bibs) < 2:
+                result.append(athlete)
+                continue
+            split_n = min(5, len(inside_bibs))
 
             if split_n < 2:
                 result.append(athlete)
@@ -2103,6 +2238,7 @@ class Detector:
                     'bottom_y': sy2,
                     'bib_text': athlete.get('bib_text', ''),
                     'split_from_track': tid,
+                    'synthetic_kind': 'bib_split',
                 })
 
             if len(generated) < 2:
@@ -2933,6 +3069,47 @@ class Detector:
         """设置龙门安全模式开关"""
         self.enable_gate_guard = bool(enabled)
 
+    def _verify_bicycle_in_crop(self, crop: Optional[np.ndarray]) -> Optional[bool]:
+        """Use the optional event-only validator to confirm bicycle presence."""
+        if self._athlete_validator is None or crop is None or crop.size == 0:
+            return None
+
+        try:
+            results = self._athlete_validator.predict(
+                source=crop,
+                imgsz=self.athlete_validator_imgsz,
+                conf=self.athlete_validator_conf,
+                iou=0.60,
+                verbose=False,
+                device="cpu",
+            )
+            if not results:
+                return False
+
+            result = results[0]
+            boxes = getattr(result, "boxes", None)
+            class_values = getattr(boxes, "cls", None) if boxes is not None else None
+            if class_values is None:
+                return False
+            class_ids = class_values.tolist() if hasattr(class_values, "tolist") else list(class_values)
+            names = getattr(result, "names", {}) or {}
+            for class_id in class_ids:
+                index = int(class_id)
+                name = names.get(index, "") if isinstance(names, dict) else names[index]
+                if str(name).strip().lower() == "bicycle":
+                    return True
+            return False
+        except Exception as exc:
+            logger.warning(f"[Detector-{self.source_id}] 运动员二次校验失败，保留事件: {exc}")
+            return None
+
+    def _passes_athlete_event_validation(self, state: TrackState, crop: Optional[np.ndarray]) -> bool:
+        """Reject only candidates explicitly shown to have no bicycle."""
+        if state.best_bib or state.has_bib_box:
+            return True
+        verdict = self._verify_bicycle_in_crop(crop)
+        return verdict is not False
+
     def set_crossing_direction(self, direction: Optional[str] = None):
         """设置过线方向"""
         self.crossing_direction = direction
@@ -3013,6 +3190,8 @@ class Detector:
                 # 清理bib_crops_cache中的帧引用
                 if hasattr(state, 'bib_crops_cache'):
                     state.bib_crops_cache.clear()
+                if hasattr(state, 'fallback_bib_crops_cache'):
+                    state.fallback_bib_crops_cache.clear()
 
             # 清理
             for tid in stale_ids:
@@ -3219,7 +3398,8 @@ class Detector:
         if not getattr(self, 'realtime_ocr_enabled', True):
             return
 
-        if self._ocr is None or not state.bib_crops_cache:
+        candidates = self._get_ocr_candidates(state)
+        if self._ocr is None or not candidates:
             return
 
         if state.best_bib and state.best_bib_conf >= max(self.ocr_conf_threshold, 0.75):
@@ -3243,7 +3423,7 @@ class Detector:
         setattr(state, '_last_sync_cross_ocr_time', current_time)
         setattr(state, '_sync_cross_ocr_attempts', attempts + 1)
 
-        for quality, bib_crop, frame_ref, bib_bbox in state.bib_crops_cache[:max_candidates]:
+        for quality, bib_crop, frame_ref, bib_bbox in candidates[:max_candidates]:
             if bib_crop is None or bib_crop.size == 0:
                 continue
 
@@ -3371,28 +3551,45 @@ class Detector:
 
     def _calculate_image_quality(self, image: np.ndarray) -> float:
         """
-        计算图像质量评分 (面积 + 清晰度)
+        计算图像质量评分 (字符像素规模 + 面积 + 清晰度)
         """
         if image is None or image.size == 0:
             return 0.0
-            
-        # 1. 面积得分 (基准为 100x100)
+
         h, w = image.shape[:2]
         area = h * w
-        area_score = min(1.0, area / 10000.0)
-        
-        # 2. 清晰度得分 (拉普拉斯方差)
+        width_score = min(1.0, w / 64.0)
+        height_score = min(1.0, h / 48.0)
+        resolution_score = (width_score + height_score) * 0.5
+        area_score = min(1.0, area / 3072.0)
+
         try:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        except:
+        except Exception:
             laplacian_var = 0.0
-            
-        # 清晰度得分归一化：通常 > 100 就算清晰，> 500 非常清晰
-        sharpness_score = min(1.0, laplacian_var / 500.0)
-        
-        # 综合评分：清晰度对 OCR 识别率更关键，权重高于面积
-        return (area_score * 0.3 + sharpness_score * 0.7)
+
+        sharpness_score = min(1.0, laplacian_var / 700.0)
+        return resolution_score * 0.55 + area_score * 0.25 + sharpness_score * 0.20
+
+    def _get_ocr_candidates(self, state: TrackState) -> List[Tuple[float, np.ndarray, np.ndarray, List[int]]]:
+        """Prefer detector-backed bib crops, falling back to continuously refreshed torso crops."""
+        if state.bib_crops_cache:
+            return state.bib_crops_cache
+        return state.fallback_bib_crops_cache
+
+    def _cache_ocr_candidate(
+        self,
+        state: TrackState,
+        candidate: Tuple[float, np.ndarray, np.ndarray, List[int]],
+        *,
+        detected_bib: bool,
+    ) -> None:
+        cache = state.bib_crops_cache if detected_bib else state.fallback_bib_crops_cache
+        cache.append(candidate)
+        cache.sort(key=lambda item: item[0], reverse=True)
+        if len(cache) > state.max_cache_size:
+            del cache[state.max_cache_size:]
 
     def _extract_bib_fallback_from_athlete(self, frame: np.ndarray, athlete_bbox: List[int]) -> Tuple[Optional[np.ndarray], Optional[List[int]]]:
         """当未检出 bib 框时，从运动员框提取躯干区域作为 OCR 兜底输入。"""
@@ -3834,22 +4031,12 @@ class Detector:
             # P0 抓漏兜底（马拉松档）：
             # 1) 当前完全没人框；或
             # 2) 号码牌明显多于人框（允许到中等人数），优先补回并排漏人
-            need_forced_rescue = (len(athletes) == 0 and len(bibs) > 0)
-            if (not need_forced_rescue) and len(athletes) <= 4 and len(bibs) >= (len(athletes) + 1):
-                need_forced_rescue = True
-            if need_forced_rescue:
-                athletes = self._rescue_athletes_from_bibs_forced(
-                    athletes=athletes,
-                    bibs=bibs,
-                    frame_shape=(height, width),
-                    current_time=current_time,
-                )
 
         self._apply_crowd_adaptive_policy(athletes, height, width, current_time)
 
         # 3.5 OCR 兜底：若未检出 bib 框，仍为每个运动员缓存一个躯干候选
         # 注意：即使关闭“实时 OCR”，也要保留这份轻量缓存，供“过线短窗同步 OCR”使用。
-        if self._ocr is not None and athletes:
+        if athletes:
             with self._lock:
                 for athlete in athletes:
                     tid = athlete.get('track_id', -1)
@@ -3868,7 +4055,7 @@ class Detector:
                     state = self._track_states[tid]
                     state.last_seen_time = current_time
 
-                    if state.bib_crops_cache:
+                    if state.has_bib_box:
                         continue
 
                     # bike-only 模型下，避免给龙门/拱门等异常宽框生成 OCR 兜底缓存
@@ -3890,7 +4077,11 @@ class Detector:
 
                     quality = self._calculate_image_quality(fallback_crop)
                     frame_ref = frame_original if athlete['bbox'][3] > int(height * 0.45) else None
-                    state.bib_crops_cache.append((quality, fallback_crop, frame_ref, fallback_bbox))
+                    self._cache_ocr_candidate(
+                        state,
+                        (quality, fallback_crop, frame_ref, fallback_bbox),
+                        detected_bib=False,
+                    )
 
         # 4. 初始化 TrackState 并进行背景检测
         for athlete in athletes:
@@ -3908,6 +4099,8 @@ class Detector:
                     )
                 state = self._track_states[track_id]
                 state.last_seen_time = current_time
+                state.observation_count += 1
+                state.synthetic_kind = str(athlete.get('synthetic_kind') or '')
                 
                 # === 性能优化 4: 背景过滤增强 ===
                 # 在处理前进行背景判定
@@ -3988,118 +4181,51 @@ class Detector:
 
         # 5. 关联 BIB 与运动员，并按需进行 OCR
         tid_bib_centers: Dict[int, List] = {}
-        for bib in bibs:
-            bib_cx, bib_cy = bib['center_x'], bib['center_y']
-            bx1, by1, bx2, by2 = bib['bbox']
-            best_score = -1.0
-            matched_athlete = None
-            
-            for athlete in athletes:
-                ax1, ay1, ax2, ay2 = athlete['bbox']
-                aw, ah = max(1, ax2 - ax1), max(1, ay2 - ay1)
-                dist = np.sqrt((bib_cx - athlete['center_x'])**2 + (bib_cy - athlete['center_y'])**2)
-                
-                # 空间约束：允许号码牌在运动员框外一定范围内 (20像素)
-                if ax1 - 20 <= bib_cx <= ax2 + 20 and ay1 - 20 <= bib_cy <= ay2 + 20:
-                    ix1 = max(ax1, bx1)
-                    iy1 = max(ay1, by1)
-                    ix2 = min(ax2, bx2)
-                    iy2 = min(ay2, by2)
-                    inter_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                    overlap_ratio = inter_area / max(1, (bx2 - bx1) * (by2 - by1))
-                    
-                    # 1. 基础距离得分 (非线性：距离越近提升越快)
-                    # 使用指数衰减，400像素为基准
-                    dist_score = np.exp(-dist / 100.0)
-                    
-                    # 1.5 覆盖率得分 (关键：号码牌必须在运动员框内)
-                    # overlap_ratio 是 inter_area / bib_area
-                    overlap_score = overlap_ratio
-                    
-                    # 2. 相对位置一致性得分
-                    rel_x = (bib_cx - ax1) / aw
-                    rel_y = (bib_cy - ay1) / ah
-                    
-                    # 自行车场景：号码牌可在胸前到车架范围内
-                    # 收紧关联范围，减少并排过线时串号风险
-                    # 上方：允许略微超出框顶（头盔边缘），下方：不超出框底
-                    if rel_y > 1.0 or rel_y < -0.05:
-                        continue
-                        
-                    rel_score = 0.5 # 默认中性分
-                    tid = athlete['track_id']
-                    with self._lock:
-                        state = self._track_states.get(tid)
-                        if state and state.last_bib_rel_pos:
-                            last_rx, last_ry = state.last_bib_rel_pos
-                            # 计算当前相对位置与历史相对位置的偏移
-                            rel_dist = np.sqrt((rel_x - last_rx)**2 + (rel_y - last_ry)**2)
-                            # 历史偏移权重：如果偏移小于 0.1，得分极高
-                            rel_score = np.exp(-rel_dist * 5.0) 
-                            rel_score = max(0.0, rel_score)
-                    
-                    # 3. 忠诚度得分 (增加粘性，防止号码在并排选手间“乱跳”)
-                    loyalty_score = 0.0
-                    if state and state.last_bib_rel_pos:
-                        loyalty_score = 0.6 # 提高忠诚度权重
-                    
-                    # 4. 理想区域得分 (针对自行车场景优化)
-                    center_score = np.exp(-abs(rel_x - 0.5) * 4.0) # 越居中分越高
-                    
-                    # 自行车号码牌可能在胸前 (0.3-0.5) 或车头 (0.6-0.8)
-                    # 使用平顶分布，在 0.3 到 0.8 之间得分都较高
-                    if 0.3 <= rel_y <= 0.85:
-                        vertical_score = 1.0
-                    else:
-                        dist_to_range = min(abs(rel_y - 0.3), abs(rel_y - 0.85))
-                        vertical_score = np.exp(-dist_to_range * 4.0)
-                        
-                    zone_score = (center_score + vertical_score) * 0.5
-                    
-                    # 综合评分：重新分配权重
-                    # 核心是：重叠度(0.3) + 历史一致性(0.3) + 区域合理性(0.2) + 忠诚度(0.1) + 距离(0.1)
-                    current_score = (overlap_score * 0.3 + 
-                                   rel_score * 0.3 + 
-                                   zone_score * 0.2 + 
-                                   loyalty_score * 0.1 + 
-                                   dist_score * 0.1)
-                    
-                    if current_score > best_score:
-                        best_score = current_score
-                        matched_athlete = athlete
-            
-            if matched_athlete:
-                    tid = matched_athlete['track_id']
-                    if tid != -1:
-                        tid_bib_centers.setdefault(tid, []).append((bib_cx, bib_cy, bib['bbox']))
-                        # 更新相对位置记忆，用于下一帧匹配
-                        ax1, ay1, ax2, ay2 = matched_athlete['bbox']
-                        rel_x = (bib_cx - ax1) / max(1, ax2 - ax1)
-                        rel_y = (bib_cy - ay1) / max(1, ay2 - ay1)
-                        with self._lock:
-                            state = self._track_states.get(tid)
-                            if state:
-                                state.last_bib_rel_pos = (rel_x, rel_y)
-                                
-                                # === 性能优化 5: 号码牌截图缓存与质量评分 ===
-                                bx1, by1, bx2, by2 = bib['bbox']
-                                b_pad = 5
-                                b_crop = frame_original[max(0, by1-b_pad):min(height, by2+b_pad),
-                                                         max(0, bx1-b_pad):min(width, bx2+b_pad)].copy()
-                                if b_crop.size > 0:
-                                    quality = self._calculate_image_quality(b_crop)
-                                    # 缓存 (quality, crop, frame_ref, bbox)
-                                    # 注意：为了节省内存，frame 只有在质量足够高或者接近过线时才考虑完整保存，
-                                    # 这里我们先存 crop 和 bbox
-                                    frame_ref = frame_original if (by2 > int(height * 0.45) or quality >= 0.6) else None
-                                    state.bib_crops_cache.append((quality, b_crop, frame_ref, bib['bbox']))
-                                    state.has_bib_box = True
-                                    # 按质量排序并保持容量
-                                    state.bib_crops_cache.sort(key=lambda x: x[0], reverse=True)
-                                    if len(state.bib_crops_cache) > state.max_cache_size:
-                                        state.bib_crops_cache = state.bib_crops_cache[:state.max_cache_size]
+        bib_assignments, unmatched_bib_indices = self._assign_bibs_to_athletes(athletes, bibs)
+        self._last_bib_assign_stats = {
+            "bibs": len(bibs),
+            "assigned": len(bibs) - len(unmatched_bib_indices),
+            "rejected": len(unmatched_bib_indices),
+        }
 
-        # 5.1 同帧运动员合并 (核心：处理并排、虚拟 ID 冲突)
+        for athlete_idx, bib_indices in bib_assignments.items():
+            matched_athlete = athletes[athlete_idx]
+            tid = matched_athlete.get('track_id', -1)
+            if tid == -1:
+                continue
+
+            ax1, ay1, ax2, ay2 = matched_athlete['bbox']
+            for bib_idx in bib_indices:
+                bib = bibs[bib_idx]
+                bib_cx = bib['center_x']
+                bib_cy = bib['center_y']
+                tid_bib_centers.setdefault(tid, []).append((bib_cx, bib_cy, bib['bbox']))
+
+                rel_x = (bib_cx - ax1) / max(1, ax2 - ax1)
+                rel_y = (bib_cy - ay1) / max(1, ay2 - ay1)
+                with self._lock:
+                    state = self._track_states.get(tid)
+                    if not state:
+                        continue
+
+                    state.last_bib_rel_pos = (rel_x, rel_y)
+                    bx1, by1, bx2, by2 = bib['bbox']
+                    b_pad = 5
+                    b_crop = frame_original[
+                        max(0, by1 - b_pad):min(height, by2 + b_pad),
+                        max(0, bx1 - b_pad):min(width, bx2 + b_pad),
+                    ].copy()
+                    if b_crop.size == 0:
+                        continue
+
+                    quality = self._calculate_image_quality(b_crop)
+                    frame_ref = frame_original if (by2 > int(height * 0.45) or quality >= 0.6) else None
+                    self._cache_ocr_candidate(
+                        state,
+                        (quality, b_crop, frame_ref, bib['bbox']),
+                        detected_bib=True,
+                    )
+                    state.has_bib_box = True
         if len(athletes) > 1:
             if HAS_WBF and self.enable_wbf_merge:
                 # 第一阶段：WBF 物理框融合 (仅当 HAS_WBF 为 True)
@@ -4256,7 +4382,7 @@ class Detector:
                         if tid == -1:
                             continue
                         state = self._track_states.get(tid)
-                        if not state or not state.bib_crops_cache:
+                        if not state or not self._get_ocr_candidates(state):
                             continue
                         # 仅近终点才启用兜底异步 OCR，避免远端无效消耗
                         if athlete['bbox'][3] > int(height * 0.45):
@@ -4297,14 +4423,15 @@ class Detector:
                             # 远端，每 3.0s 识别一次
                             should_batch_ocr = (current_time - state.last_ocr_time > 3.0)
                             
-                        if should_batch_ocr and state.bib_crops_cache:
+                        candidates = self._get_ocr_candidates(state)
+                        if should_batch_ocr and candidates:
                             # 从缓存中选出 Top-3 高质量截图提交 (如果队列不拥堵，选 3 张；否则 1 张)
                             num_to_submit = 2 if qsize < 6 else 1
                             if state.crossed:
                                 num_to_submit = 1 if qsize >= 2 else 2
                             
-                            best_crops = state.bib_crops_cache[:num_to_submit]
-                            logger.debug(f"[Detector-{self.source_id}] ID {tid} 提交 {len(best_crops)} 个 OCR 任务 (缓存大小: {len(state.bib_crops_cache)})")
+                            best_crops = candidates[:num_to_submit]
+                            logger.debug(f"[Detector-{self.source_id}] ID {tid} 提交 {len(best_crops)} 个 OCR 任务 (缓存大小: {len(candidates)})")
                             for quality, b_crop, f_ref, b_bbox in best_crops:
                                 try:
                                     # 提交 OCR (注意：不再 copy 整个 frame，增加 quality 分数)
@@ -4329,8 +4456,8 @@ class Detector:
                             if (is_very_near or state.crossed) and state.best_bib_conf < 0.85 and qsize < 15:
                                 vlm_interval = 2.0
                                 if current_time - state.last_vlm_time > vlm_interval and not state.vlm_ocr_pending:
-                                    if state.bib_crops_cache:
-                                        _, best_vlm_crop, _, _ = state.bib_crops_cache[0]
+                                    if candidates:
+                                        _, best_vlm_crop, _, _ = candidates[0]
                                         self._vlm_pipeline.submit_ocr(
                                             tid, best_vlm_crop, self._vlm_athlete_list,
                                             only_numeric=self.only_numeric
@@ -4351,6 +4478,11 @@ class Detector:
                     
                     curr_x, curr_y = athlete['center_x'], athlete['bottom_y']
                     prev_x, prev_y = state.prev_x, state.prev_y
+
+                    if not self._is_event_eligible_athlete(athlete, state.observation_count):
+                        state.prev_x, state.prev_y = curr_x, curr_y
+                        self._update_crossing_vote(state, current_time, has_cross_signal=False)
+                        continue
 
                     if self.enable_gate_guard and self._is_gate_like_bbox(athlete['bbox'], (height, width)):
                         self._update_crossing_vote(state, current_time, has_cross_signal=False)
@@ -4599,12 +4731,13 @@ class Detector:
                     # 等待 OCR 窗口
                     # 如果启用了 VLM 且目前没号码，或者正在等待 VLM 结果，则等待更久
                     time_passed = current_time - state.crossed_time
-                    if self.realtime_ocr_enabled and (not state.best_bib) and state.bib_crops_cache and time_passed >= 0.20:
+                    candidates = self._get_ocr_candidates(state)
+                    if self.realtime_ocr_enabled and (not state.best_bib) and candidates and time_passed >= 0.20:
                         self._try_sync_crossing_ocr(tid, state, current_time)
                     
                     if state.best_bib:
                         wait_window = 0.18
-                    elif state.bib_crops_cache:
+                    elif candidates:
                         wait_window = 1.05
                     else:
                         wait_window = 0.55
@@ -4751,6 +4884,11 @@ class Detector:
 
                             # 4. 极近时间+空间去重 (如果都没有号码，且时间极近)
                             if not curr_bib and not old.get('bib'):
+                                if self._is_duplicate_unknown_event_bbox(curr_bbox, old['bbox'], time_diff):
+                                    is_dup = True
+                                    dup_reason = "unknown_nested_bbox"
+                                    logger.info(f"[Detector-{self.source_id}] ID {tid} UNKNOWN嵌套框重复过线，抑制输出")
+                                    break
                                 # P0防漏：UNKNOWN 场景不再仅凭邻近时空直接吞事件，避免“有框不刷新”
                                 # 仅在“同 tid 且极高重叠”时保守去重
                                 if old.get('tid') == tid and time_diff < 0.45 and giou > 0.90:
@@ -4798,7 +4936,7 @@ class Detector:
 
                     if is_dup and not self.allow_recross:
                         # P0防漏：UNKNOWN被去重时不直接判死，允许后续再次触发
-                        if not curr_bib and not (dup_reason.startswith("same_tid") or dup_reason in {"unknown_same_tid", "unknown_reid_jitter"}):
+                        if not curr_bib and not (dup_reason.startswith("same_tid") or dup_reason in {"unknown_same_tid", "unknown_reid_jitter", "unknown_nested_bbox"}):
                             state.crossed = False
                             state.pending_event_data = None
                             state.cross_signal_count = 0
@@ -4807,9 +4945,6 @@ class Detector:
                             continue
                         state.event_emitted = True
                         continue
-                    
-                    # 生成事件
-                    self._event_id += 1
                     
                     # 确定号码状态 (针对自行车赛优化：高置信度或名单匹配自动通过)
                     if state.best_bib:
@@ -4830,12 +4965,19 @@ class Detector:
                         crop = data['frame'][max(0, by1-p_pad):min(height, by2+p_pad),
                                            max(0, bx1-p_pad):min(width, bx2+p_pad)].copy()
 
+                    if not self._passes_athlete_event_validation(state, crop):
+                        state.vlm_is_background = True
+                        state.event_emitted = True
+                        logger.info(f"[Detector-{self.source_id}] ID {tid} 未检测到自行车，取消非运动员事件")
+                        continue
+
                     # === 选择“最清晰”的 bib 证据截图（不影响检测，只影响保存的 bib.jpg） ===
                     bib_crop_for_save = state.best_bib_crop
                     bib_bbox_for_save = state.best_bib_bbox
                     bib_quality_for_save = float(getattr(state, "best_bib_quality", 0.0) or 0.0)
 
-                    if state.bib_crops_cache:
+                    candidates = self._get_ocr_candidates(state)
+                    if candidates:
                         try:
                             def _first_valid(cache_items, require_frame: bool):
                                 for q, c, frame_ref, bb in cache_items:
@@ -4850,8 +4992,8 @@ class Detector:
                                 return None
 
                             # 优先选“接近过线/质量较高时刻”的缓存（frame_ref 不为 None）
-                            best_near = _first_valid(state.bib_crops_cache, require_frame=True)
-                            best_any = _first_valid(state.bib_crops_cache, require_frame=False)
+                            best_near = _first_valid(candidates, require_frame=True)
+                            best_any = _first_valid(candidates, require_frame=False)
                             best_pick = best_near or best_any
 
                             if best_pick:
@@ -4892,7 +5034,7 @@ class Detector:
                     cross_dt = datetime.fromtimestamp(cross_unix)
 
                     event = CrossingEvent(
-                        event_id=self._event_id,
+                        event_id=self._event_id + 1,
                         rank=0,
                         track_id=tid,
                         cross_time=cross_unix,
@@ -4940,6 +5082,7 @@ class Detector:
                         if suppress_virtual_dup:
                             continue
 
+                    self._event_id = event.event_id
                     crossing_events.append(event)
                     state.event_emitted = True
                     

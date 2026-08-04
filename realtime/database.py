@@ -669,6 +669,130 @@ class Database:
         logger.error(f"[Database] 更新 OCR 结果失败 {event_id}: database locked")
         return False
 
+    def merge_ocr_duplicate_event(
+        self,
+        duplicate_event_id: int,
+        target_event_id: int,
+        bib: str,
+        conf: float,
+        ocr_state: str,
+        evidence_dir: str = "",
+        notes: str = "",
+        use_ocr_conn: bool = False,
+    ) -> bool:
+        """Merge an OCR-confirmed duplicate while preserving its evidence."""
+        if int(duplicate_event_id) == int(target_event_id):
+            return False
+
+        bib_norm = self._normalize_bib(bib)
+        if not bib_norm:
+            return False
+
+        lock = self._ocr_lock if use_ocr_conn else self._lock
+        conn = self._get_ocr_conn() if use_ocr_conn else self._get_conn()
+
+        for attempt in range(6):
+            with lock:
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT * FROM crossing_events WHERE event_id IN (?, ?)",
+                        (int(target_event_id), int(duplicate_event_id)),
+                    )
+                    rows = {int(row["event_id"]): dict(row) for row in cursor.fetchall()}
+                    target = rows.get(int(target_event_id))
+                    duplicate = rows.get(int(duplicate_event_id))
+                    if not target or not duplicate or int(target.get("is_void") or 0) != 0:
+                        return False
+
+                    try:
+                        target_conf = float(target.get("bib_confidence") or 0.0)
+                    except (TypeError, ValueError):
+                        target_conf = 0.0
+                    merged_conf = max(target_conf, float(conf or 0.0))
+                    bib_status = "recognized" if merged_conf >= 0.4 else "needs_review"
+                    now = datetime.now().isoformat()
+
+                    target_notes = str(target.get("notes") or "").strip()
+                    merge_note = f"MERGED_FROM:{int(duplicate_event_id)}"
+                    target_note_parts = [part for part in (target_notes, notes, merge_note) if part]
+                    merged_target_notes = " ".join(target_note_parts)
+
+                    def prefer_target(field: str):
+                        return target.get(field) or duplicate.get(field) or ""
+
+                    cursor.execute(
+                        '''
+                        UPDATE crossing_events
+                        SET bib_number = ?, original_bib = COALESCE(NULLIF(original_bib, ''), ?),
+                            bib_confidence = ?, bib_status = ?, ocr_state = ?,
+                            screenshot_full = ?, screenshot_clean = ?, screenshot_crop = ?, screenshot_bib = ?,
+                            evidence_dir = ?, modified_at = ?, notes = ?
+                        WHERE event_id = ?
+                        ''',
+                        (
+                            bib_norm,
+                            bib_norm,
+                            merged_conf,
+                            bib_status,
+                            ocr_state,
+                            prefer_target("screenshot_full"),
+                            prefer_target("screenshot_clean"),
+                            prefer_target("screenshot_crop"),
+                            prefer_target("screenshot_bib"),
+                            target.get("evidence_dir") or evidence_dir or duplicate.get("evidence_dir") or "",
+                            now,
+                            merged_target_notes,
+                            int(target_event_id),
+                        ),
+                    )
+
+                    cursor.execute(
+                        "UPDATE event_evidences SET event_id = ? WHERE event_id = ?",
+                        (int(target_event_id), int(duplicate_event_id)),
+                    )
+
+                    duplicate_notes = str(duplicate.get("notes") or "").strip()
+                    duplicate_merge_note = f"MERGED_TO:{int(target_event_id)}"
+                    if duplicate_merge_note not in duplicate_notes:
+                        duplicate_notes = f"{duplicate_notes} {duplicate_merge_note}".strip()
+                    cursor.execute(
+                        '''
+                        UPDATE crossing_events
+                        SET bib_number = ?, bib_confidence = ?, bib_status = ?, ocr_state = ?,
+                            is_void = 1, modified_at = ?, notes = ?
+                        WHERE event_id = ?
+                        ''',
+                        (
+                            bib_norm,
+                            float(conf or 0.0),
+                            bib_status,
+                            ocr_state,
+                            now,
+                            duplicate_notes,
+                            int(duplicate_event_id),
+                        ),
+                    )
+                    conn.commit()
+                    return True
+                except sqlite3.OperationalError as e:
+                    conn.rollback()
+                    if "locked" not in str(e).lower() and "busy" not in str(e).lower():
+                        logger.error(f"[Database] OCR duplicate merge failed: {e}")
+                        return False
+                except Exception as e:
+                    conn.rollback()
+                    logger.error(f"[Database] OCR duplicate merge failed: {e}")
+                    return False
+
+            time.sleep(min(0.5, 0.05 * (2 ** attempt)))
+
+        logger.error(
+            f"[Database] OCR duplicate merge failed: database locked, "
+            f"duplicate={duplicate_event_id}, target={target_event_id}"
+        )
+        return False
+
     def get_event_by_id(self, event_id: int) -> Optional[Dict[str, Any]]:
         """获取单个事件（关联选手和芯片成绩）"""
         with self._lock:

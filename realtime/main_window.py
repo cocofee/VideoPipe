@@ -88,6 +88,8 @@ class OCRInitThread(QThread):
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
                     text_rec_score_thresh=0.0,
+                    # Paddle 3.3 CPU oneDNN fails on PP-OCRv5 PIR attributes on Windows.
+                    enable_mkldnn=False,
                 )
                 adapter = PaddleOcrAdapter(ocr)
                 logger.info("[OCR-Init] PaddleOCR 初始化成功 (CPU模式，不影响YOLO实时检测)")
@@ -117,7 +119,7 @@ except ImportError:
 # 支持直接运行和作为模块运行
 try:
     from .stream_reader import StreamReader, StreamStatus
-    from .detector import Detector, CrossingEvent, PaddleOcrAdapter
+    from .detector import Detector, CrossingEvent, PaddleOcrAdapter, resolve_athlete_validator_model
     from .database import Database
     from .event_recorder import EventRecorder
     from .event_list_widget import EventListWidget
@@ -132,7 +134,7 @@ except ImportError:
         sys.path.insert(0, current_dir)
     
     from stream_reader import StreamReader, StreamStatus
-    from detector import Detector, CrossingEvent, PaddleOcrAdapter
+    from detector import Detector, CrossingEvent, PaddleOcrAdapter, resolve_athlete_validator_model
     from database import Database
     from event_recorder import EventRecorder
     from event_list_widget import EventListWidget
@@ -2071,6 +2073,8 @@ class MainWindow(QMainWindow):
         self.finish_line_checkboxes = {} # source_id -> QCheckBox
         
         self.shared_model = None  # 共享 YOLO 模型
+        self.shared_athlete_validator = None  # 仅在无号码事件落库前确认自行车
+        self._athlete_validator_checked = False
         self.shared_ocr = None    # 共享 OCR 引擎
         self.shared_vlm = None    # 共享 VLM 助手
         self._ocr_runtime_state = 'idle'  # idle/loading/ready/failed
@@ -3079,6 +3083,42 @@ class MainWindow(QMainWindow):
         status = "启用" if is_enabled else "禁用"
         self.statusBar().showMessage(f"机位 {source_id+1} 终点线已{status}")
 
+    def _init_shared_athlete_validator(self):
+        """Load the optional event-only bicycle validator on CPU."""
+        if self._athlete_validator_checked:
+            return
+        self._athlete_validator_checked = True
+
+        if not bool(self.config.get("athlete_validator_enabled", True)):
+            logger.info("[Main] 运动员二次校验已禁用")
+            return
+
+        validator_path = resolve_athlete_validator_model(
+            str(self.config.get("athlete_validator_model_path") or ""),
+            [Path.cwd(), Path(__file__).resolve().parent.parent],
+        )
+        if validator_path is None:
+            logger.warning("[Main] 未找到 yolov8s.pt，非号码事件将保持原有放行策略")
+            return
+
+        try:
+            from ultralytics import YOLO
+            import numpy as np
+
+            validator = YOLO(str(validator_path))
+            validator.predict(
+                source=np.zeros((320, 320, 3), dtype=np.uint8),
+                imgsz=320,
+                conf=0.20,
+                verbose=False,
+                device="cpu",
+            )
+            self.shared_athlete_validator = validator
+            logger.info(f"[Main] 运动员二次校验模型已就绪: {validator_path.name} (CPU, event-only)")
+        except Exception as exc:
+            self.shared_athlete_validator = None
+            logger.warning(f"[Main] 运动员二次校验模型加载失败，保持原有放行策略: {exc}")
+
     def _init_shared_ocr(self):
         """后台异步初始化 OCR"""
         if hasattr(self, 'ocr_init_thread') and self.ocr_init_thread and self.ocr_init_thread.isRunning():
@@ -4018,6 +4058,8 @@ class MainWindow(QMainWindow):
                 dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
                 self.shared_model.predict(source=dummy_frame, verbose=False)
                 logger.info("[Main] YOLO 模型预热完成")
+
+            self._init_shared_athlete_validator()
             
             if not self.shared_ocr:
                 self._init_shared_ocr()
@@ -4043,7 +4085,9 @@ class MainWindow(QMainWindow):
                     ocr_engine=self.ocr_engine,
                     only_numeric=self.numeric_only_checkbox.isChecked(),
                     realtime_ocr=(False if self._is_wave_mode_active() else self.realtime_ocr_checkbox.isChecked()),
-                    gate_guard_enabled=bool(self._gate_guard_enabled)
+                    gate_guard_enabled=bool(self._gate_guard_enabled),
+                    athlete_validator=self.shared_athlete_validator,
+                    performance_profile=str(self.config.get("performance_profile") or "auto"),
                 )
                 detector.ensure_ocr()
                 
@@ -4438,7 +4482,9 @@ class MainWindow(QMainWindow):
                     ocr_engine=self.ocr_engine,
                     only_numeric=self.numeric_only_checkbox.isChecked(),
                     realtime_ocr=(False if self._is_wave_mode_active() else self.realtime_ocr_checkbox.isChecked()),
-                    gate_guard_enabled=bool(self._gate_guard_enabled)
+                    gate_guard_enabled=bool(self._gate_guard_enabled),
+                    athlete_validator=self.shared_athlete_validator,
+                    performance_profile=str(self.config.get("performance_profile") or "auto"),
                 )
                 if i == 0:
                     detector.set_finish_line(self.line_pt1, self.line_pt2)

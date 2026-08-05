@@ -1,4 +1,5 @@
 from realtime.main_window import VideoThread
+from realtime.stream_reader import StreamStatus
 
 
 class _Reader:
@@ -37,3 +38,26 @@ def test_video_thread_requests_only_frames_newer_than_last_timestamp():
 
     assert reader.after_calls == [0.0]
     assert reader.legacy_calls == 0
+
+
+class _EndedReader:
+    status = StreamStatus.ENDED
+
+    def set_on_status_change(self, callback):
+        self.status_callback = callback
+
+    def get_frame_after(self, timestamp):
+        return None, timestamp
+
+
+def test_video_thread_exits_when_local_video_reaches_eof():
+    reader = _EndedReader()
+    detector = _Detector()
+    thread = VideoThread(reader, detector, ui_skip=99)
+
+    thread.start()
+    try:
+        assert thread.wait(500) is True
+    finally:
+        if thread.isRunning():
+            thread.stop()

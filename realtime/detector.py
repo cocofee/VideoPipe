@@ -42,6 +42,9 @@ except ImportError:
     logger = logging.getLogger("Detector")
 
 
+LOCAL_VIDEO_EVENT_SETTLE_SECONDS = 0.85
+
+
 def resolve_athlete_validator_model(configured_path: str, search_roots: List[Path]) -> Optional[Path]:
     """Resolve an optional generic bicycle detector without requiring it."""
     roots = [Path(root).expanduser() for root in search_roots]
@@ -158,6 +161,28 @@ class PaddleOcrAdapter:
                             lines.append([sub[0], text, float(sub[1][1])])
         return lines
 
+    def recognize_only(self, img):
+        """Run whole-image text recognition without the text detector."""
+        if self.recognizer is not None:
+            try:
+                result = self.recognizer.predict(img, batch_size=1)
+                return self._parse_paddle_predictions(result), 0.0
+            except Exception as e:
+                logger.debug(f"PaddleOCR explicit recognition-only failed: {e}")
+
+        if hasattr(self.ocr, "ocr"):
+            try:
+                result = self.ocr.ocr(img, det=False, cls=False)
+                if result and result[0] and result[0][0]:
+                    text = result[0][0][0]
+                    conf = result[0][0][1]
+                    if text:
+                        return [[None, text, float(conf)]], 0.0
+            except Exception as e:
+                logger.debug(f"PaddleOCR legacy recognition-only failed: {e}")
+
+        return [], 0.0
+
     def __call__(self, img):
         lines = []
 
@@ -184,8 +209,7 @@ class PaddleOcrAdapter:
                 logger.debug(f"PaddleOCR predict failed, trying recognition-only: {e}")
 
             try:
-                result = self.recognizer.predict(img, batch_size=1)
-                lines = self._parse_paddle_predictions(result)
+                lines, _ = self.recognize_only(img)
                 if lines:
                     return lines, 0.0
             except Exception as e:
@@ -335,6 +359,8 @@ class CrossingEvent:
     crop: Optional[np.ndarray] = None
     bib_crop: Optional[np.ndarray] = None
     bib_bbox: Optional[List[int]] = None # 新增：号码牌框
+    bib_evidence_kind: str = ""
+    bib_candidates: List[Tuple[float, np.ndarray, List[int]]] = field(default_factory=list)
     quality_score: float = 0.0 # 新增：质量分
     is_update_only: bool = False # 新增：标记为仅更新截图数据
     is_info_update: bool = False # 新增：标记为仅更新文本/状态信息
@@ -1304,7 +1330,8 @@ class Detector:
                  model: Optional[YOLO] = None, ocr: Optional[Any] = None, ocr_engine: str = "rapidocr",
                  only_numeric: bool = False, realtime_ocr: bool = False,
                  gate_guard_enabled: bool = True, athlete_validator: Optional[Any] = None,
-                 performance_profile: str = "auto", sport_profile: str = "cycling"):
+                 performance_profile: str = "auto", sport_profile: str = "cycling",
+                 event_settle_seconds: Optional[float] = None):
         self.model_path = model_path
         self.source_id = source_id
         self._model = model
@@ -1318,6 +1345,9 @@ class Detector:
         if normalized_sport_profile != "cycling":
             raise ValueError(f"Unsupported sport profile in this release: {normalized_sport_profile}")
         self.sport_profile = normalized_sport_profile
+        self.event_settle_seconds = (
+            None if event_settle_seconds is None else max(0.0, float(event_settle_seconds))
+        )
         self.athlete_validator_imgsz = 320
         self.athlete_validator_conf = 0.20
         self.athlete_validator_min_bicycle_area_ratio = 0.05
@@ -1352,6 +1382,8 @@ class Detector:
         self.ocr_detected_bib_min_width = 40
         self.ocr_detected_bib_min_height = 32
         self.ocr_detected_bib_min_quality = 0.55
+        self.bib_candidate_max_aspect = 2.20
+        self.bib_cache_max_median_aspect = 2.05
         self.crossing_direction: Optional[str] = None
         self.cross_confirm_frames = 1          # 过线最少确认帧数（低FPS下避免漏判）
         self.cross_signal_window = 0.45        # 连续过线信号合并窗口（秒）
@@ -1477,6 +1509,9 @@ class Detector:
 
         # 线程锁
         self._lock = threading.RLock()
+        self._raw_model_boxes: List[Tuple[int, float, List[float]]] = []
+        self._raw_detection_capture_registered = False
+        self._register_raw_detection_capture()
 
         # 选手名单
         self._athlete_list: set = set()
@@ -1509,6 +1544,37 @@ class Detector:
 
         if self._ocr is not None:
             self.start_ocr_worker()
+
+    def _register_raw_detection_capture(self) -> None:
+        """Keep raw detections before tracking drops fast, small BIB boxes."""
+        add_callback = getattr(self._model, "add_callback", None)
+        if not callable(add_callback):
+            return
+        try:
+            add_callback("on_predict_postprocess_end", self._capture_raw_model_boxes)
+            self._raw_detection_capture_registered = True
+        except Exception as exc:
+            logger.debug(f"[Detector-{self.source_id}] Raw detection capture unavailable: {exc}")
+
+    def _capture_raw_model_boxes(self, predictor: Any) -> None:
+        captured: List[Tuple[int, float, List[float]]] = []
+        try:
+            for result in getattr(predictor, "results", []) or []:
+                boxes = getattr(result, "boxes", None)
+                if boxes is None:
+                    continue
+                for index in range(len(boxes)):
+                    cls_value = boxes.cls[index]
+                    conf_value = boxes.conf[index]
+                    xyxy_value = boxes.xyxy[index]
+                    cls_id = int(cls_value.item()) if hasattr(cls_value, "item") else int(cls_value)
+                    confidence = float(conf_value.item()) if hasattr(conf_value, "item") else float(conf_value)
+                    xyxy = xyxy_value.tolist() if hasattr(xyxy_value, "tolist") else list(xyxy_value)
+                    captured.append((cls_id, confidence, [float(value) for value in xyxy]))
+        except Exception as exc:
+            logger.debug(f"[Detector-{self.source_id}] Raw detection capture failed: {exc}")
+            captured = []
+        self._raw_model_boxes = captured
 
     # =========================================================================
     # VLM 配置
@@ -1672,8 +1738,15 @@ class Detector:
         current_bbox: List[int],
         previous_bbox: List[int],
         time_diff: float,
+        current_bib_evidence_kind: str = "",
+        previous_bib_evidence_kind: str = "",
     ) -> bool:
         """Match nested detector boxes only at the final event boundary."""
+        if "detected" in {
+            str(current_bib_evidence_kind or "").strip().lower(),
+            str(previous_bib_evidence_kind or "").strip().lower(),
+        }:
+            return False
         if time_diff < 0.0 or time_diff >= 1.20:
             return False
 
@@ -3796,10 +3869,40 @@ class Detector:
         sharpness_score = min(1.0, laplacian_var / 700.0)
         return resolution_score * 0.55 + area_score * 0.25 + sharpness_score * 0.20
 
+    def _get_plausible_detected_bib_candidates(
+        self,
+        state: TrackState,
+    ) -> List[Tuple[float, np.ndarray, np.ndarray, List[int]]]:
+        candidates = []
+        aspects = []
+        for candidate in state.bib_crops_cache:
+            if len(candidate) < 4:
+                continue
+            _, crop, _, bbox = candidate
+            if crop is None or not isinstance(crop, np.ndarray) or crop.size == 0:
+                continue
+            if not bbox or len(bbox) != 4:
+                continue
+            width = max(1.0, float(bbox[2]) - float(bbox[0]))
+            height = max(1.0, float(bbox[3]) - float(bbox[1]))
+            aspect = width / height
+            aspects.append(aspect)
+            candidates.append((candidate, aspect))
+
+        if len(aspects) >= 3 and float(np.median(aspects)) > self.bib_cache_max_median_aspect:
+            return []
+
+        return [
+            candidate
+            for candidate, aspect in candidates
+            if aspect <= self.bib_candidate_max_aspect
+        ]
+
     def _get_ocr_candidates(self, state: TrackState) -> List[Tuple[float, np.ndarray, np.ndarray, List[int]]]:
         """Prefer detector-backed bib crops, falling back to continuously refreshed torso crops."""
-        if state.bib_crops_cache:
-            best_detected = state.bib_crops_cache[0]
+        detected_candidates = self._get_plausible_detected_bib_candidates(state)
+        if detected_candidates:
+            best_detected = detected_candidates[0]
             quality, crop = best_detected[0], best_detected[1]
             crop_height, crop_width = crop.shape[:2] if crop is not None and crop.size > 0 else (0, 0)
             detected_is_usable = (
@@ -3808,7 +3911,7 @@ class Detector:
                 and quality >= self.ocr_detected_bib_min_quality
             )
             if detected_is_usable or not state.fallback_bib_crops_cache:
-                return state.bib_crops_cache
+                return detected_candidates
             return [best_detected, state.fallback_bib_crops_cache[0]]
         return state.fallback_bib_crops_cache
 
@@ -3964,6 +4067,7 @@ class Detector:
             "augment": False,
             "imgsz": self.process_imgsz,  # 使用配置的尺寸
         }
+        self._raw_model_boxes = []
         try:
             _t0 = time.time()
             results = self._model.track(infer_frame, **track_kwargs)
@@ -4042,6 +4146,21 @@ class Detector:
                     box_id = result.boxes.id[i]
                     track_i = int(box_id.item()) if hasattr(box_id, 'item') else int(box_id)
                 all_boxes.append((cls_i, conf_i, xyxy_i, track_i))
+
+        if self._raw_model_boxes:
+            all_boxes = [box for box in all_boxes if int(box[0]) not in self.bib_class_ids]
+            for cls_i, conf_i, xyxy_i in self._raw_model_boxes:
+                if int(cls_i) not in self.bib_class_ids:
+                    continue
+                raw_xyxy = list(xyxy_i)
+                if infer_offset_x or infer_offset_y:
+                    raw_xyxy = [
+                        raw_xyxy[0] + infer_offset_x,
+                        raw_xyxy[1] + infer_offset_y,
+                        raw_xyxy[2] + infer_offset_x,
+                        raw_xyxy[3] + infer_offset_y,
+                    ]
+                all_boxes.append((int(cls_i), float(conf_i), raw_xyxy, None))
         
         present_class_ids = {int(cls) for cls, _, _, _ in all_boxes}
         runtime_person_class_ids = set(self.person_class_ids)
@@ -4970,7 +5089,9 @@ class Detector:
                     if self.realtime_ocr_enabled and (not state.best_bib) and candidates and time_passed >= 0.20:
                         self._try_sync_crossing_ocr(tid, state, current_time)
                     
-                    if state.best_bib:
+                    if self.event_settle_seconds is not None:
+                        wait_window = self.event_settle_seconds
+                    elif state.best_bib:
                         wait_window = 0.18
                     elif candidates:
                         wait_window = 1.05
@@ -5003,6 +5124,8 @@ class Detector:
                     curr_x = data['position'][0]
                     curr_bbox = data['bbox']
                     curr_bib = state.best_bib
+                    detected_candidates = self._get_plausible_detected_bib_candidates(state)
+                    bib_evidence_kind_for_event = "detected" if detected_candidates else "fallback"
 
                     if self.enable_gate_guard and self._is_gate_like_bbox(curr_bbox, (height, width)):
                         state.crossed = False
@@ -5119,7 +5242,13 @@ class Detector:
 
                             # 4. 极近时间+空间去重 (如果都没有号码，且时间极近)
                             if not curr_bib and not old.get('bib'):
-                                if self._is_duplicate_unknown_event_bbox(curr_bbox, old['bbox'], time_diff):
+                                if self._is_duplicate_unknown_event_bbox(
+                                    curr_bbox,
+                                    old['bbox'],
+                                    time_diff,
+                                    current_bib_evidence_kind=bib_evidence_kind_for_event,
+                                    previous_bib_evidence_kind=old.get('bib_evidence_kind', ''),
+                                ):
                                     is_dup = True
                                     dup_reason = "unknown_nested_bbox"
                                     logger.info(f"[Detector-{self.source_id}] ID {tid} UNKNOWN嵌套框重复过线，抑制输出")
@@ -5244,6 +5373,13 @@ class Detector:
                     bib_bbox_for_save = state.best_bib_bbox
                     bib_quality_for_save = float(getattr(state, "best_bib_quality", 0.0) or 0.0)
 
+                    bib_candidates_for_event = []
+                    for q, candidate_crop, _, candidate_bbox in detected_candidates[:4]:
+                        if candidate_crop is None or not isinstance(candidate_crop, np.ndarray) or candidate_crop.size == 0:
+                            continue
+                        bib_candidates_for_event.append(
+                            (float(q), candidate_crop.copy(), list(candidate_bbox or []))
+                        )
                     candidates = self._get_ocr_candidates(state)
                     if candidates:
                         try:
@@ -5262,7 +5398,10 @@ class Detector:
                             # 优先选“接近过线/质量较高时刻”的缓存（frame_ref 不为 None）
                             best_near = _first_valid(candidates, require_frame=True)
                             best_any = _first_valid(candidates, require_frame=False)
-                            best_pick = best_near or best_any
+                            detected_pick = _first_valid(detected_candidates, require_frame=False)
+                            best_pick = detected_pick or best_near or best_any
+                            if detected_pick is not None:
+                                bib_crop_for_save = None
 
                             if best_pick:
                                 pick_q, pick_crop, pick_bbox = best_pick
@@ -5319,6 +5458,8 @@ class Detector:
                         crop=crop,
                         bib_crop=bib_crop_for_save,
                         bib_bbox=bib_bbox_for_save,
+                        bib_evidence_kind=bib_evidence_kind_for_event,
+                        bib_candidates=bib_candidates_for_event,
                         quality_score=bib_quality_for_save
                     )
 
@@ -5359,7 +5500,8 @@ class Detector:
                         'time': current_time,
                         'bbox': data['bbox'],
                         'tid': tid,
-                        'bib': state.best_bib
+                        'bib': state.best_bib,
+                        'bib_evidence_kind': bib_evidence_kind_for_event,
                     })
                     
                     # 记录到已完成名单 (全局去重，记录时间戳)

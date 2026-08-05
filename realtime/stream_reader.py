@@ -24,6 +24,7 @@ class StreamStatus(Enum):
     CONNECTING = "connecting"      # 连接中
     CONNECTED = "connected"        # 已连接
     RECONNECTING = "reconnecting"  # 重连中
+    ENDED = "ended"                # 本地视频已播放完成
     ERROR = "error"                # 错误
 
 
@@ -81,6 +82,7 @@ class StreamReader:
         self._cap: Optional[cv2.VideoCapture] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._eof_reached = False
 
         # 统计信息
         self._frame_count: int = 0
@@ -140,6 +142,11 @@ class StreamReader:
     def set_on_frame(self, callback: Callable[[cv2.typing.MatLike], None]):
         """设置新帧回调"""
         self._on_frame = callback
+
+    @staticmethod
+    def is_video_file_source(source) -> bool:
+        """Return whether the source is a finite local video input."""
+        return isinstance(source, str) and not source.lower().startswith("rtsp")
 
     def _set_status(self, status: StreamStatus):
         """设置状态并触发回调"""
@@ -218,6 +225,9 @@ class StreamReader:
                 self._set_status(StreamStatus.ERROR)
                 return False
 
+            if self.is_video_file_source(self.source):
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
             # 获取实际的流信息
             self._width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self._height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -247,7 +257,7 @@ class StreamReader:
         self._last_frame_time = time.time()
 
         # 判断是否是视频文件（需要帧率控制）
-        is_video_file = isinstance(self.source, str) and not self.source.startswith('rtsp')
+        is_video_file = self.is_video_file_source(self.source)
         frame_interval = 1.0 / self._fps if is_video_file and self._fps > 0 else 0
         
         retry_count = 0
@@ -316,7 +326,14 @@ class StreamReader:
                     fps_frame_count = 0
                     fps_update_time = time.time()
             else:
-                # 读取失败，可能断线
+                if is_video_file:
+                    logger.info(f"[StreamReader] 本地视频播放完成: {self.source}")
+                    self._eof_reached = True
+                    self._running = False
+                    self._set_status(StreamStatus.ENDED)
+                    break
+
+                # 实时流读取失败，按断线处理
                 if self._running:
                     self._set_status(StreamStatus.RECONNECTING)
                     # 释放旧连接，强制下次循环重新连接
@@ -329,7 +346,8 @@ class StreamReader:
         if self._cap:
             self._cap.release()
             self._cap = None
-        self._set_status(StreamStatus.DISCONNECTED)
+        if not self._eof_reached:
+            self._set_status(StreamStatus.DISCONNECTED)
 
     def start(self) -> bool:
         """
@@ -340,6 +358,8 @@ class StreamReader:
         """
         if self._running:
             return True
+
+        self._eof_reached = False
 
         # 先尝试连接
         if not self._connect():
@@ -405,6 +425,7 @@ class StreamReader:
             "fps": self._fps,
             "actual_fps": self._actual_fps,
             "frame_count": self._frame_count,
+            "eof_reached": self._eof_reached,
         }
 
 

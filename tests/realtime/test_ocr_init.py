@@ -111,3 +111,25 @@ def test_paddle_v3_adapter_skips_recognizer_when_predict_finds_text():
 
     assert lines == [[None, "A1234", 0.93]]
     assert recognizer.calls == 0
+
+
+def test_paddle_v3_adapter_can_run_recognition_only_explicitly():
+    class DetectionPipeline:
+        def predict(self, image, **kwargs):
+            return [{"rec_texts": ["4"], "rec_scores": [0.3]}]
+
+    class RecognitionOnly:
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, image, batch_size):
+            self.calls += 1
+            return [{"res": {"rec_text": "33", "rec_score": 0.94}}]
+
+    recognizer = RecognitionOnly()
+    adapter = PaddleOcrAdapter(DetectionPipeline(), recognizer=recognizer)
+
+    lines, _ = adapter.recognize_only(np.zeros((32, 40, 3), dtype=np.uint8))
+
+    assert lines == [[None, "33", 0.94]]
+    assert recognizer.calls == 1

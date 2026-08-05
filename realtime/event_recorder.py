@@ -525,7 +525,7 @@ class EventRecorder:
         event_dir = self.evidence_root / event_id_str
         event_dir.mkdir(parents=True, exist_ok=True)
         
-        paths = {"full": None, "athlete": None, "bib": None}
+        paths = {"full": None, "athlete": None, "bib": None, "bib_candidates": []}
         
         # 原子写函数
         def atomic_save(img: np.ndarray, target_path: Path):
@@ -572,6 +572,16 @@ class EventRecorder:
             bib_path = event_dir / "bib.jpg"
             if atomic_save(event.bib_crop, bib_path):
                 paths["bib"] = "bib.jpg"
+
+        for index, candidate in enumerate(getattr(event, "bib_candidates", [])[:4], start=1):
+            if len(candidate) < 2:
+                continue
+            candidate_image = candidate[1]
+            if candidate_image is None or not isinstance(candidate_image, np.ndarray) or candidate_image.size == 0:
+                continue
+            candidate_name = f"bib_candidate_{index:02d}.jpg"
+            if atomic_save(candidate_image, event_dir / candidate_name):
+                paths["bib_candidates"].append(candidate_name)
         
         # 4. 生成/更新 meta.json
         meta_path = event_dir / "meta.json"
@@ -587,6 +597,8 @@ class EventRecorder:
                     meta["quality"]["score"] = float(event.quality_score)
                 if event.bib_bbox:
                     meta["bbox_bib"] = list(event.bib_bbox)
+                if event.bib_evidence_kind:
+                    meta["bib_evidence_kind"] = event.bib_evidence_kind
             except Exception as e:
                 logger.error(f"[EventRecorder] 加载旧 meta.json 失败: {e}")
                 meta = self._create_initial_meta(event, paths)
@@ -613,6 +625,7 @@ class EventRecorder:
             "camera_id": f"cam_{event.source_id}",
             "bbox_athlete": list(event.bbox) if event.bbox else None,
             "bbox_bib": list(event.bib_bbox) if event.bib_bbox else None,
+            "bib_evidence_kind": event.bib_evidence_kind,
             "quality": {
                 "score": float(event.quality_score)
             },

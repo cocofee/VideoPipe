@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from realtime.detector import (
     Detector,
+    LOCAL_VIDEO_EVENT_SETTLE_SECONDS,
     TrackState,
     resolve_athlete_validator_model,
     resolve_performance_profile,
@@ -152,6 +153,52 @@ class _OriginalFrameTrackingModel:
         return [SimpleNamespace(boxes=_Boxes(), names=self.names)]
 
 
+class _SimpleBoxes:
+    def __init__(self, cls, conf, xyxy, ids=None):
+        self.cls = np.asarray(cls, dtype=np.float32)
+        self.conf = np.asarray(conf, dtype=np.float32)
+        self.xyxy = np.asarray(xyxy, dtype=np.float32)
+        self.id = None if ids is None else np.asarray(ids, dtype=np.float32)
+
+    def __len__(self):
+        return len(self.cls)
+
+
+class _RawBibCaptureTrackingModel:
+    names = {0: "bike", 1: "BIB"}
+
+    def __init__(self):
+        self.postprocess_callbacks = []
+
+    def add_callback(self, event, callback):
+        if event == "on_predict_postprocess_end":
+            self.postprocess_callbacks.append(callback)
+
+    def track(self, frame, **kwargs):
+        raw_result = SimpleNamespace(
+            boxes=_SimpleBoxes(
+                cls=[0, 1],
+                conf=[0.95, 0.90],
+                xyxy=[[80, 100, 220, 300], [120, 140, 160, 170]],
+            ),
+            names=self.names,
+        )
+        predictor = SimpleNamespace(results=[raw_result])
+        for callback in self.postprocess_callbacks:
+            callback(predictor)
+
+        tracked_result = SimpleNamespace(
+            boxes=_SimpleBoxes(
+                cls=[0],
+                conf=[0.95],
+                xyxy=[[80, 100, 220, 300]],
+                ids=[11],
+            ),
+            names=self.names,
+        )
+        return [tracked_result]
+
+
 def _pending_crossing_state(frame, track_id):
     state = TrackState(prev_x=100, prev_y=200)
     state.crossed = True
@@ -242,6 +289,20 @@ def test_nested_unknown_crossing_boxes_are_event_duplicates():
 
     assert detector._is_duplicate_unknown_event_bbox(duplicate, first, time_diff=0.0) is True
     assert detector._is_duplicate_unknown_event_bbox(adjacent_rider, first, time_diff=0.2) is False
+
+
+def test_detected_bib_evidence_prevents_unknown_nested_event_deduplication():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    previous = [687, 289, 948, 626]
+    current = [721, 232, 992, 619]
+
+    assert detector._is_duplicate_unknown_event_bbox(
+        current,
+        previous,
+        time_diff=1.19,
+        current_bib_evidence_kind="detected",
+        previous_bib_evidence_kind="fallback",
+    ) is False
 
 
 def test_slow_nested_unknown_track_is_deduplicated_without_merging_real_riders():
@@ -550,6 +611,47 @@ def test_laptop_profile_keeps_ocr_crop_on_original_frame():
     assert np.array_equal(crop, frame[545:635, 715:845])
 
 
+def test_raw_bib_detection_is_kept_when_tracker_returns_only_athlete():
+    model = _RawBibCaptureTrackingModel()
+    detector = Detector(model_path="fake.pt", model=model, ocr=None)
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    detector.set_finish_line((0, 310), (320, 310))
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+
+    detector.process_frame(frame, timestamp=0.0)
+
+    state = detector._track_states[11]
+    assert state.has_bib_box is True
+    assert state.bib_crops_cache[0][3] == [120, 140, 160, 170]
+
+
+def test_event_evidence_prefers_detected_bib_over_torso_fallback():
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+    detected_crop = np.full((24, 28, 3), 180, dtype=np.uint8)
+    fallback_crop = np.full((160, 100, 3), 80, dtype=np.uint8)
+    detector = Detector(
+        model_path="fake.pt",
+        model=_EmptyTrackingModel(),
+        ocr=None,
+        athlete_validator=_ValidatorModel(["bicycle"]),
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    state = _pending_crossing_state(frame, 101)
+    state.has_bib_box = True
+    state.bib_crops_cache = [(0.50, detected_crop, None, [120, 140, 148, 164])]
+    state.fallback_bib_crops_cache = [(0.95, fallback_crop, frame, [100, 120, 200, 280])]
+    detector._track_states[101] = state
+
+    events, _, _ = detector.process_frame(frame, timestamp=2.0)
+
+    assert len(events) == 1
+    assert events[0].bib_bbox == [120, 140, 148, 164]
+    assert np.array_equal(events[0].bib_crop, detected_crop)
+
+
 def test_resolve_athlete_validator_prefers_config_then_default(tmp_path):
     configured = tmp_path / "configured.pt"
     configured.write_bytes(b"configured")
@@ -594,3 +696,101 @@ def test_usable_detected_bib_candidates_keep_priority_without_fallback_noise():
     candidates = detector._get_ocr_candidates(state)
 
     assert candidates == state.bib_crops_cache
+
+
+def test_implausibly_wide_bib_sequence_falls_back_to_athlete_evidence():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    false_crop = np.zeros((26, 69, 3), dtype=np.uint8)
+    fallback_crop = np.zeros((160, 100, 3), dtype=np.uint8)
+    state = TrackState(prev_x=0, prev_y=0)
+    state.bib_crops_cache = [
+        (0.77, false_crop, None, [0, 0, 59, 16]),
+        (0.68, false_crop, None, [0, 0, 41, 16]),
+        (0.67, false_crop, None, [0, 0, 39, 17]),
+        (0.66, false_crop, None, [0, 0, 38, 16]),
+    ]
+    state.fallback_bib_crops_cache = [
+        (0.60, fallback_crop, None, [10, 20, 110, 180]),
+    ]
+
+    candidates = detector._get_ocr_candidates(state)
+
+    assert candidates == state.fallback_bib_crops_cache
+
+
+def test_event_keeps_ranked_detected_bib_candidates_for_batch_consensus():
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+    detector = Detector(
+        model_path="fake.pt",
+        model=_EmptyTrackingModel(),
+        ocr=None,
+        athlete_validator=_ValidatorModel(["bicycle"]),
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    state = _pending_crossing_state(frame, 202)
+    state.has_bib_box = True
+    state.bib_crops_cache = [
+        (0.90, np.full((48, 64, 3), 30, dtype=np.uint8), frame, [120, 140, 184, 188]),
+        (0.80, np.full((44, 60, 3), 60, dtype=np.uint8), frame, [122, 142, 182, 186]),
+        (0.70, np.full((40, 56, 3), 90, dtype=np.uint8), frame, [124, 144, 180, 184]),
+    ]
+    detector._track_states[202] = state
+
+    events, _, _ = detector.process_frame(frame, timestamp=2.0)
+
+    assert len(events) == 1
+    assert events[0].bib_evidence_kind == "detected"
+    assert [int(candidate[1][0, 0, 0]) for candidate in events[0].bib_candidates] == [30, 60, 90]
+
+
+def test_event_marks_implausible_detected_bib_history_as_fallback_evidence():
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+    detector = Detector(
+        model_path="fake.pt",
+        model=_EmptyTrackingModel(),
+        ocr=None,
+        athlete_validator=_ValidatorModel(["bicycle"]),
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    state = _pending_crossing_state(frame, 203)
+    state.has_bib_box = True
+    false_crop = np.zeros((26, 69, 3), dtype=np.uint8)
+    state.bib_crops_cache = [
+        (0.77, false_crop, frame, [0, 0, 59, 16]),
+        (0.68, false_crop, frame, [0, 0, 41, 16]),
+        (0.67, false_crop, frame, [0, 0, 39, 17]),
+    ]
+    state.fallback_bib_crops_cache = [
+        (0.60, np.zeros((80, 100, 3), dtype=np.uint8), frame, [100, 90, 200, 170]),
+    ]
+    detector._track_states[203] = state
+
+    events, _, _ = detector.process_frame(frame, timestamp=2.0)
+
+    assert len(events) == 1
+    assert events[0].bib_evidence_kind == "fallback"
+    assert events[0].bib_candidates == []
+
+
+def test_local_video_mode_uses_a_bounded_settle_delay():
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+    detector = Detector(
+        model_path="fake.pt",
+        model=_EmptyTrackingModel(),
+        ocr=None,
+        athlete_validator=_ValidatorModel(["bicycle"]),
+        event_settle_seconds=LOCAL_VIDEO_EVENT_SETTLE_SECONDS,
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    state = _pending_crossing_state(frame, 204)
+    state.crossed_time = 2.0
+    detector._track_states[204] = state
+
+    early_events, _, _ = detector.process_frame(frame, timestamp=2.84)
+    events, _, _ = detector.process_frame(frame, timestamp=2.86)
+
+    assert early_events == []
+    assert len(events) == 1

@@ -325,7 +325,7 @@ def main() -> int:
     import numpy as np
     from ultralytics import YOLO
 
-    from realtime.detector import Detector
+    from realtime.detector import Detector, LOCAL_VIDEO_EVENT_SETTLE_SECONDS
     if not args.verbose:
         try:
             logging.getLogger().setLevel(logging.ERROR)
@@ -387,6 +387,7 @@ def main() -> int:
         model=yolo,
         ocr=None,
         athlete_validator=athlete_validator,
+        event_settle_seconds=LOCAL_VIDEO_EVENT_SETTLE_SECONDS,
     )
     detector.realtime_ocr_enabled = False
 

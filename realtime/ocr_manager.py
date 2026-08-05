@@ -132,7 +132,7 @@ class OCRManager:
     def _refresh_rules_from_db(self):
         """从数据库读取号码规则开关（容错、低成本）。"""
         try:
-            self.only_numeric = str(self.db.get_config("numeric_only", "0")) == "1"
+            self.only_numeric = str(self.db.get_config("numeric_only", "1")) == "1"
         except Exception:
             pass
         # 读取号码范围（关键：过滤背景垃圾文字）
@@ -235,13 +235,16 @@ class OCRManager:
         notes: str,
         merged_to: Optional[int] = None,
     ) -> bool:
-        if merged_to is not None and bib:
+        normalized_status = str(status or "").strip().upper()
+        formal_bib = bib if normalized_status == "DONE" else ""
+
+        if merged_to is not None and formal_bib:
             merge_method = getattr(self.db, 'merge_ocr_duplicate_event', None)
             if merge_method is not None:
                 merged = merge_method(
                     duplicate_event_id=int(event_id),
                     target_event_id=int(merged_to),
-                    bib=bib,
+                    bib=formal_bib,
                     conf=float(conf or 0.0),
                     ocr_state=status,
                     evidence_dir=evidence_dir,
@@ -253,7 +256,7 @@ class OCRManager:
 
         return self.db.update_event_ocr_result(
             event_id,
-            bib,
+            formal_bib,
             conf,
             status,
             evidence_dir=evidence_dir,
@@ -672,23 +675,79 @@ class OCRManager:
 
             quality_grade, quality_reason = self._assess_quality(meta)
             best_bib, best_conf, best_source, best_image = "", 0.0, "LOCAL", ""
+            multi_frame_required = False
+            multi_frame_consistent = False
+            evidence_kind = str(meta.get("bib_evidence_kind") or "").strip().lower()
+            fallback_only_evidence = evidence_kind == "fallback"
+            insufficient_multi_frame_evidence = False
 
             def _update_best(bib, conf, source, image):
                 nonlocal best_bib, best_conf, best_source, best_image
                 if bib and conf > best_conf:
                     best_bib, best_conf, best_source, best_image = bib, conf, source, image
 
-            # ── 步骤1：bib.jpg 快速尝试（CPU下图很小，<1s） ──
-            if quality_grade in ("good", "marginal") and bib_path.exists():
+            candidate_paths = []
+            meta_paths = meta.get("paths") if isinstance(meta, dict) else None
+            if isinstance(meta_paths, dict):
+                configured_candidates = meta_paths.get("bib_candidates")
+                if isinstance(configured_candidates, list):
+                    for relative_path in configured_candidates[:4]:
+                        candidate_path = event_dir / str(relative_path)
+                        if candidate_path.exists():
+                            candidate_paths.append(candidate_path)
+
+            # New events use distinct frames for consensus. Old events keep the bib.jpg path.
+            multi_frame_required = len(candidate_paths) >= 2
+            insufficient_multi_frame_evidence = evidence_kind == "detected" and len(candidate_paths) < 2
+            if quality_grade in ("good", "marginal") and multi_frame_required:
+                frame_results = []
+                for candidate_path in candidate_paths:
+                    candidate_img = self._load_image(candidate_path)
+                    if candidate_img is None:
+                        continue
+                    candidate_bib, candidate_conf, candidate_source = self._run_multi_scale_ocr(candidate_img)
+                    tight_bib, tight_conf, tight_source = self._run_tight_numeric_recognition(candidate_img)
+                    if tight_bib:
+                        normal_is_multidigit = bool(candidate_bib and len(candidate_bib) >= 2)
+                        if not normal_is_multidigit or tight_bib == candidate_bib:
+                            if tight_bib != candidate_bib or tight_conf > candidate_conf:
+                                candidate_bib = tight_bib
+                                candidate_conf = tight_conf
+                                candidate_source = tight_source
+                    if candidate_bib:
+                        frame_results.append(
+                            (candidate_bib, float(candidate_conf), candidate_source, candidate_path.name)
+                        )
+
+                grouped = {}
+                for candidate_bib, candidate_conf, candidate_source, candidate_name in frame_results:
+                    grouped.setdefault(candidate_bib, []).append(
+                        (candidate_conf, candidate_source, candidate_name)
+                    )
+
+                ranked_groups = sorted(
+                    grouped.items(),
+                    key=lambda item: (len(item[1]), sum(value[0] for value in item[1])),
+                    reverse=True,
+                )
+                if ranked_groups:
+                    selected_bib, selected_values = ranked_groups[0]
+                    runner_up_count = len(ranked_groups[1][1]) if len(ranked_groups) > 1 else 0
+                    multi_frame_consistent = len(selected_values) >= 2 and len(selected_values) > runner_up_count
+                    best_bib = selected_bib
+                    best_conf = float(sum(value[0] for value in selected_values) / len(selected_values))
+                    best_source = "multi_frame_consensus" if multi_frame_consistent else "multi_frame_conflict"
+                    best_image = "multi_frame"
+            elif quality_grade in ("good", "marginal") and bib_path.exists():
                 bib_img = self._load_image(bib_path)
                 if bib_img is not None:
-                    bib_bib, bib_conf = self._run_local_ocr(bib_img)
-                    _update_best(bib_bib, bib_conf, "original", "bib")
+                    bib_bib, bib_conf, bib_source = self._run_multi_scale_ocr(bib_img)
+                    _update_best(bib_bib, bib_conf, bib_source, "bib")
 
             # 高置信直接跳过后续
-            if best_bib and best_conf >= 0.8:
+            if best_bib and best_conf >= 0.8 and (not multi_frame_required or multi_frame_consistent):
                 pass
-            else:
+            elif not multi_frame_required:
                 # ── 步骤2：athlete.jpg 放大3x（核心策略，CPU约5-10s） ──
                 if athlete_path.exists():
                     athlete_img = self._load_image(athlete_path)
@@ -716,7 +775,12 @@ class OCRManager:
 
             # 3. 归并逻辑 (统一为一个运动员)
             merged_to = None
-            if best_bib and best_conf >= self.conf_threshold:
+            can_auto_confirm = (
+                (not multi_frame_required or multi_frame_consistent)
+                and not fallback_only_evidence
+                and not insufficient_multi_frame_evidence
+            )
+            if best_bib and best_conf >= self.conf_threshold and can_auto_confirm:
                 cross_time = meta.get("cross_time_unix")
                 try:
                     cross_time = float(cross_time)
@@ -738,9 +802,15 @@ class OCRManager:
                     self.stats["merged"] += 1
                     logger.info(f"事件 {event_id} 归并到 {merged_to} (Bib: {best_bib})")
 
-            status = "DONE" if best_bib and best_conf >= self.conf_threshold else "PENDING"
+            status = "DONE" if best_bib and best_conf >= self.conf_threshold and can_auto_confirm else "PENDING"
             if status != "DONE":
-                if best_bib:
+                if fallback_only_evidence:
+                    error = "FALLBACK_ONLY_EVIDENCE"
+                elif insufficient_multi_frame_evidence:
+                    error = "INSUFFICIENT_MULTI_FRAME_EVIDENCE"
+                elif multi_frame_required and best_bib and not multi_frame_consistent:
+                    error = "INCONSISTENT_MULTI_FRAME"
+                elif best_bib:
                     error = "LOW_CONF"
                 elif quality_grade == "poor":
                     error = f"QUALITY_POOR: {quality_reason}"
@@ -872,6 +942,47 @@ class OCRManager:
             logger.error(f"图像增强异常: {e}")
 
         return candidates
+
+    def _run_tight_numeric_recognition(self, img: np.ndarray) -> Tuple[str, float, str]:
+        """Recover multi-digit bicycle bibs hidden by padding around a small detected crop."""
+        if not self.only_numeric or img is None or img.size == 0:
+            return "", 0.0, "tight_unavailable"
+        if self.ocr is None or not hasattr(self.ocr, "recognize_only"):
+            return "", 0.0, "tight_unavailable"
+
+        height, width = img.shape[:2]
+        min_side = min(height, width)
+        if min_side < 24:
+            return "", 0.0, "tight_too_small"
+
+        border = min(5, max(2, int(round(min_side * 0.12))))
+        if height <= border * 2 + 8 or width <= border * 2 + 8:
+            return "", 0.0, "tight_too_small"
+
+        tight = img[border:height - border, border:width - border]
+        tight = cv2.resize(tight, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+
+        try:
+            results, _ = self.ocr.recognize_only(tight)
+        except Exception as e:
+            logger.debug(f"Tight recognition failed: {e}")
+            return "", 0.0, "tight_failed"
+
+        best_bib = ""
+        best_conf = 0.0
+        for _, text, conf in results or []:
+            normalized = self._normalize_bib_text(text)
+            # This path may restore missing adjacent digits, but must never
+            # replace one valid single-digit bib with another single digit.
+            if not normalized.isdigit() or len(normalized) < 2:
+                continue
+            if float(conf) > best_conf:
+                best_bib = normalized
+                best_conf = float(conf)
+
+        if not best_bib:
+            return "", 0.0, "tight_no_multidigit"
+        return best_bib, best_conf, "tight_recognition"
 
     def _run_multi_scale_ocr(self, img: np.ndarray) -> Tuple[str, float, str]:
         """

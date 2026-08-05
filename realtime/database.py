@@ -641,13 +641,21 @@ class Database:
                         if evidence_dir:
                             cursor.execute('''
                                 UPDATE crossing_events 
-                                SET bib_status = ?, ocr_state = ?, evidence_dir = ?, modified_at = ?, notes = COALESCE(notes, '') || ' ' || ?
+                                SET bib_number = CASE WHEN COALESCE(manual_corrected, 0) = 0 THEN NULL ELSE bib_number END,
+                                    bib_confidence = CASE WHEN COALESCE(manual_corrected, 0) = 0 THEN 0.0 ELSE bib_confidence END,
+                                    bib_status = CASE WHEN COALESCE(manual_corrected, 0) = 0 THEN ? ELSE bib_status END,
+                                    ocr_state = CASE WHEN COALESCE(manual_corrected, 0) = 0 THEN ? ELSE ocr_state END,
+                                    evidence_dir = ?, modified_at = ?, notes = COALESCE(notes, '') || ' ' || ?
                                 WHERE event_id = ?
                             ''', (bib_status, ocr_state, evidence_dir, now, notes, event_id))
                         else:
                             cursor.execute('''
                                 UPDATE crossing_events 
-                                SET bib_status = ?, ocr_state = ?, modified_at = ?, notes = COALESCE(notes, '') || ' ' || ?
+                                SET bib_number = CASE WHEN COALESCE(manual_corrected, 0) = 0 THEN NULL ELSE bib_number END,
+                                    bib_confidence = CASE WHEN COALESCE(manual_corrected, 0) = 0 THEN 0.0 ELSE bib_confidence END,
+                                    bib_status = CASE WHEN COALESCE(manual_corrected, 0) = 0 THEN ? ELSE bib_status END,
+                                    ocr_state = CASE WHEN COALESCE(manual_corrected, 0) = 0 THEN ? ELSE ocr_state END,
+                                    modified_at = ?, notes = COALESCE(notes, '') || ' ' || ?
                                 WHERE event_id = ?
                             ''', (bib_status, ocr_state, now, notes, event_id))
 

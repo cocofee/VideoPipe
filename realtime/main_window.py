@@ -135,7 +135,7 @@ except ImportError:
 # 支持直接运行和作为模块运行
 try:
     from .stream_reader import StreamReader, StreamStatus
-    from .detector import Detector, CrossingEvent, PaddleOcrAdapter, resolve_athlete_validator_model
+    from .detector import Detector, CrossingEvent, LOCAL_VIDEO_EVENT_SETTLE_SECONDS, PaddleOcrAdapter, resolve_athlete_validator_model
     from .database import Database
     from .event_recorder import EventRecorder
     from .event_list_widget import EventListWidget
@@ -150,7 +150,7 @@ except ImportError:
         sys.path.insert(0, current_dir)
     
     from stream_reader import StreamReader, StreamStatus
-    from detector import Detector, CrossingEvent, PaddleOcrAdapter, resolve_athlete_validator_model
+    from detector import Detector, CrossingEvent, LOCAL_VIDEO_EVENT_SETTLE_SECONDS, PaddleOcrAdapter, resolve_athlete_validator_model
     from database import Database
     from event_recorder import EventRecorder
     from event_list_widget import EventListWidget
@@ -564,6 +564,9 @@ class VideoThread(QThread):
                 continue
 
             if frame is None:
+                if self.reader.status == StreamStatus.ENDED:
+                    logger.info(f"[VideoThread-{self.source_id}] 本地视频处理完成")
+                    break
                 time.sleep(0.001)
                 continue
 
@@ -588,6 +591,8 @@ class VideoThread(QThread):
             # UI刷新：降低刷新频率减轻GUI负担
             if frame_count % self.ui_skip == 0:
                 self.frame_ready.emit(frame, athletes, bibs, self.source_id)
+
+        self._running = False
 
     def stop(self):
         self._running = False
@@ -2297,7 +2302,7 @@ class MainWindow(QMainWindow):
                 logger.info(f"[Main] 已加载持久化号段配置: {ranges}")
             
             # 加载纯数字开关状态
-            is_numeric = self.database.get_config('numeric_only', '0') == '1'
+            is_numeric = self.database.get_config('numeric_only', '1') == '1'
             if hasattr(self, 'numeric_only_checkbox'):
                 self.numeric_only_checkbox.blockSignals(True)
                 self.numeric_only_checkbox.setChecked(is_numeric)
@@ -2641,7 +2646,7 @@ class MainWindow(QMainWindow):
 
         # 仅限纯数字开关 (自行车模式优化)
         self.numeric_only_checkbox = QCheckBox("仅限纯数字")
-        self.numeric_only_checkbox.setChecked(False) # 默认关闭，用户手动开启
+        self.numeric_only_checkbox.setChecked(True)
         self.numeric_only_checkbox.setToolTip("针对自行车比赛优化：只识别纯数字号码，过滤掉带字母的干扰项")
         self.numeric_only_checkbox.setStyleSheet("color: #722ed1; font-weight: bold; font-size: 16px;")
         self.numeric_only_checkbox.stateChanged.connect(self._on_numeric_only_changed)
@@ -4104,6 +4109,11 @@ class MainWindow(QMainWindow):
                     gate_guard_enabled=bool(self._gate_guard_enabled),
                     athlete_validator=self.shared_athlete_validator,
                     performance_profile=str(self.config.get("performance_profile") or "auto"),
+                    event_settle_seconds=(
+                        LOCAL_VIDEO_EVENT_SETTLE_SECONDS
+                        if StreamReader.is_video_file_source(source)
+                        else None
+                    ),
                 )
                 detector.ensure_ocr()
                 
@@ -4501,6 +4511,11 @@ class MainWindow(QMainWindow):
                     gate_guard_enabled=bool(self._gate_guard_enabled),
                     athlete_validator=self.shared_athlete_validator,
                     performance_profile=str(self.config.get("performance_profile") or "auto"),
+                    event_settle_seconds=(
+                        LOCAL_VIDEO_EVENT_SETTLE_SECONDS
+                        if i < len(self.sources) and StreamReader.is_video_file_source(self.sources[i])
+                        else None
+                    ),
                 )
                 if i == 0:
                     detector.set_finish_line(self.line_pt1, self.line_pt2)
@@ -4543,6 +4558,9 @@ class MainWindow(QMainWindow):
         elif status == StreamStatus.RECONNECTING:
             text = "重连中..."
             color = "#faad14" # 橙色
+        elif status == StreamStatus.ENDED:
+            text = "视频已播放完成"
+            color = "#1677ff"
         elif status == StreamStatus.ERROR:
             text = "连接错误"
             color = "#ff4d4f" # 红色

@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from datetime import datetime
 from types import SimpleNamespace
 
 from realtime.detector import (
@@ -199,6 +200,26 @@ class _RawBibCaptureTrackingModel:
         return [tracked_result]
 
 
+class _LowConfidenceUntrackedModel:
+    names = {0: "bike", 1: "BIB"}
+
+    def __init__(self, *, track_id=None):
+        self.track_id = track_id
+
+    def track(self, frame, **kwargs):
+        return [
+            SimpleNamespace(
+                boxes=_SimpleBoxes(
+                    cls=[0],
+                    conf=[0.15],
+                    xyxy=[[600, 350, 1000, 1000]],
+                    ids=None if self.track_id is None else [self.track_id],
+                ),
+                names=self.names,
+            )
+        ]
+
+
 def _pending_crossing_state(frame, track_id):
     state = TrackState(prev_x=100, prev_y=200)
     state.crossed = True
@@ -212,6 +233,32 @@ def _pending_crossing_state(frame, track_id):
     }
     state.best_athlete_crop = frame[120:280, 100:180].copy()
     return state
+
+
+def test_low_confidence_untracked_candidate_is_not_emitted_as_athlete():
+    detector = Detector(
+        model_path="fake.pt",
+        model=_LowConfidenceUntrackedModel(),
+        ocr=None,
+    )
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    _, athletes, _ = detector.process_frame(frame, timestamp=1.0)
+
+    assert athletes == []
+
+
+def test_low_confidence_tracked_candidate_remains_available_for_recall():
+    detector = Detector(
+        model_path="fake.pt",
+        model=_LowConfidenceUntrackedModel(track_id=11),
+        ocr=None,
+    )
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    _, athletes, _ = detector.process_frame(frame, timestamp=1.0)
+
+    assert [athlete["track_id"] for athlete in athletes] == [11]
 
 
 def test_bib_center_outside_athlete_is_not_assigned():
@@ -317,6 +364,28 @@ def test_slow_nested_unknown_track_is_deduplicated_without_merging_real_riders()
     assert detector._is_duplicate_unknown_event_bbox(slow_duplicate, first, time_diff=0.87) is True
     assert detector._is_duplicate_unknown_event_bbox(hevc_duplicate, hevc_first, time_diff=0.67) is True
     assert detector._is_duplicate_unknown_event_bbox(second_real_rider, first_real_rider, time_diff=0.0) is False
+
+
+def test_scale_changed_unknown_track_from_long_video_is_deduplicated():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    first_event_bbox = [809, 594, 948, 820]
+    fragmented_track_bbox = [821, 603, 932, 840]
+    adjacent_rider_bbox = [777, 626, 892, 820]
+
+    assert detector._is_duplicate_unknown_event_bbox(
+        fragmented_track_bbox,
+        first_event_bbox,
+        time_diff=0.4,
+        current_bib_evidence_kind="detected",
+        previous_bib_evidence_kind="detected",
+    ) is True
+    assert detector._is_duplicate_unknown_event_bbox(
+        adjacent_rider_bbox,
+        first_event_bbox,
+        time_diff=0.4,
+        current_bib_evidence_kind="detected",
+        previous_bib_evidence_kind="detected",
+    ) is False
 
 
 def test_overlapping_boxes_with_distinct_bibs_are_not_deduplicated():
@@ -609,6 +678,65 @@ def test_laptop_profile_keeps_ocr_crop_on_original_frame():
     assert bbox == [720, 550, 840, 630]
     assert frame_ref is frame
     assert np.array_equal(crop, frame[545:635, 715:845])
+
+
+def _crossing_detector_for_timestamp_test():
+    detector = Detector(
+        model_path="fake.pt",
+        model=_OriginalFrameTrackingModel(),
+        ocr=None,
+        athlete_validator=_ValidatorModel(["bicycle"]),
+        event_settle_seconds=0.0,
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    state = TrackState(prev_x=800, prev_y=900)
+    state.start_pos = (800, 800)
+    state.start_time = 0.0
+    state.best_bib = "7"
+    state.best_bib_conf = 0.9
+    state.has_bib_box = True
+    detector._track_states[11] = state
+    return detector
+
+
+def test_crossing_event_uses_supplied_capture_timestamp_and_wall_realtime(monkeypatch):
+    wall_time = 1_900_000_000.0
+    capture_time = 123.456
+    monkeypatch.setattr("realtime.detector.time.time", lambda: wall_time)
+    detector = _crossing_detector_for_timestamp_test()
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    events, _, _ = detector.process_frame(frame, timestamp=capture_time)
+
+    assert len(events) == 1
+    assert events[0].cross_time == capture_time
+    assert events[0].cross_realtime == datetime.fromtimestamp(wall_time).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def test_crossing_event_without_timestamp_keeps_wall_clock_behavior(monkeypatch):
+    wall_time = 1_900_000_000.0
+    monkeypatch.setattr("realtime.detector.time.time", lambda: wall_time)
+    detector = _crossing_detector_for_timestamp_test()
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    events, _, _ = detector.process_frame(frame)
+
+    assert len(events) == 1
+    assert events[0].cross_time == wall_time
+    assert events[0].cross_realtime == datetime.fromtimestamp(wall_time).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def test_crossing_event_keeps_zero_capture_timestamp(monkeypatch):
+    wall_time = 1_900_000_000.0
+    monkeypatch.setattr("realtime.detector.time.time", lambda: wall_time)
+    detector = _crossing_detector_for_timestamp_test()
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    events, _, _ = detector.process_frame(frame, timestamp=0.0)
+
+    assert len(events) == 1
+    assert events[0].cross_time == 0.0
 
 
 def test_raw_bib_detection_is_kept_when_tracker_returns_only_athlete():

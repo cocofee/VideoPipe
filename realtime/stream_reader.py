@@ -8,8 +8,14 @@
 import cv2
 import threading
 import time
+from collections import deque
 from typing import Optional, Tuple, Callable
 from enum import Enum
+
+try:
+    from .frame_envelope import FrameEnvelope
+except ImportError:
+    from frame_envelope import FrameEnvelope
 
 try:
     from .logger import logger
@@ -51,7 +57,8 @@ class StreamReader:
         reader.stop()
     """
 
-    def __init__(self, source, buffer_size: int = 1):
+    def __init__(self, source, buffer_size: int = 1, queue_size: int = 8,
+                 overflow_policy: str = "drop_oldest"):
         """
         初始化流读取器
 
@@ -62,7 +69,11 @@ class StreamReader:
             buffer_size: OpenCV缓冲区大小，默认1（最低延迟）
         """
         self.source = source
-        self.buffer_size = buffer_size
+        self.buffer_size = max(1, int(buffer_size))
+        self.queue_capacity = max(1, int(queue_size))
+        if overflow_policy not in {"drop_oldest", "drop_newest"}:
+            raise ValueError("overflow_policy must be 'drop_oldest' or 'drop_newest'")
+        self.overflow_policy = overflow_policy
 
         # 状态
         self._status = StreamStatus.DISCONNECTED
@@ -71,6 +82,9 @@ class StreamReader:
         # 帧数据
         self._frame: Optional[cv2.typing.MatLike] = None
         self._frame_lock = threading.Lock()
+        self._frame_queue = deque()
+        self._queue_lock = threading.Lock()
+        self._dropped_frame_count = 0
         self._frame_time: float = 0  # 帧时间戳
 
         # 流信息
@@ -86,6 +100,8 @@ class StreamReader:
 
         # 统计信息
         self._frame_count: int = 0
+        self._segment_id: int = 0
+        self._connection_established = False
         self._start_time: float = 0
         self._actual_fps: float = 0
         self._last_frame_time: float = 0  # 上一帧接收的时间戳
@@ -134,6 +150,18 @@ class StreamReader:
     def frame_count(self) -> int:
         """已读取帧数"""
         return self._frame_count
+
+    @property
+    def dropped_frame_count(self) -> int:
+        """Return the number of frames discarded on queue overflow."""
+        with self._queue_lock:
+            return self._dropped_frame_count
+
+    @property
+    def queue_depth(self) -> int:
+        """Return the number of unread frame envelopes."""
+        with self._queue_lock:
+            return len(self._frame_queue)
 
     def set_on_status_change(self, callback: Callable[[StreamStatus], None]):
         """设置状态变化回调"""
@@ -206,7 +234,7 @@ class StreamReader:
                 return False
 
             # 设置缓冲区大小（0或1代表最低延迟，Action 5 建议 1）
-            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
 
             # 尝试读取第一帧，确保流真的可用（最多5秒）
             start = time.time()
@@ -240,6 +268,9 @@ class StreamReader:
 
             logger.info(f"[StreamReader] 相机配置: {self._width}x{self._height} @ {self._fps:.1f}fps ({fourcc_str})")
 
+            if self._connection_established:
+                self._segment_id += 1
+            self._connection_established = True
             self._set_status(StreamStatus.CONNECTED)
             return True
 
@@ -247,6 +278,29 @@ class StreamReader:
             logger.exception(f"[StreamReader] 连接发生异常: {e}")
             self._set_status(StreamStatus.ERROR)
             return False
+
+    def _get_capture_time_ms(self, is_video_file: bool, arrival_time_ms: float,
+                             frame_index: int) -> float:
+        if not is_video_file or self._cap is None:
+            return arrival_time_ms
+        try:
+            media_time_ms = float(self._cap.get(cv2.CAP_PROP_POS_MSEC))
+            if media_time_ms >= 0:
+                return media_time_ms
+        except Exception:
+            pass
+        if self._fps > 0:
+            return frame_index * 1000.0 / self._fps
+        return arrival_time_ms
+
+    def _enqueue_envelope(self, envelope: FrameEnvelope) -> None:
+        with self._queue_lock:
+            if len(self._frame_queue) >= self.queue_capacity:
+                self._dropped_frame_count += 1
+                if self.overflow_policy == "drop_newest":
+                    return
+                self._frame_queue.popleft()
+            self._frame_queue.append(envelope)
 
     def _read_loop(self):
         """读帧循环（在独立线程中运行）"""
@@ -278,6 +332,8 @@ class StreamReader:
                     self._cap = None
                 
                 logger.info(f"[StreamReader] 正在尝试重新连接视频源: {self.source}...")
+                reconnecting = self._connection_established or self._frame_count > 0
+                previous_segment_id = self._segment_id
                 if not self._connect():
                     retry_count += 1
                     # 修复：使用指数退避算法，而不是线性增长
@@ -289,6 +345,8 @@ class StreamReader:
                     continue
                 else:
                     retry_count = 0
+                    if reconnecting and self._segment_id == previous_segment_id:
+                        self._segment_id += 1
                     logger.info(f"[StreamReader] 重连成功！")
                     self._last_frame_time = time.time() # 重置看门狗
 
@@ -303,11 +361,24 @@ class StreamReader:
 
             if ret:
                 self._last_frame_time = time.time()
+                arrival_time_ms = time.time() * 1000.0
+                capture_time_ms = self._get_capture_time_ms(
+                    is_video_file, arrival_time_ms, self._frame_count
+                )
+                envelope = FrameEnvelope(
+                    original_frame=frame,
+                    frame_index=self._frame_count,
+                    capture_time_ms=capture_time_ms,
+                    arrival_time_ms=arrival_time_ms,
+                    segment_id=self._segment_id,
+                )
                 # 更新帧（使用引用而不是拷贝，避免内存泄漏）
                 # OpenCV内部缓冲区复用可以通过缓冲区大小设置来避免
                 with self._frame_lock:
                     self._frame = frame
-                    self._frame_time = self._last_frame_time
+                    self._frame_time = arrival_time_ms / 1000.0
+
+                self._enqueue_envelope(envelope)
 
                 self._frame_count += 1
                 fps_frame_count += 1
@@ -390,6 +461,11 @@ class StreamReader:
             # 返回拷贝以避免外部修改，但添加内存管理
             return self._frame.copy() if self._frame is not None else None
 
+    def get_frame_envelope(self) -> Optional[FrameEnvelope]:
+        """Consume the next frame envelope in FIFO order."""
+        with self._queue_lock:
+            return self._frame_queue.popleft() if self._frame_queue else None
+
     def get_frame_with_time(self) -> Tuple[Optional[cv2.typing.MatLike], float]:
         """
         获取最新帧及其时间戳
@@ -426,6 +502,12 @@ class StreamReader:
             "actual_fps": self._actual_fps,
             "frame_count": self._frame_count,
             "eof_reached": self._eof_reached,
+            "queue_capacity": self.queue_capacity,
+            "queue_size": self.queue_capacity,
+            "buffer_size": self.buffer_size,
+            "overflow_policy": self.overflow_policy,
+            "queue_depth": self.queue_depth,
+            "dropped_frame_count": self.dropped_frame_count,
         }
 
 

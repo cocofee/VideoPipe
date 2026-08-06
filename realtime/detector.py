@@ -1379,6 +1379,7 @@ class Detector:
         self.iou_threshold = 0.65 if source_id == 0 else 0.60  # 马拉松并排人流：提高NMS阈值，减少互相压框
         self.ocr_conf_threshold = 0.55  # ✅ 优化: 拒绝低质量OCR
         self.bib_assignment_min_score_margin = 0.05
+        self.untracked_detection_conf = 0.20
         self.ocr_detected_bib_min_width = 40
         self.ocr_detected_bib_min_height = 32
         self.ocr_detected_bib_min_quality = 0.55
@@ -1742,11 +1743,10 @@ class Detector:
         previous_bib_evidence_kind: str = "",
     ) -> bool:
         """Match nested detector boxes only at the final event boundary."""
-        if "detected" in {
+        has_detected_bib_evidence = "detected" in {
             str(current_bib_evidence_kind or "").strip().lower(),
             str(previous_bib_evidence_kind or "").strip().lower(),
-        }:
-            return False
+        }
         if time_diff < 0.0 or time_diff >= 1.20:
             return False
 
@@ -1767,12 +1767,23 @@ class Detector:
         bottom_diff = abs(cy2 - py2)
         width_ratio = max(current_w, previous_w) / min_w
 
-        return (
+        base_match = (
             containment >= 0.85
             and width_ratio <= 1.40
             and center_dx <= max(16.0, min_w * 0.16)
             and bottom_diff <= max(12.0, min_h * 0.08)
         )
+        # A fragmented track can change scale between adjacent crossing frames.
+        scale_changed_match = (
+            time_diff < 0.65
+            and containment >= 0.90
+            and width_ratio <= 1.40
+            and center_dx <= max(16.0, min_w * 0.16)
+            and bottom_diff <= max(20.0, min_h * 0.10)
+        )
+        if has_detected_bib_evidence:
+            return scale_changed_match
+        return base_match or scale_changed_match
 
     # =========================================================================
     # 并排过线判定
@@ -3980,6 +3991,7 @@ class Detector:
         if self._start_time is None:
             self._start_time = time.time()
 
+        timestamp_provided = timestamp is not None
         if timestamp is None:
             current_time = time.time() - self._start_time
         else:
@@ -4319,6 +4331,8 @@ class Detector:
                 if parsed_track_id is not None and parsed_track_id > 0:
                     track_id = parsed_track_id
                 else:
+                    if conf < self.untracked_detection_conf:
+                        continue
                     cx_i = int((x1 + x2) * 0.5)
                     cy_i = int((y1 + y2) * 0.5)
                     best_key = None
@@ -5032,7 +5046,8 @@ class Detector:
                                 state.crossed = True
                                 state.crossed_time = current_time
                                 state.pending_event_data = {
-                                    'cross_time': time.time(),
+                                    'cross_time': current_time if timestamp_provided else time.time(),
+                                    'cross_realtime': time.time(),
                                     'bbox': athlete['bbox'],
                                     'conf': athlete['conf'],
                                     'position': (curr_x, curr_y),
@@ -5437,8 +5452,14 @@ class Detector:
                         except Exception:
                             pass
                     
-                    cross_unix = float(data.get('cross_time') or time.time())
+                    cross_time_value = data.get('cross_time')
+                    cross_unix = float(time.time() if cross_time_value is None else cross_time_value)
+                    cross_realtime_value = data.get('cross_realtime')
+                    cross_realtime_unix = float(
+                        cross_unix if cross_realtime_value is None else cross_realtime_value
+                    )
                     cross_dt = datetime.fromtimestamp(cross_unix)
+                    cross_realtime_dt = datetime.fromtimestamp(cross_realtime_unix)
 
                     event = CrossingEvent(
                         event_id=self._event_id + 1,
@@ -5446,7 +5467,7 @@ class Detector:
                         track_id=tid,
                         cross_time=cross_unix,
                         cross_time_str=cross_dt.strftime("%H:%M:%S.%f")[:-3],
-                        cross_realtime=cross_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                        cross_realtime=cross_realtime_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
                         bib_number=state.best_bib,
                         bib_confidence=state.best_bib_conf,
                         bib_status=bib_status,

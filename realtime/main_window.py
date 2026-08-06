@@ -134,6 +134,7 @@ except ImportError:
 
 # 支持直接运行和作为模块运行
 try:
+    from .frame_envelope import FrameEnvelope
     from .stream_reader import StreamReader, StreamStatus
     from .detector import Detector, CrossingEvent, LOCAL_VIDEO_EVENT_SETTLE_SECONDS, PaddleOcrAdapter, resolve_athlete_validator_model
     from .database import Database
@@ -149,6 +150,7 @@ except ImportError:
     if current_dir not in sys.path:
         sys.path.insert(0, current_dir)
     
+    from frame_envelope import FrameEnvelope
     from stream_reader import StreamReader, StreamStatus
     from detector import Detector, CrossingEvent, LOCAL_VIDEO_EVENT_SETTLE_SECONDS, PaddleOcrAdapter, resolve_athlete_validator_model
     from database import Database
@@ -525,6 +527,8 @@ class VideoThread(QThread):
         self.source_id = source_id
         self.ui_skip = ui_skip  # UI刷新间隔（不影响检测，每帧都检测）
         self._running = False
+        self.last_processed_envelope: Optional[FrameEnvelope] = None
+        self.last_frame_metrics: Dict[str, Any] = {}
         
         # 绑定流状态回调
         self.reader.set_on_status_change(self._on_stream_status_change)
@@ -556,8 +560,18 @@ class VideoThread(QThread):
         last_frame_ts = 0.0
 
         while self._running:
+            envelope = None
             try:
-                frame, frame_ts = self.reader.get_frame_after(last_frame_ts)
+                get_frame_envelope = getattr(self.reader, "get_frame_envelope", None)
+                if callable(get_frame_envelope):
+                    envelope = get_frame_envelope()
+                    if envelope is None:
+                        frame, frame_ts = None, last_frame_ts
+                    else:
+                        frame = envelope.original_frame
+                        frame_ts = envelope.capture_time_ms / 1000.0
+                else:
+                    frame, frame_ts = self.reader.get_frame_after(last_frame_ts)
             except Exception as e:
                 logger.exception(f"[VideoThread-{self.source_id}] 获取新帧异常: {e}")
                 time.sleep(0.01)
@@ -570,17 +584,47 @@ class VideoThread(QThread):
                 time.sleep(0.001)
                 continue
 
-            if frame_ts > 0:
+            if envelope is None and frame_ts > 0:
                 last_frame_ts = frame_ts
 
             frame_count += 1
+            processing_started = time.monotonic()
+            processing_started_wall_ms = time.time() * 1000.0
 
             # 每帧都检测（保持ByteTrack跟踪连续性）
             try:
-                events, athletes, bibs = self.detector.process_frame(frame)
+                if envelope is None:
+                    events, athletes, bibs = self.detector.process_frame(frame)
+                else:
+                    try:
+                        events, athletes, bibs = self.detector.process_frame(
+                            frame, timestamp=envelope.capture_time_ms / 1000.0
+                        )
+                    except TypeError as error:
+                        if "unexpected keyword argument 'timestamp'" not in str(error):
+                            raise
+                        events, athletes, bibs = self.detector.process_frame(frame)
             except Exception as e:
                 logger.exception(f"[VideoThread-{self.source_id}] process_frame 异常: {e}")
                 events, athletes, bibs = [], [], []
+            if envelope is not None:
+                processing_time_ms = (time.monotonic() - processing_started) * 1000.0
+                envelope = envelope.with_processing_time(processing_time_ms)
+                self.last_processed_envelope = envelope
+                capture_latency_ms = envelope.arrival_time_ms - envelope.capture_time_ms
+                if capture_latency_ms < 0 or capture_latency_ms > 60_000:
+                    capture_latency_ms = None
+                queue_latency_ms = max(0.0, processing_started_wall_ms - envelope.arrival_time_ms)
+                self.last_frame_metrics = {
+                    "frame_index": envelope.frame_index,
+                    "segment_id": envelope.segment_id,
+                    "capture_time_ms": envelope.capture_time_ms,
+                    "arrival_time_ms": envelope.arrival_time_ms,
+                    "capture_latency_ms": capture_latency_ms,
+                    "queue_latency_ms": queue_latency_ms,
+                    "processing_time_ms": processing_time_ms,
+                    "end_to_end_latency_ms": queue_latency_ms + processing_time_ms,
+                }
 
             # 发送过线事件
             for event in events:

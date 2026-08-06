@@ -93,9 +93,6 @@ target_link_libraries(lane_detect_sample ${PROJECT_NAME})
 add_executable(frame_fusion_sample "frame_fusion_sample.cpp")
 target_link_libraries(frame_fusion_sample ${PROJECT_NAME})
 
-add_executable(vp_test "vp_test.cpp")
-target_link_libraries(vp_test ${PROJECT_NAME})
-
 # samples depend on Kafka
 if(VP_WITH_KAFKA)
     add_executable(message_broker_kafka_sample "message_broker_kafka_sample.cpp")
@@ -194,44 +191,4 @@ if(VP_WITH_TRT)
 
     add_executable(rtmp_src_sample "rtmp_src_sample.cpp")
     target_link_libraries(rtmp_src_sample ${PROJECT_NAME})
-endif()
-
-if(VP_BUILD_COMPLEX_SAMPLES)
-    message("start build for complex sampels...")
-    # save exe to 'face_recognize'
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/face_recognize)
-    add_executable(face_recognize_pipeline "face_recognize/face_recognize_pipeline.cpp")
-    target_link_libraries(face_recognize_pipeline ${PROJECT_NAME})
-
-    if(VP_WITH_TRT) # samples depend on TensorRT   
-        # save exe to 'similiarity_search'
-        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/similiarity_search)
-        add_executable(face_encoding_pipeline "similiarity_search/face_encoding_pipeline.cpp")
-        target_link_libraries(face_encoding_pipeline ${PROJECT_NAME})
-        add_executable(vehicle_encoding_pipeline "similiarity_search/vehicle_encoding_pipeline.cpp")
-        target_link_libraries(vehicle_encoding_pipeline ${PROJECT_NAME})
-
-        # save exe to 'vehicle_behaviour_analysis'
-        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/vehicle_behaviour_analysis)
-        add_executable(vehicle_ba_pipeline "vehicle_behaviour_analysis/vehicle_ba_pipeline.cpp")
-        target_link_libraries(vehicle_ba_pipeline ${PROJECT_NAME})
-
-        # save exe to 'vehicle_property_and_similiarity_search'
-        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/vehicle_property_and_similiarity_search)
-        add_executable(vehicle_encoding_classify_pipeline "vehicle_property_and_similiarity_search/vehicle_encoding_classify_pipeline.cpp")
-        target_link_libraries(vehicle_encoding_classify_pipeline ${PROJECT_NAME})
-
-        # save exe to 'lpr_camera'
-        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/lpr_camera)
-        add_executable(plate_recognize_pipeline "lpr_camera/plate_recognize_pipeline.cpp")
-        target_link_libraries(plate_recognize_pipeline ${PROJECT_NAME})
-    endif()
-
-    if(VP_WITH_PADDLE)
-        # save exe to 'math_review'
-        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/math_review)
-        add_executable(math_expression_check_pipeline "math_review/math_expression_check_pipeline.cpp")
-        target_link_libraries(math_expression_check_pipeline ${PROJECT_NAME}) 
-    endif()
-    
 endif()

@@ -95,7 +95,6 @@ After compilation, all library files are stored in `build/libs`, and all sample 
 - `-DVP_WITH_PADDLE=ON` (Compile PaddlePaddle-related features and samples; default is OFF)
 - `-DVP_WITH_KAFKA=ON` (Compile Kafka-related features and samples; default is OFF)
 - `-DVP_WITH_LLM=ON` (Compile LLM-related features and samples; default is OFF)
-- `-DVP_BUILD_COMPLEX_SAMPLES=ON` (Compile advanced samples; default is OFF)
 
 For example, to enable CUDA and TensorRT modules, you can run:
 ```bash

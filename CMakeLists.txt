@@ -21,7 +21,6 @@ option(VP_WITH_PADDLE "prepared PaddlePaddle or not?" OFF)
 option(VP_WITH_KAFKA "prepared Kafka or not?" OFF)
 option(VP_WITH_LLM "prepared LLM or not?" OFF)
 option(VP_WITH_FFMPEG "prepared FFMPEG or not?" OFF)
-option(VP_BUILD_COMPLEX_SAMPLES "build complex samples or not? (maybe source code not provided)" OFF)
 
 # OpenCV required
 find_package(OpenCV REQUIRED)

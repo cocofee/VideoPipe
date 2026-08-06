@@ -92,7 +92,6 @@ VideoPipe 是一个让计算机视觉算法模型集成更加简单的框架，�
 - -DVP_WITH_PADDLE=ON （编译 PaddlePaddle 相关功能和 Samples，默认为 OFF）
 - -DVP_WITH_KAFKA=ON （编译 Kafka 相关功能和 Samples，默认为 OFF）
 - -DVP_WITH_LLM=ON （编译 LLM 相关功能和 Samples，默认为 OFF）
-- -DVP_BUILD_COMPLEX_SAMPLES=ON （编译高级 Samples，默认为 OFF）
 
 比如需要开启CUDA和TensorRT相关的模块，可以运行 `cmake -DVP_WITH_CUDA=ON -DVP_WITH_TRT=ON ..`。如果只运行 `cmake ..`，那么所有代码运行在 CPU 上。
 
@@ -101,8 +100,7 @@ VideoPipe 是一个让计算机视觉算法模型集成更加简单的框架，�
 cmake -DVP_WITH_CUDA=ON \
 -DVP_WITH_TRT=ON \
 -DVP_WITH_PADDLE=ON \
--DVP_WITH_KAFKA=ON \
--DVP_BUILD_COMPLEX_SAMPLES=ON ..
+-DVP_WITH_KAFKA=ON
 
 # 关闭全部（默认）
 cmake ..

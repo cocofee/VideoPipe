@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "case_id": "cycling_external_template",
+      "video_path_env": "VIDEOPIPE_CYCLING_VIDEO",
+      "model_path_env": "VIDEOPIPE_CYCLING_MODEL",
+      "event_profile": {
+        "name": "cycling-external",
+        "pipeline": "athlete_bib",
+        "required_equipment": "bicycle",
+        "crossing_mode": "finish_once",
+        "bib_regions": ["torso", "back", "handlebar", "frame"]
+      },
+      "known_same_participant_tracks": [[405, 605]],
+      "known_distinct_tracks": [[5534, 6543]],
+      "expected_in_clip_crossings": null,
+      "require_evidence": false,
+      "notes": "Set the crossing baseline only after processing a retained real competition video."
+    }
+  ]
+}

@@ -599,6 +599,13 @@ class EventRecorder:
                     meta["bbox_bib"] = list(event.bib_bbox)
                 if event.bib_evidence_kind:
                     meta["bib_evidence_kind"] = event.bib_evidence_kind
+                if event.participant_id:
+                    meta["participant_id"] = event.participant_id
+                meta["raw_track_id"] = event.track_id
+                meta["raw_track_ids"] = self._collect_raw_track_ids(
+                    event,
+                    meta.get("raw_track_ids", []),
+                )
             except Exception as e:
                 logger.error(f"[EventRecorder] 加载旧 meta.json 失败: {e}")
                 meta = self._create_initial_meta(event, paths)
@@ -614,11 +621,26 @@ class EventRecorder:
         
         return str(event_dir)
 
+    @staticmethod
+    def _collect_raw_track_ids(event: CrossingEvent, existing: Optional[List[int]] = None) -> List[int]:
+        raw_track_ids = set()
+        for track_id in [*(existing or []), *(event.raw_track_ids or ()), event.track_id]:
+            try:
+                normalized = int(track_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized >= 0:
+                raw_track_ids.add(normalized)
+        return sorted(raw_track_ids)
+
     def _create_initial_meta(self, event: CrossingEvent, paths: dict) -> dict:
         """创建初始元数据字典"""
         return {
             "event_id": event.event_id,
             "track_id": event.track_id,
+            "participant_id": event.participant_id,
+            "raw_track_id": event.track_id,
+            "raw_track_ids": self._collect_raw_track_ids(event),
             "cross_time_unix": event.cross_time,
             "cross_time_str": event.cross_time_str,
             "cross_realtime": event.cross_realtime,
@@ -1116,6 +1138,10 @@ class EventRecorder:
                     'event_id': event.event_id,
                     'rank': event.rank,
                     'track_id': event.track_id,
+                    'participant_id': event.participant_id,
+                    'raw_track_ids': list(event.raw_track_ids or ()),
+                    'sport_profile': event.sport_profile,
+                    'passage_index': event.passage_index,
                     'cross_time': event.cross_time,
                     'cross_time_str': event.cross_time_str,
                     'cross_realtime': event.cross_realtime,

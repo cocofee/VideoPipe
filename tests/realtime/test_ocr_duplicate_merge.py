@@ -131,6 +131,82 @@ def test_ocr_manager_falls_back_to_normal_update_when_merge_fails():
     assert len(db.update_calls) == 1
 
 
+def test_participant_ocr_does_not_merge_distinct_participants_by_bib_and_time(tmp_path):
+    class _CrossParticipantMergeDatabase(_MergeDatabase):
+        def get_event_by_bib_and_time(self, *args, **kwargs):
+            return {"event_id": 1, "participant_id": "P1"}
+
+    db = _CrossParticipantMergeDatabase()
+    manager = OCRManager(db)
+    manager.only_numeric = True
+    manager.ocr = object()
+    event_dir = tmp_path / "000001"
+    _write_consensus_event(event_dir, [20, 20, 20])
+    meta_path = event_dir / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.update({"event_id": 2, "participant_id": "P2", "track_id": 22})
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    manager._run_multi_scale_ocr = lambda img: ("23", 0.95, "fake")
+
+    manager._process_event(event_dir)
+
+    result = json.loads((event_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["participant_id"] == "P2"
+    assert result["merged_to"] is None
+    assert db.merge_calls == []
+    assert len(db.update_calls) == 1
+
+
+def test_participant_ocr_keeps_confidence_with_the_selected_candidate(tmp_path):
+    db = _MergeDatabase()
+    manager = OCRManager(db)
+    manager.only_numeric = True
+    manager.ocr = object()
+
+    outputs = [("165", 0.95), ("165", 0.95), ("185", 0.80)]
+
+    def _write_participant_event(event_dir, value, track_id):
+        event_dir.mkdir()
+        for name in ("bib.jpg", "bib_candidate_01.jpg"):
+            cv2.imwrite(str(event_dir / name), np.full((40, 60, 3), value, dtype=np.uint8))
+        (event_dir / "meta.json").write_text(
+            json.dumps(
+                {
+                    "event_id": track_id,
+                    "track_id": track_id,
+                    "participant_id": "P4",
+                    "cross_time_unix": float(track_id),
+                    "bbox_athlete": [0, 0, 100, 160],
+                    "bbox_bib": [20, 40, 80, 80],
+                    "bib_evidence_kind": "detected",
+                    "paths": {
+                        "bib": "bib.jpg",
+                        "bib_candidates": ["bib_candidate_01.jpg"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    _write_participant_event(tmp_path / "000001", 20, 1)
+    _write_participant_event(tmp_path / "000002", 40, 2)
+    _write_participant_event(tmp_path / "000003", 120, 3)
+
+    def _ocr_by_pixel(img):
+        index = 0 if int(round(float(img.mean()))) < 30 else 1 if int(round(float(img.mean()))) < 100 else 2
+        bib, confidence = outputs[index]
+        return bib, confidence, "fake"
+
+    manager._run_multi_scale_ocr = _ocr_by_pixel
+    manager._process_event(tmp_path / "000001", participant_id="P4", raw_track_id=405)
+    manager._process_event(tmp_path / "000002", participant_id="P4", raw_track_id=605)
+    manager._process_event(tmp_path / "000003", participant_id="P4", raw_track_id=705)
+
+    result = json.loads((tmp_path / "000003" / "result.json").read_text(encoding="utf-8"))
+    assert result["bib"] == "165"
+    assert result["confidence"] == 0.95
+
+
 def test_pending_ocr_clears_a_previous_automatic_bib(tmp_path):
     db = Database(str(tmp_path / "event.db"))
     try:
@@ -440,6 +516,8 @@ def test_event_recorder_saves_ranked_bib_candidates(tmp_path):
                 (0.9, np.full((40, 60, 3), 40, dtype=np.uint8), [20, 40, 80, 80]),
                 (0.8, np.full((38, 58, 3), 80, dtype=np.uint8), [21, 41, 79, 79]),
             ],
+            participant_id="P4",
+            raw_track_ids=(405, 605),
         )
 
         event_dir = Path(recorder._save_evidence_to_disk(event))
@@ -452,5 +530,8 @@ def test_event_recorder_saves_ranked_bib_candidates(tmp_path):
             "bib_candidate_02.jpg",
         ]
         assert meta["bib_evidence_kind"] == "detected"
+        assert meta["participant_id"] == "P4"
+        assert meta["raw_track_id"] == 7
+        assert meta["raw_track_ids"] == [7, 405, 605]
     finally:
         db.close()

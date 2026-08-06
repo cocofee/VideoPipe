@@ -4,6 +4,8 @@ import time
 import threading
 import queue
 import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
@@ -15,6 +17,38 @@ from .database import Database
 from .io_utils import read_image_unicode
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ParticipantOcrState:
+    """Participant-keyed OCR evidence while retaining raw-track audit data."""
+
+    participant_id: str
+    raw_track_ids: set[int] = field(default_factory=set)
+    votes: list[tuple[str, float]] = field(default_factory=list)
+    best_candidate: Optional[str] = None
+    best_confidence: float = 0.0
+    status: str = "PENDING"
+
+    def add_vote(self, raw_track_id: int, text: str, confidence: float) -> None:
+        normalized = str(text or "").strip().upper()
+        if not normalized:
+            return
+
+        self.raw_track_ids.add(int(raw_track_id))
+        self.votes.append((normalized, float(confidence)))
+        scores = defaultdict(float)
+        confidences = defaultdict(float)
+        for candidate, score in self.votes:
+            scores[candidate] += score
+            confidences[candidate] = max(confidences[candidate], score)
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        self.best_candidate = ranked[0][0]
+        self.best_confidence = confidences[self.best_candidate]
+        if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < 0.25:
+            self.status = "CONFLICT"
+        else:
+            self.status = "RECOGNIZED"
 
 class OCRManager:
     """
@@ -43,6 +77,9 @@ class OCRManager:
         self._worker_thread = None
         self._queue_lock = threading.Lock()
         self._queued_event_dirs = set()
+        # Participant-keyed consensus is additive; event/track APIs remain intact.
+        self._participant_ocr_states: Dict[str, ParticipantOcrState] = {}
+        self._participant_ocr_lock = threading.Lock()
         
         # 统计
         self.stats = {
@@ -219,6 +256,38 @@ class OCRManager:
                     return True
         return False
 
+    def get_participant_ocr_state(self, participant_id: Optional[str], create: bool = True) -> Optional[ParticipantOcrState]:
+        """Return participant OCR state without making identity decisions."""
+        key = str(participant_id or "").strip()
+        if not key:
+            return None
+        with self._participant_ocr_lock:
+            state = self._participant_ocr_states.get(key)
+            if state is None and create:
+                state = ParticipantOcrState(participant_id=key)
+                self._participant_ocr_states[key] = state
+            return state
+
+    def _add_participant_ocr_vote(
+        self,
+        participant_id: Optional[str],
+        raw_track_id: Optional[int],
+        text: Any,
+        confidence: float,
+    ) -> Optional[ParticipantOcrState]:
+        """Normalize and roster-validate a candidate before participant aggregation."""
+        if not participant_id or raw_track_id is None:
+            return None
+        normalized = self._normalize_bib_text(text)
+        if not normalized or not self._is_in_bib_ranges(normalized):
+            return None
+        state = self.get_participant_ocr_state(participant_id)
+        if state is None:
+            return None
+        with self._participant_ocr_lock:
+            state.add_vote(raw_track_id=int(raw_track_id), text=normalized, confidence=float(confidence or 0.0))
+        return state
+
     def set_ocr(self, ocr_engine: PaddleOcrAdapter, vlm_engine: Optional[Any] = None):
         """动态设置识别引擎"""
         self.ocr = ocr_engine
@@ -354,7 +423,13 @@ class OCRManager:
                         pass # 文件损坏则重新识别
                 
                 # 入队：(优先级=时间戳, 数据=目录路径)
-                tasks.append((meta.get("cross_time_unix", 0), str(edir)))
+                participant_id = str(meta.get("participant_id") or "").strip()
+                raw_track_id = meta.get("track_id")
+                try:
+                    raw_track_id = int(raw_track_id) if raw_track_id is not None else None
+                except (TypeError, ValueError):
+                    raw_track_id = None
+                tasks.append((meta.get("cross_time_unix", 0), str(edir), participant_id, raw_track_id))
                 self.stats["pending"] += 1
                 
             except Exception as e:
@@ -376,7 +451,14 @@ class OCRManager:
         self._worker_thread.start()
         logger.info(f"OCR 批处理启动: {self.stats['pending']} 个任务待处理")
 
-    def enqueue_live_event(self, event_id: int, evidence_dir: Optional[str] = None, cross_time: Optional[float] = None) -> bool:
+    def enqueue_live_event(
+        self,
+        event_id: int,
+        evidence_dir: Optional[str] = None,
+        cross_time: Optional[float] = None,
+        participant_id: Optional[str] = None,
+        raw_track_id: Optional[int] = None,
+    ) -> bool:
         """实时自动补号入口：将单个事件加入 OCR 队列（若可处理）。"""
         if event_id is None:
             return False
@@ -393,6 +475,10 @@ class OCRManager:
                     evidence_dir = resolved_event.get("evidence_dir")
                     if cross_time is None:
                         cross_time = resolved_event.get("cross_time")
+                    if participant_id is None:
+                        participant_id = resolved_event.get("participant_id")
+                    if raw_track_id is None:
+                        raw_track_id = resolved_event.get("track_id")
             except Exception as e:
                 logger.debug(f"[OCRManager] 读取事件失败，无法自动入队: event_id={event_id}, err={e}")
                 return False
@@ -421,7 +507,11 @@ class OCRManager:
                 return False
             self._queued_event_dirs.add(event_dir_str)
 
-        self.task_queue.put((priority, event_dir_str))
+        try:
+            raw_track_id = int(raw_track_id) if raw_track_id is not None else None
+        except (TypeError, ValueError):
+            raw_track_id = None
+        self.task_queue.put((priority, event_dir_str, str(participant_id or ""), raw_track_id))
         self.stats["total"] = int(self.stats.get("total", 0)) + 1
         self.stats["pending"] = int(self.stats.get("pending", 0)) + 1
 
@@ -444,13 +534,22 @@ class OCRManager:
 
         while self._running and not self.task_queue.empty():
             try:
-                _, event_dir_str = self.task_queue.get(timeout=1.0)
+                task_item = self.task_queue.get(timeout=1.0)
+                if len(task_item) >= 4:
+                    _, event_dir_str, participant_id, raw_track_id = task_item
+                else:
+                    _, event_dir_str = task_item
+                    participant_id, raw_track_id = "", None
                 try:
                     # 规则在 start_batch / enqueue_live_event 时已同步
                     # 仅实时模式下每50个事件刷新一次（用户可能在UI修改规则）
                     if batch_count > 0 and batch_count % 50 == 0:
                         self._refresh_rules_from_db()
-                    self._process_event(Path(event_dir_str))
+                    self._process_event(
+                        Path(event_dir_str),
+                        participant_id=participant_id,
+                        raw_track_id=raw_track_id,
+                    )
                 finally:
                     with self._queue_lock:
                         self._queued_event_dirs.discard(event_dir_str)
@@ -650,7 +749,12 @@ class OCRManager:
 
         return "good", f"号码牌框正常({bib_w}x{bib_h}px)"
 
-    def _process_event(self, event_dir: Path):
+    def _process_event(
+        self,
+        event_dir: Path,
+        participant_id: Optional[str] = None,
+        raw_track_id: Optional[int] = None,
+    ):
         """处理单个事件（CPU模式：OCR在CPU运行，GPU 100% 留给YOLO实时检测）
 
         CPU模式策略（每事件最多3次OCR，平衡速度与准确率）：
@@ -668,6 +772,13 @@ class OCRManager:
                 meta = json.load(f)
 
             event_id = meta["event_id"]
+            participant_id = str(participant_id or meta.get("participant_id") or "").strip()
+            if raw_track_id is None:
+                raw_track_id = meta.get("track_id")
+            try:
+                raw_track_id = int(raw_track_id) if raw_track_id is not None else None
+            except (TypeError, ValueError):
+                raw_track_id = None
 
             if not self.ocr:
                 logger.error("未设置 OCR 引擎")
@@ -774,11 +885,27 @@ class OCRManager:
             error = ""
 
             # 3. 归并逻辑 (统一为一个运动员)
+            participant_state = None
+            if best_bib and participant_id and raw_track_id is not None:
+                participant_state = self._add_participant_ocr_vote(
+                    participant_id,
+                    raw_track_id,
+                    best_bib,
+                    best_conf,
+                )
+                if participant_state and participant_state.best_candidate:
+                    best_bib = participant_state.best_candidate
+                    best_conf = participant_state.best_confidence
+            participant_conflict = bool(
+                participant_state and participant_state.status == "CONFLICT"
+            )
+
             merged_to = None
             can_auto_confirm = (
                 (not multi_frame_required or multi_frame_consistent)
                 and not fallback_only_evidence
                 and not insufficient_multi_frame_evidence
+                and not participant_conflict
             )
             if best_bib and best_conf >= self.conf_threshold and can_auto_confirm:
                 cross_time = meta.get("cross_time_unix")
@@ -788,7 +915,7 @@ class OCRManager:
                     cross_time = None
 
                 nearby_event = None
-                if cross_time is not None:
+                if cross_time is not None and not participant_id:
                     if cross_time > 1e12:
                         cross_time = cross_time / 1000.0
                     nearby_event = self.db.get_event_by_bib_and_time(
@@ -810,6 +937,8 @@ class OCRManager:
                     error = "INSUFFICIENT_MULTI_FRAME_EVIDENCE"
                 elif multi_frame_required and best_bib and not multi_frame_consistent:
                     error = "INCONSISTENT_MULTI_FRAME"
+                elif participant_conflict:
+                    error = "PARTICIPANT_OCR_CONFLICT"
                 elif best_bib:
                     error = "LOW_CONF"
                 elif quality_grade == "poor":
@@ -831,7 +960,10 @@ class OCRManager:
                 merged_to=merged_to,
                 source=source,
                 image_source=best_image,
-                crop_applied=False
+                crop_applied=False,
+                participant_id=participant_id,
+                raw_track_id=raw_track_id,
+                participant_status=(participant_state.status if participant_state else "PENDING"),
             )
             
             self._persist_ocr_resolution(
@@ -1262,10 +1394,28 @@ class OCRManager:
 
         return best_bib, best_conf, best_source, best_image, best_crop_applied, error
 
-    def _save_result(self, event_dir: Path, meta: dict, bib: Optional[str], conf: float, status: str, error: str = "", merged_to: Optional[int] = None, source: str = "LOCAL", image_source: str = "", crop_applied: bool = False):
+    def _save_result(
+        self,
+        event_dir: Path,
+        meta: dict,
+        bib: Optional[str],
+        conf: float,
+        status: str,
+        error: str = "",
+        merged_to: Optional[int] = None,
+        source: str = "LOCAL",
+        image_source: str = "",
+        crop_applied: bool = False,
+        participant_id: Optional[str] = None,
+        raw_track_id: Optional[int] = None,
+        participant_status: str = "PENDING",
+    ):
         """保存 result.json (原子操作)"""
         result = {
             "event_id": meta["event_id"],
+            "participant_id": str(participant_id or meta.get("participant_id") or ""),
+            "raw_track_id": raw_track_id if raw_track_id is not None else meta.get("track_id"),
+            "participant_ocr_status": participant_status,
             "bib": bib,
             "confidence": float(conf),
             "status": status,

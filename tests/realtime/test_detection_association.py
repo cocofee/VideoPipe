@@ -10,6 +10,7 @@ from realtime.detector import (
     resolve_athlete_validator_model,
     resolve_performance_profile,
 )
+from realtime.event_profile import build_event_profile
 
 
 def _athlete(track_id, bbox):
@@ -458,9 +459,120 @@ def test_default_sport_profile_is_cycling():
     assert detector.sport_profile == "cycling"
 
 
-def test_running_profile_is_not_silently_treated_as_cycling():
-    with pytest.raises(ValueError, match="running"):
-        Detector(model_path="fake.pt", model=None, ocr=None, sport_profile="running")
+def test_detector_exposes_stable_participant_id_for_track_fragment():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    try:
+        first = detector.resolve_participant(
+            _athlete(405, (700, 300, 850, 900)), timestamp=1.0
+        )
+        second = detector.resolve_participant(
+            _athlete(605, (705, 320, 846, 902)), timestamp=1.4
+        )
+
+        assert second["participant_id"] == first["participant_id"]
+        assert second["raw_track_ids"] == [405, 605]
+        assert second["identity_status"] == "ACTIVE"
+    finally:
+        detector.stop()
+
+
+def test_detector_keeps_raw_track_id_for_audit():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    try:
+        resolved = detector.resolve_participant(
+            _athlete(405, (700, 300, 850, 900)), timestamp=1.0
+        )
+
+        assert resolved["track_id"] == 405
+        assert resolved["raw_track_ids"] == [405]
+        assert resolved["participant_id"]
+        assert resolved["identity_status"] == "ACTIVE"
+    finally:
+        detector.stop()
+
+
+def test_detector_reset_starts_a_new_participant_identity_session():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    try:
+        first, first_resolution = detector._resolve_participant_with_resolution(
+            _athlete(405, (700, 300, 850, 900)), timestamp=1.0
+        )
+
+        detector.reset()
+
+        second, second_resolution = detector._resolve_participant_with_resolution(
+            _athlete(405, (700, 300, 850, 900)), timestamp=1.0
+        )
+
+        assert first["participant_id"] == "P000001"
+        assert second["participant_id"] == "P000001"
+        assert first_resolution.created is True
+        assert second_resolution.created is True
+    finally:
+        detector.stop()
+
+
+def test_running_profile_uses_common_pipeline_without_bicycle_validation():
+    validator = _ValidatorModel(["person"])
+    detector = Detector(
+        model_path="fake.pt",
+        model=None,
+        ocr=None,
+        athlete_validator=validator,
+        sport_profile="running",
+    )
+    crop = np.zeros((160, 100, 3), dtype=np.uint8)
+
+    assert detector.sport_profile == "running"
+    assert detector.event_profile.pipeline == "athlete_bib"
+    assert detector.event_profile.required_equipment is None
+    assert detector._passes_athlete_event_validation(
+        TrackState(prev_x=0, prev_y=0),
+        crop,
+    ) is True
+    assert validator.calls == 0
+
+
+def test_explicit_event_profile_overrides_legacy_sport_name():
+    validator = _ValidatorModel(["person"])
+    profile = build_event_profile(name="current-skating-event")
+    detector = Detector(
+        model_path="fake.pt",
+        model=None,
+        ocr=None,
+        athlete_validator=validator,
+        sport_profile="cycling",
+        event_profile=profile,
+    )
+    crop = np.zeros((160, 100, 3), dtype=np.uint8)
+
+    assert detector.event_profile is profile
+    assert detector.sport_profile == "current-skating-event"
+    assert detector._passes_athlete_event_validation(
+        TrackState(prev_x=0, prev_y=0),
+        crop,
+    ) is True
+    assert validator.calls == 0
+
+
+def test_blank_legacy_sport_profile_preserves_cycling_validation():
+    validator = _ValidatorModel(["person"])
+    detector = Detector(
+        model_path="fake.pt",
+        model=None,
+        ocr=None,
+        athlete_validator=validator,
+        sport_profile="   ",
+    )
+    crop = np.zeros((160, 100, 3), dtype=np.uint8)
+
+    assert detector.sport_profile == "cycling"
+    assert detector.event_profile.required_equipment == "bicycle"
+    assert detector._passes_athlete_event_validation(
+        TrackState(prev_x=0, prev_y=0),
+        crop,
+    ) is False
+    assert validator.calls == 1
 
 
 def test_bib_evidence_requires_secondary_athlete_validation_in_cycling_profile():
@@ -626,6 +738,46 @@ def test_rejected_candidate_does_not_consume_event_id():
     accepted_events, _, _ = detector.process_frame(frame, timestamp=2.0)
 
     assert [event.event_id for event in accepted_events] == [1]
+
+
+def test_crossing_lifecycle_admits_by_participant_before_allocating_event_id():
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+    detector = Detector(
+        model_path="fake.pt",
+        model=_EmptyTrackingModel(),
+        ocr=None,
+        athlete_validator=_ValidatorModel(["bicycle"]),
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+
+    first_state = _pending_crossing_state(frame, 101)
+    first_state.pending_event_data["participant_id"] = "P4"
+    first_state.pending_event_data["raw_track_ids"] = (55, 101)
+    detector._track_states[101] = first_state
+    first_events, _, _ = detector.process_frame(frame, timestamp=1.0)
+
+    second_state = _pending_crossing_state(frame, 202)
+    second_state.pending_event_data.update(
+        {
+            "participant_id": "P4",
+            "raw_track_ids": (202,),
+            "bbox": [400, 120, 480, 280],
+        }
+    )
+    second_state.best_athlete_crop = frame[120:280, 400:480].copy()
+    detector._track_states[202] = second_state
+    second_events, _, _ = detector.process_frame(frame, timestamp=2.0)
+
+    assert [event.event_id for event in first_events] == [1]
+    assert first_events[0].participant_id == "P4"
+    assert first_events[0].raw_track_ids == (55, 101)
+    assert second_events == []
+    assert detector._event_id == 1
+    snapshot = detector._crossing_lifecycle.snapshot_for_key(
+        (detector._crossing_session_id, detector.source_id, "P4")
+    )
+    assert snapshot.raw_track_ids == (101, 202)
 
 
 def test_rejected_bib_candidate_does_not_consume_event_id():

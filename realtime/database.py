@@ -108,6 +108,10 @@ class Database:
                 event_id INTEGER UNIQUE,
                 rank INTEGER,
                 track_id INTEGER,
+                participant_id TEXT,
+                raw_track_ids_json TEXT,
+                sport_profile TEXT DEFAULT 'cycling',
+                passage_index INTEGER DEFAULT 1,
                 cross_time REAL,
                 cross_time_str TEXT,
                 cross_realtime TEXT,
@@ -183,7 +187,11 @@ class Database:
             'original_bib': 'TEXT',
             'is_ai_correction': 'INTEGER DEFAULT 0',
             'evidence_dir': 'TEXT',
-            'ocr_state': 'TEXT DEFAULT "PENDING"'
+            'ocr_state': 'TEXT DEFAULT "PENDING"',
+            'participant_id': 'TEXT',
+            'raw_track_ids_json': 'TEXT',
+            'sport_profile': "TEXT DEFAULT 'cycling'",
+            'passage_index': 'INTEGER DEFAULT 1'
         }
         
         # 获取现有字段名
@@ -216,6 +224,46 @@ class Database:
             pass
             
         return s
+
+    @staticmethod
+    def _normalize_raw_track_ids(raw_track_ids: Any, compatibility_track_id: Any = None) -> List[int]:
+        value = raw_track_ids
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = []
+        if value is None:
+            value = []
+        elif not isinstance(value, (list, tuple, set)):
+            value = [value]
+
+        normalized = set()
+        for track_id in value:
+            try:
+                track_id = int(track_id)
+            except (TypeError, ValueError):
+                continue
+            if track_id >= 0:
+                normalized.add(track_id)
+
+        if not normalized:
+            try:
+                compatibility_track_id = int(compatibility_track_id)
+            except (TypeError, ValueError):
+                compatibility_track_id = None
+            if compatibility_track_id is not None and compatibility_track_id >= 0:
+                normalized.add(compatibility_track_id)
+
+        return sorted(normalized)
+
+    def _event_record(self, row: sqlite3.Row) -> Dict[str, Any]:
+        record = dict(row)
+        record['raw_track_ids'] = self._normalize_raw_track_ids(
+            record.get('raw_track_ids_json'),
+            record.get('track_id'),
+        )
+        return record
 
     def _coerce_float(self, value: Any) -> Optional[float]:
         """将值转换为 float（用于相对时间秒）"""
@@ -521,17 +569,27 @@ class Database:
 
             cursor.execute('''
                 INSERT INTO crossing_events (
-                    event_id, rank, track_id, cross_time, cross_time_str,
+                    event_id, rank, track_id, participant_id, raw_track_ids_json, sport_profile, passage_index,
+                    cross_time, cross_time_str,
                     cross_realtime, bib_number, original_bib, bib_confidence, bib_status, detection_confidence,
                     source_id, position_x, position_y, bbox,
                     screenshot_full, screenshot_clean, screenshot_crop, screenshot_bib,
                     is_test, finish_time, evidence_dir, ocr_state, notes,
                     created_at, modified_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 event.get('event_id'),
                 event.get('rank'),
                 event.get('track_id'),
+                event.get('participant_id') or None,
+                json.dumps(
+                    self._normalize_raw_track_ids(
+                        event.get('raw_track_ids', event.get('raw_track_ids_json')),
+                        event.get('track_id'),
+                    )
+                ),
+                event.get('sport_profile') or 'cycling',
+                int(event.get('passage_index') or 1),
                 event.get('cross_time'),
                 event.get('cross_time_str'),
                 event.get('cross_realtime'),
@@ -823,7 +881,7 @@ class Database:
             row = cursor.fetchone()
 
             if row:
-                return dict(row)
+                return self._event_record(row)
             return None
 
     def get_event(self, event_id: int) -> Optional[Dict[str, Any]]:
@@ -855,7 +913,7 @@ class Database:
 
             cursor.execute(query)
             rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+            return [self._event_record(row) for row in rows]
 
     def get_event_count(self) -> int:
         """获取事件数量"""

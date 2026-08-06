@@ -13,6 +13,171 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
+REPORT_METRIC_KEYS = (
+    "frames_processed",
+    "processing_fps",
+    "raw_tracks",
+    "stable_participants",
+    "track_fragments_merged",
+    "identity_ambiguities",
+    "crossing_events",
+    "duplicate_passages",
+    "rejected_candidates",
+    "evidence_complete",
+    "ocr_recognized",
+    "ocr_conflicts",
+    "ocr_unrecognized",
+    "queue_depth_max",
+    "dropped_frames",
+)
+
+
+def _enum_text(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip().upper()
+
+
+def _has_image(value: Any) -> bool:
+    return value is not None and int(getattr(value, "size", 0) or 0) > 0
+
+
+def validate_competition_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate a manifest that references local inputs only through env vars."""
+
+    if not isinstance(manifest, dict):
+        raise ValueError("Competition manifest must be a JSON object")
+    if manifest.get("schema_version") != 1:
+        raise ValueError("Unsupported competition manifest schema_version")
+
+    cases = manifest.get("cases")
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("Competition manifest cases must be a non-empty list")
+
+    seen_case_ids = set()
+    for case in cases:
+        if not isinstance(case, dict):
+            raise ValueError("Each competition manifest case must be an object")
+        case_id = str(case.get("case_id") or "").strip()
+        if not case_id or case_id in seen_case_ids:
+            raise ValueError("Competition manifest case_id values must be unique")
+        seen_case_ids.add(case_id)
+
+        for key in case:
+            if key.endswith("_path"):
+                raise ValueError(
+                    f"Manifest paths must use environment variables, not {key}"
+                )
+        for key in ("video_path_env", "model_path_env"):
+            if not str(case.get(key) or "").strip():
+                raise ValueError(f"Competition manifest requires {key}")
+
+        profile = case.get("event_profile")
+        if not isinstance(profile, dict):
+            raise ValueError(f"Case {case_id} requires an event_profile object")
+        try:
+            from realtime.event_profile import build_event_profile
+
+            build_event_profile(
+                name=profile.get("name", case_id),
+                pipeline=profile.get("pipeline", "athlete_bib"),
+                required_equipment=profile.get("required_equipment"),
+                crossing_mode=profile.get("crossing_mode", "finish_once"),
+                bib_regions=tuple(profile.get("bib_regions", ("torso", "back"))),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid event_profile for case {case_id}: {exc}") from exc
+
+        for key in ("known_same_participant_tracks", "known_distinct_tracks"):
+            groups = case.get(key, [])
+            if not isinstance(groups, list):
+                raise ValueError(f"Case {case_id} field {key} must be a list")
+            for group in groups:
+                if (
+                    not isinstance(group, list)
+                    or len(group) < 2
+                    or any(not isinstance(track_id, int) or track_id < 0 for track_id in group)
+                ):
+                    raise ValueError(f"Case {case_id} field {key} contains an invalid track group")
+
+        expected = case.get("expected_in_clip_crossings")
+        if expected is not None and (not isinstance(expected, int) or expected < 0):
+            raise ValueError(f"Case {case_id} expected_in_clip_crossings must be a non-negative integer or null")
+
+    return manifest
+
+
+def load_competition_manifest(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8-sig") as handle:
+        manifest = json.load(handle)
+    return validate_competition_manifest(manifest)
+
+
+def validate_case_report(case: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    """Check known identity invariants without changing event data."""
+
+    issues: List[str] = []
+    track_to_participant: Dict[int, str] = {}
+    for participant_id, track_ids in (report.get("participant_tracks") or {}).items():
+        for track_id in track_ids or []:
+            try:
+                track_to_participant[int(track_id)] = str(participant_id)
+            except (TypeError, ValueError):
+                continue
+
+    for group in case.get("known_same_participant_tracks", []):
+        resolved = {track_to_participant.get(int(track_id)) for track_id in group}
+        if None in resolved or len(resolved) != 1:
+            issues.append(f"known_same_participant_tracks unresolved or split: {group}")
+
+    for group in case.get("known_distinct_tracks", []):
+        resolved = {track_to_participant.get(int(track_id)) for track_id in group}
+        if None in resolved or len(resolved) != len(group):
+            issues.append(f"known_distinct_tracks merged or unresolved: {group}")
+
+    expected_crossings = case.get("expected_in_clip_crossings")
+    if expected_crossings is not None and int(report.get("crossing_events", 0) or 0) != expected_crossings:
+        issues.append(
+            f"crossing count {report.get('crossing_events', 0)} != expected {expected_crossings}"
+        )
+
+    if case.get("require_evidence") and int(report.get("evidence_complete", 0) or 0) < int(report.get("crossing_events", 0) or 0):
+        issues.append("required event evidence is incomplete")
+
+    baseline_signature = case.get("baseline_signature")
+    if baseline_signature and report.get("result_signature") != baseline_signature:
+        issues.append("result signature differs from the manifest baseline")
+
+    return {"passed": not issues, "issues": issues}
+
+
+def aggregate_case_reports(case_reports: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    cases = []
+    validation_issues = []
+    for case_report in case_reports:
+        case = case_report.get("manifest_case") or {}
+        validation = validate_case_report(case, case_report)
+        case_id = case.get("case_id") or case_report.get("case_id")
+        cases.append(
+            {
+                "case_id": case_id,
+                "report": case_report,
+                "validation": validation,
+            }
+        )
+        validation_issues.extend(
+            f"{case_id}: {issue}" for issue in validation["issues"]
+        )
+
+    return {
+        "schema_version": 1,
+        "cases": cases,
+        "validation": {
+            "passed": not validation_issues,
+            "issues": validation_issues,
+        },
+    }
+
+
 @dataclass
 class RegressionMetrics:
     """Aggregate detector layers without writing race or event data."""
@@ -27,20 +192,91 @@ class RegressionMetrics:
     _inference_ms: List[float] = field(default_factory=list)
     _postprocess_ms: List[float] = field(default_factory=list)
     _total_ms: List[float] = field(default_factory=list)
+    _raw_track_ids: set[int] = field(default_factory=set, repr=False)
+    _participant_ids: set[str] = field(default_factory=set, repr=False)
+    _raw_tracks_max: int = 0
+    _participants_max: int = 0
+    _track_fragments_merged: int = 0
+    _identity_ambiguities: int = 0
+    _duplicate_passages: int = 0
+    _evidence_complete: int = 0
+    _ocr_recognized: int = 0
+    _ocr_conflicts: int = 0
+    _ocr_unrecognized: int = 0
+    _queue_depth_max: int = 0
+    _dropped_frames: int = 0
+    _passage_keys: set[Tuple[str, int]] = field(default_factory=set, repr=False)
 
     def observe_frame(
         self,
         frame_metrics: Dict[str, Any],
         crossing_events: Iterable[Any],
         rejected_candidates: Iterable[Any] = (),
+        participant_ids: Iterable[Any] = (),
+        raw_track_ids: Iterable[Any] = (),
     ) -> None:
         self.frames_processed += 1
         self.raw_bike_detections += int(frame_metrics.get("raw_bikes", 0) or 0)
         self.raw_bib_detections += int(frame_metrics.get("raw_bibs", 0) or 0)
         self.validated_track_observations += int(frame_metrics.get("validated_tracks", 0) or 0)
         self.synthetic_track_observations += int(frame_metrics.get("synthetic_tracks", 0) or 0)
-        self.crossing_events += sum(1 for _ in crossing_events)
+        frame_events = list(crossing_events)
+        self.crossing_events += len(frame_events)
         self.rejected_candidates += sum(1 for _ in rejected_candidates)
+        frame_raw_track_count = int(frame_metrics.get("raw_tracks", 0) or 0)
+        self._raw_tracks_max = max(self._raw_tracks_max, frame_raw_track_count)
+        for track_id in raw_track_ids or ():
+            try:
+                track_id = int(track_id)
+            except (TypeError, ValueError):
+                continue
+            if track_id >= 0:
+                self._raw_track_ids.add(track_id)
+        frame_participant_count = int(frame_metrics.get("participants", 0) or 0)
+        self._participants_max = max(self._participants_max, frame_participant_count)
+        for participant_id in participant_ids or ():
+            participant_id = str(participant_id or "").strip()
+            if participant_id:
+                self._participant_ids.add(participant_id)
+        self._track_fragments_merged += int(frame_metrics.get("track_fragments_merged", 0) or 0)
+        self._identity_ambiguities += int(frame_metrics.get("identity_ambiguities", 0) or 0)
+        self._queue_depth_max = max(
+            self._queue_depth_max,
+            int(frame_metrics.get("queue_depth", 0) or 0),
+        )
+        self._dropped_frames = max(
+            self._dropped_frames,
+            int(
+                frame_metrics.get(
+                    "dropped_frames",
+                    frame_metrics.get("dropped_frame_count", 0),
+                )
+                or 0
+            ),
+        )
+        for event in frame_events:
+            participant_id = str(getattr(event, "participant_id", "") or "").strip()
+            if participant_id:
+                try:
+                    passage_index = int(getattr(event, "passage_index", 1) or 1)
+                except (TypeError, ValueError):
+                    passage_index = 1
+                passage_key = (participant_id, passage_index)
+                if passage_key in self._passage_keys:
+                    self._duplicate_passages += 1
+                self._passage_keys.add(passage_key)
+
+            status = _enum_text(getattr(event, "bib_status", ""))
+            participant_ocr_status = _enum_text(getattr(event, "participant_ocr_status", ""))
+            if "CONFLICT" in status or "CONFLICT" in participant_ocr_status:
+                self._ocr_conflicts += 1
+            elif status in {"RECOGNIZED", "CONFIRMED", "DONE"}:
+                self._ocr_recognized += 1
+            else:
+                self._ocr_unrecognized += 1
+
+            if _has_image(getattr(event, "frame", None)) and _has_image(getattr(event, "crop", None)):
+                self._evidence_complete += 1
         self._inference_ms.append(float(frame_metrics.get("inference_ms", 0.0) or 0.0))
         self._postprocess_ms.append(float(frame_metrics.get("postprocess_ms", 0.0) or 0.0))
         self._total_ms.append(float(frame_metrics.get("total_ms", 0.0) or 0.0))
@@ -63,9 +299,25 @@ class RegressionMetrics:
             "max": round(float(ordered[-1]), 3),
         }
 
-    def to_report(self) -> Dict[str, Any]:
+    def to_report(self, processing_fps: float = 0.0) -> Dict[str, Any]:
+        raw_tracks = len(self._raw_track_ids) or self._raw_tracks_max
+        stable_participants = len(self._participant_ids) or self._participants_max
         return {
             "frames_processed": self.frames_processed,
+            "processing_fps": float(processing_fps),
+            "raw_tracks": raw_tracks,
+            "stable_participants": stable_participants,
+            "track_fragments_merged": self._track_fragments_merged,
+            "identity_ambiguities": self._identity_ambiguities,
+            "crossing_events": self.crossing_events,
+            "duplicate_passages": self._duplicate_passages,
+            "rejected_candidates": self.rejected_candidates,
+            "evidence_complete": self._evidence_complete,
+            "ocr_recognized": self._ocr_recognized,
+            "ocr_conflicts": self._ocr_conflicts,
+            "ocr_unrecognized": self._ocr_unrecognized,
+            "queue_depth_max": self._queue_depth_max,
+            "dropped_frames": self._dropped_frames,
             "counts": {
                 "raw_bike_detections": self.raw_bike_detections,
                 "raw_bib_detections": self.raw_bib_detections,
@@ -91,6 +343,16 @@ def validate_report_output_path(path: Path) -> Path:
     return resolved
 
 
+def write_json_report(path: Path, report: Dict[str, Any]) -> Path:
+    output_path = validate_report_output_path(Path(path))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
+    temp_path.replace(output_path)
+    return output_path
+
+
 def video_timestamp_seconds(position_ms: float, frame_index: int, fps: float) -> float:
     """Return deterministic media time for offline detector processing."""
 
@@ -107,6 +369,10 @@ def build_event_record(event: Any, state: Any, frame_index: int, media_time: flo
     return {
         "event_id": event.event_id,
         "track_id": event.track_id,
+        "participant_id": str(getattr(event, "participant_id", "") or ""),
+        "raw_track_ids": list(getattr(event, "raw_track_ids", ()) or ()),
+        "passage_index": int(getattr(event, "passage_index", 1) or 1),
+        "sport_profile": str(getattr(event, "sport_profile", "") or ""),
         "cross_time": event.cross_time,
         "cross_realtime": event.cross_realtime,
         "frame_index": int(frame_index),
@@ -221,6 +487,10 @@ def result_signature(report: Dict[str, Any]) -> str:
     event_keys = (
         "event_id",
         "track_id",
+        "participant_id",
+        "raw_track_ids",
+        "passage_index",
+        "sport_profile",
         "frame_index",
         "media_time",
         "bib_number",
@@ -230,6 +500,11 @@ def result_signature(report: Dict[str, Any]) -> str:
         "bbox",
         "position",
     )
+    rejected_records = report.get("rejected_candidate_records")
+    if rejected_records is None:
+        legacy_records = report.get("rejected_candidates", [])
+        rejected_records = legacy_records if isinstance(legacy_records, list) else []
+
     payload = {
         "frames_processed": int(report.get("frames_processed", 0) or 0),
         "counts": report.get("counts", {}),
@@ -252,7 +527,7 @@ def result_signature(report: Dict[str, Any]) -> str:
                 )
                 if key in candidate
             }
-            for candidate in report.get("rejected_candidates", [])
+            for candidate in rejected_records
         ],
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -316,6 +591,7 @@ def main() -> int:
     parser.add_argument("--frames", type=int, default=1800, help="处理帧数（默认 1800 帧 ≈ 60 秒@30fps）")
     parser.add_argument("--start-frame", type=int, default=0, help="起始帧（默认 0）")
     parser.add_argument("--config", type=str, default="", help="可选：config.json 或 config_preset_*.json（用于复用终点线/ROI）")
+    parser.add_argument("--event-profile-json", type=str, default="", help="可选：EventProfile JSON 对象")
     parser.add_argument("--out", type=str, default="", help="输出报告 json 路径（默认放到当前目录）")
     parser.add_argument("--evidence-dir", type=str, default="", help="可选：保存事件原始帧、运动员裁剪和号码牌裁剪")
     parser.add_argument("--verbose", action="store_true", help="打印检测器 INFO 日志")
@@ -326,6 +602,7 @@ def main() -> int:
     from ultralytics import YOLO
 
     from realtime.detector import Detector, LOCAL_VIDEO_EVENT_SETTLE_SECONDS
+    from realtime.event_profile import build_event_profile
     if not args.verbose:
         try:
             logging.getLogger().setLevel(logging.ERROR)
@@ -381,6 +658,21 @@ def main() -> int:
             device="cpu",
         )
 
+    event_profile = None
+    if args.event_profile_json:
+        try:
+            profile_payload = json.loads(args.event_profile_json)
+            event_profile = build_event_profile(
+                name=profile_payload.get("name", "current-event"),
+                pipeline=profile_payload.get("pipeline", "athlete_bib"),
+                required_equipment=profile_payload.get("required_equipment"),
+                crossing_mode=profile_payload.get("crossing_mode", "finish_once"),
+                bib_regions=tuple(profile_payload.get("bib_regions", ("torso", "back"))),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[FAIL] invalid event profile: {exc}")
+            return 2
+
     detector = Detector(
         model_path=str(model_path),
         source_id=0,
@@ -388,6 +680,7 @@ def main() -> int:
         ocr=None,
         athlete_validator=athlete_validator,
         event_settle_seconds=LOCAL_VIDEO_EVENT_SETTLE_SECONDS,
+        event_profile=event_profile,
     )
     detector.realtime_ocr_enabled = False
 
@@ -420,6 +713,7 @@ def main() -> int:
     bibs_sum = 0
     events = []
     rejected_candidates = []
+    participant_tracks: Dict[str, set[int]] = {}
     regression_metrics = RegressionMetrics()
     evidence_dir = Path(args.evidence_dir) if args.evidence_dir else None
 
@@ -436,10 +730,30 @@ def main() -> int:
         )
         crossing_events, athletes, bibs = detector.process_frame(frame, timestamp=video_timestamp)
         frame_rejections = list(detector.last_rejected_candidates)
+        frame_participant_ids = []
+        frame_raw_track_ids = []
+        for athlete in athletes:
+            participant_id = str(athlete.get("participant_id") or "").strip()
+            if participant_id:
+                frame_participant_ids.append(participant_id)
+                participant_tracks.setdefault(participant_id, set())
+            raw_ids = athlete.get("raw_track_ids") or ([athlete.get("track_id")] if athlete.get("track_id") is not None else [])
+            for raw_track_id in raw_ids:
+                try:
+                    raw_track_id = int(raw_track_id)
+                except (TypeError, ValueError):
+                    continue
+                if raw_track_id < 0:
+                    continue
+                frame_raw_track_ids.append(raw_track_id)
+                if participant_id:
+                    participant_tracks[participant_id].add(raw_track_id)
         regression_metrics.observe_frame(
             detector.last_frame_metrics,
             crossing_events,
             rejected_candidates=frame_rejections,
+            participant_ids=frame_participant_ids,
+            raw_track_ids=frame_raw_track_ids,
         )
 
         athletes_sum += len(athletes)
@@ -477,7 +791,7 @@ def main() -> int:
 
     elapsed = time.time() - t0
     proc_fps = (frames_done / elapsed) if elapsed > 1e-6 else 0.0
-    metric_report = regression_metrics.to_report()
+    metric_report = regression_metrics.to_report(processing_fps=proc_fps)
 
     report: Dict[str, Any] = {
         "video": str(video_path),
@@ -495,6 +809,20 @@ def main() -> int:
             "elapsed_sec": float(round(elapsed, 3)),
             "processing_fps": float(round(proc_fps, 2)),
         },
+        "processing_fps": float(round(proc_fps, 2)),
+        "raw_tracks": metric_report["raw_tracks"],
+        "stable_participants": metric_report["stable_participants"],
+        "track_fragments_merged": metric_report["track_fragments_merged"],
+        "identity_ambiguities": metric_report["identity_ambiguities"],
+        "crossing_events": metric_report["crossing_events"],
+        "duplicate_passages": metric_report["duplicate_passages"],
+        "rejected_candidates": metric_report["rejected_candidates"],
+        "evidence_complete": metric_report["evidence_complete"],
+        "ocr_recognized": metric_report["ocr_recognized"],
+        "ocr_conflicts": metric_report["ocr_conflicts"],
+        "ocr_unrecognized": metric_report["ocr_unrecognized"],
+        "queue_depth_max": metric_report["queue_depth_max"],
+        "dropped_frames": metric_report["dropped_frames"],
         "counts": {
             **metric_report["counts"],
             "events": len(events),
@@ -506,16 +834,30 @@ def main() -> int:
         },
         "latency_ms": metric_report["latency_ms"],
         "events": events,
-        "rejected_candidates": rejected_candidates,
+        "rejected_candidate_records": rejected_candidates,
+        "participant_tracks": {
+            participant_id: sorted(track_ids)
+            for participant_id, track_ids in sorted(participant_tracks.items())
+        },
+        "event_profile": (
+            {
+                "name": event_profile.name,
+                "pipeline": event_profile.pipeline,
+                "required_equipment": event_profile.required_equipment,
+                "crossing_mode": event_profile.crossing_mode,
+                "bib_regions": list(event_profile.bib_regions),
+            }
+            if event_profile is not None
+            else None
+        ),
     }
     report["result_signature"] = result_signature(report)
 
     try:
-        out_path = validate_report_output_path(
-            Path(args.out) if args.out else Path.cwd() / f"regression_report_{model_path.stem}.json"
+        out_path = write_json_report(
+            Path(args.out) if args.out else Path.cwd() / f"regression_report_{model_path.stem}.json",
+            report,
         )
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[FAIL] 写报告失败: {e}")
         return 2

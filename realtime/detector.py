@@ -28,6 +28,17 @@ from enum import Enum
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
+if __package__:
+    from .crossing_lifecycle import CrossingLifecycle
+    from .event_profile import EventProfile, build_event_profile
+    from .participant_identity import IdentityConfig, ParticipantIdentityManager
+    from .participant_models import CrossingCandidate, ParticipantObservation
+else:
+    from crossing_lifecycle import CrossingLifecycle
+    from event_profile import EventProfile, build_event_profile
+    from participant_identity import IdentityConfig, ParticipantIdentityManager
+    from participant_models import CrossingCandidate, ParticipantObservation
+
 try:
     from ensemble_boxes import weighted_boxes_fusion
     HAS_WBF = True
@@ -364,6 +375,10 @@ class CrossingEvent:
     quality_score: float = 0.0 # 新增：质量分
     is_update_only: bool = False # 新增：标记为仅更新截图数据
     is_info_update: bool = False # 新增：标记为仅更新文本/状态信息
+    participant_id: str = ""
+    raw_track_ids: Tuple[int, ...] = ()
+    passage_index: int = 1
+    sport_profile: str = "cycling"
 
 
 @dataclass
@@ -386,6 +401,8 @@ class TrackState:
     last_seen_time: float = 0.0
     last_ocr_time: float = 0.0
     pending_event_data: Dict[str, Any] = field(default_factory=dict)
+    participant_id: str = ""
+    participant_ocr_status: str = "PENDING"
     
     # OCR 投票与历史
     bib_candidates: Dict[str, int] = field(default_factory=dict)
@@ -1331,7 +1348,8 @@ class Detector:
                  only_numeric: bool = False, realtime_ocr: bool = False,
                  gate_guard_enabled: bool = True, athlete_validator: Optional[Any] = None,
                  performance_profile: str = "auto", sport_profile: str = "cycling",
-                 event_settle_seconds: Optional[float] = None):
+                 event_settle_seconds: Optional[float] = None,
+                 event_profile: Optional[EventProfile] = None):
         self.model_path = model_path
         self.source_id = source_id
         self._model = model
@@ -1341,10 +1359,28 @@ class Detector:
         self.realtime_ocr_enabled = realtime_ocr # 是否启用实时 OCR
         self.enable_gate_guard = bool(gate_guard_enabled) # 龙门安全模式（抑制龙门/拱门误检）
         self._athlete_validator = athlete_validator
-        normalized_sport_profile = str(sport_profile or "cycling").strip().lower()
-        if normalized_sport_profile != "cycling":
-            raise ValueError(f"Unsupported sport profile in this release: {normalized_sport_profile}")
-        self.sport_profile = normalized_sport_profile
+        normalized_sport_profile = (
+            str(sport_profile or "cycling").strip().lower() or "cycling"
+        )
+        if event_profile is None:
+            required_equipment = "bicycle" if normalized_sport_profile == "cycling" else None
+            event_profile = build_event_profile(
+                name=normalized_sport_profile,
+                required_equipment=required_equipment,
+            )
+        self.event_profile = event_profile
+        self.sport_profile = self.event_profile.name
+        self._participant_identity_manager = ParticipantIdentityManager(
+            config=IdentityConfig(event_profile_name=self.event_profile.name)
+        )
+        self._crossing_session_id = f"{self.event_profile.name}:{self.source_id}"
+        self._crossing_lifecycle = CrossingLifecycle(
+            mode=self.event_profile.crossing_mode,
+            min_lap_interval_ms=(
+                30_000.0 if self.event_profile.crossing_mode == "multi_lap" else 0.0
+            ),
+        )
+        self._identity_segment_id = 0
         self.event_settle_seconds = (
             None if event_settle_seconds is None else max(0.0, float(event_settle_seconds))
         )
@@ -1444,6 +1480,10 @@ class Detector:
             "raw_bibs": 0,
             "validated_tracks": 0,
             "synthetic_tracks": 0,
+            "raw_tracks": 0,
+            "participants": 0,
+            "track_fragments_merged": 0,
+            "identity_ambiguities": 0,
             "inference_ms": 0.0,
             "postprocess_ms": 0.0,
             "total_ms": 0.0,
@@ -1485,6 +1525,7 @@ class Detector:
 
         # 状态
         self._track_states: Dict[int, TrackState] = {}
+        self._participant_ocr_states: Dict[str, Any] = {}
         self._finished_bibs: Dict[str, Any] = {} # 记录 bib/digits 去重信息（时间、前缀、bbox）
         self._recent_events: List[Dict[str, Any]] = []
         self._event_id = 0
@@ -2552,6 +2593,33 @@ class Detector:
             
         return img
 
+    def _record_participant_ocr_vote(
+        self,
+        participant_id: Optional[str],
+        raw_track_id: int,
+        text: str,
+        confidence: float,
+    ):
+        """Aggregate validated OCR evidence without changing participant identity."""
+        key = str(participant_id or "").strip()
+        if not key or not text:
+            return None
+        if __package__:
+            from .ocr_manager import ParticipantOcrState
+        else:
+            from ocr_manager import ParticipantOcrState
+
+        state = self._participant_ocr_states.get(key)
+        if state is None:
+            state = ParticipantOcrState(participant_id=key)
+            self._participant_ocr_states[key] = state
+        state.add_vote(
+            raw_track_id=raw_track_id,
+            text=text,
+            confidence=confidence,
+        )
+        return state
+
     def _ocr_worker(self):
         """后台 OCR 线程"""
         logger.info(f"[Detector-{self.source_id}] OCR 后台线程进入循环")
@@ -2566,7 +2634,19 @@ class Detector:
                 if task is None:
                     continue
                 
-                bib_crop, track_id, athlete_bbox, bib_bbox, frame_original, crop_quality = task
+                if len(task) >= 7:
+                    (
+                        bib_crop,
+                        track_id,
+                        athlete_bbox,
+                        bib_bbox,
+                        frame_original,
+                        crop_quality,
+                        participant_id,
+                    ) = task
+                else:
+                    bib_crop, track_id, athlete_bbox, bib_bbox, frame_original, crop_quality = task
+                    participant_id = ""
                 
                 # 计算当前检测器时间戳
                 current_time = time.time() - (self._start_time if self._start_time else time.time())
@@ -2705,6 +2785,24 @@ class Detector:
                             if final_conf < 0.15:
                                 logger.debug(f"[Detector] ID {track_id} 号码 {corrected_text} 置信度过低 ({final_conf:.2f})，跳过投票")
                                 continue
+                            participant_ocr_state = self._record_participant_ocr_vote(
+                                participant_id,
+                                track_id,
+                                corrected_text,
+                                final_conf,
+                            )
+                            if participant_ocr_state is not None:
+                                state.participant_id = participant_ocr_state.participant_id
+                                state.participant_ocr_status = participant_ocr_state.status
+                                if participant_ocr_state.status == "CONFLICT":
+                                    logger.warning(
+                                        f"[Detector] participant {participant_ocr_state.participant_id} "
+                                        f"OCR conflict across raw tracks {sorted(participant_ocr_state.raw_track_ids)}"
+                                    )
+                                    continue
+                                if participant_ocr_state.best_candidate:
+                                    corrected_text = participant_ocr_state.best_candidate
+                                    final_conf = participant_ocr_state.best_confidence
                             state.bib_candidates[corrected_text] = state.bib_candidates.get(corrected_text, 0) + 1
                             state.bib_confidences[corrected_text] = max(
                                 state.bib_confidences.get(corrected_text, 0.0), final_conf
@@ -3388,7 +3486,10 @@ class Detector:
         context_crops: Optional[List[np.ndarray]] = None,
         allow_edge_bicycle: bool = False,
     ) -> bool:
-        """Require owned bicycle evidence while failing open on validator errors."""
+        """Apply the event profile's optional equipment validation."""
+        if self.event_profile.required_equipment is None:
+            return True
+
         athlete_evidence = self._bicycle_evidence_in_crop(crop)
         if athlete_evidence is None:
             return True
@@ -3444,6 +3545,7 @@ class Detector:
         """重置状态"""
         with self._lock:
             self._track_states.clear()
+            self._participant_ocr_states.clear()
             self._finished_bibs.clear()
             self._recent_events.clear()
             self._event_id = start_event_id
@@ -3451,6 +3553,16 @@ class Detector:
             self._split_track_pool.clear()
             self._forced_bib_rescue_last.clear()
             self._wide_split_last.clear()
+            self._participant_identity_manager = ParticipantIdentityManager(
+                config=IdentityConfig(event_profile_name=self.event_profile.name)
+            )
+            self._crossing_lifecycle = CrossingLifecycle(
+                mode=self.event_profile.crossing_mode,
+                min_lap_interval_ms=(
+                    30_000.0 if self.event_profile.crossing_mode == "multi_lap" else 0.0
+                ),
+            )
+            self._identity_segment_id = 0
 
     def stop(self):
         """停止检测器"""
@@ -3967,6 +4079,94 @@ class Detector:
             return None, None
         return crop, [fx1, fy1, fx2, fy2]
 
+    @staticmethod
+    def _identity_bbox(value: Any) -> Optional[Tuple[int, int, int, int]]:
+        if value is None:
+            return None
+        try:
+            values = list(value)
+        except (TypeError, ValueError):
+            return None
+        if len(values) != 4:
+            return None
+        try:
+            return tuple(int(round(float(item))) for item in values)
+        except (TypeError, ValueError):
+            return None
+
+    def _resolve_participant_with_resolution(
+        self,
+        athlete: dict,
+        timestamp: float,
+        *,
+        bib_bboxes=(),
+    ) -> Tuple[dict, Any]:
+        participant_bbox = self._identity_bbox(athlete.get("bbox"))
+        if participant_bbox is None:
+            raise ValueError("athlete bbox must contain four numeric values")
+
+        raw_track_id = athlete.get("track_id")
+        try:
+            raw_track_id = int(raw_track_id) if raw_track_id is not None else None
+        except (TypeError, ValueError):
+            raw_track_id = None
+        if raw_track_id is not None and raw_track_id < 0:
+            raw_track_id = None
+
+        try:
+            segment_id = int(athlete.get("segment_id", self._identity_segment_id))
+        except (TypeError, ValueError):
+            segment_id = self._identity_segment_id
+        try:
+            source_id = int(athlete.get("source_id", self.source_id))
+        except (TypeError, ValueError):
+            source_id = self.source_id
+
+        normalized_bib_bboxes = []
+        for bib_bbox in bib_bboxes or ():
+            normalized = self._identity_bbox(bib_bbox)
+            if normalized is not None:
+                normalized_bib_bboxes.append(normalized)
+
+        try:
+            capture_time_ms = float(timestamp) * 1000.0
+        except (TypeError, ValueError):
+            capture_time_ms = time.time() * 1000.0
+
+        observation = ParticipantObservation(
+            source_id=source_id,
+            segment_id=segment_id,
+            frame_index=int(self._frame_count),
+            capture_time_ms=capture_time_ms,
+            raw_track_id=raw_track_id,
+            participant_bbox=participant_bbox,
+            person_bbox=self._identity_bbox(athlete.get("person_bbox")) or participant_bbox,
+            equipment_bbox=self._identity_bbox(athlete.get("equipment_bbox")),
+            bib_bboxes=tuple(normalized_bib_bboxes),
+            confidence=float(athlete.get("conf", 0.0) or 0.0),
+        )
+        resolution = self._participant_identity_manager.resolve(observation)
+        resolved = dict(athlete)
+        resolved["participant_id"] = resolution.participant.participant_id
+        resolved["raw_track_ids"] = sorted(resolution.participant.raw_track_ids)
+        resolved["identity_status"] = resolution.participant.identity_status
+        return resolved, resolution
+
+    def resolve_participant(
+        self,
+        athlete: dict,
+        timestamp: float,
+        *,
+        bib_bboxes=(),
+    ) -> dict:
+        """Resolve one raw athlete observation to stable participant metadata."""
+        resolved, _ = self._resolve_participant_with_resolution(
+            athlete,
+            timestamp,
+            bib_bboxes=bib_bboxes,
+        )
+        return resolved
+
     def process_frame(self, frame: np.ndarray, timestamp: float = None) -> Tuple[List[CrossingEvent], List[dict], List[dict]]:
         """
         处理一帧（增强版）
@@ -3978,6 +4178,10 @@ class Detector:
                 "raw_bibs": 0,
                 "validated_tracks": 0,
                 "synthetic_tracks": 0,
+                "raw_tracks": 0,
+                "participants": 0,
+                "track_fragments_merged": 0,
+                "identity_ambiguities": 0,
                 "inference_ms": 0.0,
                 "postprocess_ms": 0.0,
                 "total_ms": 0.0,
@@ -4023,6 +4227,10 @@ class Detector:
                 "raw_bibs": 0,
                 "validated_tracks": 0,
                 "synthetic_tracks": 0,
+                "raw_tracks": 0,
+                "participants": 0,
+                "track_fragments_merged": 0,
+                "identity_ambiguities": 0,
                 "inference_ms": 0.0,
                 "postprocess_ms": total_ms,
                 "total_ms": total_ms,
@@ -4469,6 +4677,7 @@ class Detector:
                 state.last_seen_time = current_time
                 state.observation_count += 1
                 state.synthetic_kind = str(athlete.get('synthetic_kind') or '')
+                state.participant_id = str(athlete.get('participant_id') or state.participant_id or '')
                 
                 # === 性能优化 4: 背景过滤增强 ===
                 # 在处理前进行背景判定
@@ -4737,7 +4946,26 @@ class Detector:
         )
 
         athletes = [a for a in athletes if not a.get('is_static')]
-        
+
+        # Resolve identity only after same-frame deduplication and wide-box splitting.
+        identity_resolutions = {}
+        resolved_athletes = []
+        for athlete in athletes:
+            raw_track_id = athlete.get("track_id")
+            bib_boxes = tuple(
+                bib_entry[2]
+                for bib_entry in tid_bib_centers.get(raw_track_id, ())
+                if len(bib_entry) >= 3
+            )
+            resolved, resolution = self._resolve_participant_with_resolution(
+                athlete,
+                current_time,
+                bib_bboxes=bib_boxes,
+            )
+            resolved_athletes.append(resolved)
+            identity_resolutions[id(resolved)] = resolution
+        athletes = resolved_athletes
+
         # 5.2 提交 OCR 任务 (异步双链路：基于高质量缓存)
         if self.realtime_ocr_enabled:
             # 除了“已检出 bib 框”的目标，也纳入“近终点且有兜底裁剪缓存”的目标，
@@ -4804,7 +5032,17 @@ class Detector:
                                 try:
                                     # 提交 OCR (注意：不再 copy 整个 frame，增加 quality 分数)
                                     self._ocr_attempts += 1
-                                    self._ocr_queue.put_nowait((b_crop, tid, athlete['bbox'], b_bbox, f_ref, quality))
+                                    self._ocr_queue.put_nowait(
+                                        (
+                                            b_crop,
+                                            tid,
+                                            athlete['bbox'],
+                                            b_bbox,
+                                            f_ref,
+                                            quality,
+                                            str(athlete.get('participant_id') or state.participant_id or ''),
+                                        )
+                                    )
                                 except queue.Full:
                                     break
                                 
@@ -5051,7 +5289,9 @@ class Detector:
                                     'bbox': athlete['bbox'],
                                     'conf': athlete['conf'],
                                     'position': (curr_x, curr_y),
-                                    'frame': frame_original
+                                    'frame': frame_original,
+                                    'participant_id': athlete.get('participant_id', ''),
+                                    'raw_track_ids': tuple(athlete.get('raw_track_ids') or ()),
                                 }
                                 logger.info(f"[Detector-{self.source_id}] ID {tid} 触发过线判定 (方向: {self.crossing_direction or 'any'})")
                             else:
@@ -5461,8 +5701,19 @@ class Detector:
                     cross_dt = datetime.fromtimestamp(cross_unix)
                     cross_realtime_dt = datetime.fromtimestamp(cross_realtime_unix)
 
+                    participant_id = str(data.get('participant_id') or '')
+                    event_raw_track_ids = tuple(
+                        sorted(
+                            {
+                                int(raw_track_id)
+                                for raw_track_id in (data.get('raw_track_ids') or ())
+                                if raw_track_id is not None and int(raw_track_id) >= 0
+                            }
+                        )
+                    )
+
                     event = CrossingEvent(
-                        event_id=self._event_id + 1,
+                        event_id=0,
                         rank=0,
                         track_id=tid,
                         cross_time=cross_unix,
@@ -5481,7 +5732,10 @@ class Detector:
                         bib_bbox=bib_bbox_for_save,
                         bib_evidence_kind=bib_evidence_kind_for_event,
                         bib_candidates=bib_candidates_for_event,
-                        quality_score=bib_quality_for_save
+                        quality_score=bib_quality_for_save,
+                        participant_id=participant_id,
+                        raw_track_ids=event_raw_track_ids,
+                        sport_profile=self.sport_profile,
                     )
 
                     # P0：抑制补人虚拟ID的同帧重复事件（不影响真实ID）
@@ -5512,6 +5766,32 @@ class Detector:
                         if suppress_virtual_dup:
                             continue
 
+                    if participant_id:
+                        candidate = CrossingCandidate(
+                            session_id=self._crossing_session_id,
+                            source_id=self.source_id,
+                            participant_id=participant_id,
+                            raw_track_id=tid,
+                            crossing_time_ms=cross_unix * 1000.0,
+                        )
+                        if not self._crossing_lifecycle.admit(candidate):
+                            state.event_emitted = True
+                            logger.info(
+                                f"[Detector-{self.source_id}] participant {participant_id} crossing rejected by lifecycle"
+                            )
+                            continue
+                        lifecycle_snapshot = self._crossing_lifecycle.snapshot(candidate)
+                        if lifecycle_snapshot is not None:
+                            event.passage_index = lifecycle_snapshot.passage_index
+                            event.raw_track_ids = tuple(
+                                sorted(
+                                    set(lifecycle_snapshot.raw_track_ids).union(
+                                        event_raw_track_ids
+                                    )
+                                )
+                            )
+
+                    event.event_id = self._event_id + 1
                     self._event_id = event.event_id
                     crossing_events.append(event)
                     state.event_emitted = True
@@ -5652,11 +5932,37 @@ class Detector:
             for athlete in final_athletes
             if athlete.get('split_from_track') is not None or athlete.get('bib_driven')
         )
+        raw_track_ids = {
+            int(athlete["track_id"])
+            for athlete in final_athletes
+            if athlete.get("track_id") is not None
+            and int(athlete.get("track_id", -1)) >= 0
+        }
+        participant_ids = {
+            athlete.get("participant_id")
+            for athlete in final_athletes
+            if athlete.get("participant_id")
+        }
+        track_fragments_merged = sum(
+            1
+            for athlete in final_athletes
+            if identity_resolutions.get(id(athlete)) is not None
+            and identity_resolutions[id(athlete)].merged_raw_track
+        )
+        identity_ambiguities = sum(
+            1
+            for athlete in final_athletes
+            if athlete.get("identity_status") == "AMBIGUOUS"
+        )
         self.last_frame_metrics = {
             "raw_bikes": int(raw_bike_detections),
             "raw_bibs": int(raw_bib_detections),
             "validated_tracks": len(final_athletes),
             "synthetic_tracks": synthetic_tracks,
+            "raw_tracks": len(raw_track_ids),
+            "participants": len(participant_ids),
+            "track_fragments_merged": int(track_fragments_merged),
+            "identity_ambiguities": int(identity_ambiguities),
             "inference_ms": float(_infer_ms),
             "postprocess_ms": float(max(0.0, total_ms - _infer_ms)),
             "total_ms": float(total_ms),

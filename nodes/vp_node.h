@@ -3,6 +3,7 @@
 #include <thread>
 #include <queue>
 #include <mutex>
+#include <atomic>
 #include <condition_variable>
 #include <string>
 #include <memory>
@@ -26,11 +27,17 @@ namespace vp_nodes {
     };
 
     // base class for all nodes
-    class vp_node: public vp_meta_publisher, 
-                    public vp_meta_subscriber, 
-                    public vp_meta_hookable, 
+    class vp_node: public vp_meta_publisher,
+                    public vp_meta_subscriber,
+                    public vp_meta_hookable,
                     public std::enable_shared_from_this<vp_node> {
     private:
+        struct vp_out_queue_event {
+            std::shared_ptr<vp_objects::vp_meta> meta;
+            int queue_size_before;
+            int queue_size_after;
+        };
+
         // previous nodes
         std::vector<std::shared_ptr<vp_node>> pre_nodes;
 
@@ -39,9 +46,14 @@ namespace vp_nodes {
         // dispatch thread
         std::thread dispatch_thread;
 
+        // serialize output hook and semaphore notifications across producers
+        std::mutex out_queue_event_lock;
+        std::queue<vp_out_queue_event> out_queue_events;
+        bool out_queue_event_draining = false;
+
     protected:
         // alive or not for node
-        bool alive = true;
+        std::atomic<bool> alive {true};
 
         // by default we handle frame meta one by one, in some situations we need handle them batch by batch(such as vp_infer_node).
         // setting this member greater than 1 means the node will handle frame meta with batch, and vp_node::handle_frame_meta_by_batch(...) will be called other than vp_node::handle_frame_meta(...).
@@ -54,6 +66,8 @@ namespace vp_nodes {
         std::mutex in_queue_lock;
         // cache output meta to next nodes
         std::queue<std::shared_ptr<vp_objects::vp_meta>> out_queue;
+        // synchronize access to out_queue
+        std::mutex out_queue_lock;
 
         // synchronize for in_queue
         vp_utils::vp_semaphore in_queue_semaphore;
@@ -84,7 +98,7 @@ namespace vp_nodes {
 
         // push meta to the back of out_queue, then it will be pushed to next nodes in order.
         // take care it's different from vp_node::push_meta(meta) which will push meta to next nodes directly.
-        // the method can be called ONLY in handle thread inside node.
+        // the method can be called by the handle thread or external control producers.
         void pendding_meta(std::shared_ptr<vp_objects::vp_meta> meta);
 
         // protected as it can't be instanstiated directly.

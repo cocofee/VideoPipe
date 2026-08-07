@@ -21,6 +21,7 @@ option(VP_WITH_PADDLE "prepared PaddlePaddle or not?" OFF)
 option(VP_WITH_KAFKA "prepared Kafka or not?" OFF)
 option(VP_WITH_LLM "prepared LLM or not?" OFF)
 option(VP_WITH_FFMPEG "prepared FFMPEG or not?" OFF)
+option(VP_BUILD_TESTS "Build VideoPipe tests" OFF)
 
 # OpenCV required
 find_package(OpenCV REQUIRED)
@@ -168,3 +169,8 @@ target_link_libraries(${PROJECT_NAME} ${VP_DEPEND_LIBS})
 
 # build for samples
 add_subdirectory(samples)
+
+if(VP_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

@@ -2,6 +2,7 @@
 #include <fstream>
 
 #include "vp_infer_node.h"
+#include "../utils/vp_batch_utils.h"
 
 namespace vp_nodes {
     vp_infer_node::vp_infer_node(std::string node_name, 
@@ -90,11 +91,11 @@ namespace vp_nodes {
         }
         else {
             // infer more times
-            int b_size[] = {batch_size, blob_to_infer.size[1], blob_to_infer.size[2], blob_to_infer.size[3]};
-            auto times = (number_of_batch % batch_size) == 0 ? (number_of_batch / batch_size) : (number_of_batch / batch_size + 1);
-            for (int i = 0; i < times; i++) {
+            auto batch_ranges = vp_utils::split_batch_ranges(number_of_batch, batch_size);
+            for (const auto& batch_range: batch_ranges) {
                 // split to small piece
-                int i_hwc[] = {i * batch_size, 0, 0, 0};  // 4D
+                int b_size[] = {batch_range.size, blob_to_infer.size[1], blob_to_infer.size[2], blob_to_infer.size[3]};
+                int i_hwc[] = {batch_range.offset, 0, 0, 0};  // 4D
                 auto ptr = blob_to_infer.ptr(i_hwc);
                 cv::Mat b_blob(4, b_size, CV_32F, (void*)ptr);
                 std::vector<cv::Mat> b_outputs;
@@ -148,7 +149,7 @@ namespace vp_nodes {
                         t_size.push_back(src.size[s]);
                     }
 
-                    auto ptr = des.ptr(i * batch_size);
+                    auto ptr = des.ptr(batch_range.offset);
                     cv::Mat tmp(s_dims_n, t_size.data(), CV_32F, (void*)ptr);
 
                     src.copyTo(tmp);

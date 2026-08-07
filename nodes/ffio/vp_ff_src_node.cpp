@@ -123,23 +123,13 @@ namespace vp_nodes {
                 std::make_shared<vp_objects::vp_frame_meta>(c_frame, this->frame_index, this->channel_index, video_width, video_height, fps);
 
             if (out_meta != nullptr) {
-                this->out_queue.push(out_meta);
-                
-                // handled hooker activated if need
-                if (this->meta_handled_hooker) {
-                    meta_handled_hooker(node_name, out_queue.size(), out_meta);
-                }
-
-                // important! notify consumer of out_queue in case it is waiting.
-                this->out_queue_semaphore.signal();
-                VP_DEBUG(vp_utils::string_format("[%s] after handling meta, out_queue.size()==>%d", node_name.c_str(), out_queue.size()));
+                this->pendding_meta(out_meta);
             } 
         }
         
         free_sws_ctx();
         // send dead flag for dispatch_thread
-        this->out_queue.push(nullptr);
-        this->out_queue_semaphore.signal();    
+        this->pendding_meta(nullptr);
     }
 
     std::string vp_ff_src_node::to_string() {

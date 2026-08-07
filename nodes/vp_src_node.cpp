@@ -51,7 +51,7 @@ namespace vp_nodes {
 
     void vp_src_node::speak() {
         auto speak_control_meta = std::make_shared<vp_objects::vp_control_meta>(vp_objects::vp_control_type::SPEAK, this->channel_index);
-        this->push_meta(speak_control_meta);
+        this->pendding_meta(speak_control_meta);
     }
 
      vp_node_type vp_src_node::node_type() {
@@ -82,7 +82,7 @@ namespace vp_nodes {
         auto video_record_control_meta = std::make_shared<vp_objects::vp_video_record_control_meta>(channel_index, file_name_without_ext, video_duration, osd);
 
         // push meta to pipe
-        push_meta(video_record_control_meta);
+        pendding_meta(video_record_control_meta);
     }
 
     void vp_src_node::record_image_manually(bool osd) {
@@ -94,6 +94,6 @@ namespace vp_nodes {
         auto image_record_control_meta = std::make_shared<vp_objects::vp_image_record_control_meta>(channel_index, file_name_without_ext, osd);
 
         // push meta to pipe
-        push_meta(image_record_control_meta);
+        pendding_meta(image_record_control_meta);
     }
 } 

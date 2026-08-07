@@ -57,7 +57,15 @@ namespace vp_nodes {
             }
 
             // handling hooker activated if need
-            invoke_meta_handling_hooker(node_name, in_queue_size_before, in_meta);
+            try {
+                invoke_meta_handling_hooker(node_name, in_queue_size_before, in_meta);
+            }
+            catch (const std::exception& error) {
+                VP_ERROR(vp_utils::string_format("[%s] meta handling hook failed: %s", node_name.c_str(), error.what()));
+            }
+            catch (...) {
+                VP_ERROR(vp_utils::string_format("[%s] meta handling hook failed with unknown error", node_name.c_str()));
+            }
 
             std::shared_ptr<vp_objects::vp_meta> out_meta;
 
@@ -124,7 +132,15 @@ namespace vp_nodes {
             }
 
             // leaving hooker activated if need
-            invoke_meta_leaving_hooker(node_name, out_queue_size_before, out_meta);
+            try {
+                invoke_meta_leaving_hooker(node_name, out_queue_size_before, out_meta);
+            }
+            catch (const std::exception& error) {
+                VP_ERROR(vp_utils::string_format("[%s] meta leaving hook failed: %s", node_name.c_str(), error.what()));
+            }
+            catch (...) {
+                VP_ERROR(vp_utils::string_format("[%s] meta leaving hook failed with unknown error", node_name.c_str()));
+            }
 
             // do something..
             this->push_meta(out_meta);
@@ -149,29 +165,79 @@ namespace vp_nodes {
             return;
         }
 
-        std::lock_guard<std::mutex> guard(this->in_queue_lock);
-        VP_DEBUG(vp_utils::string_format("[%s] before meta flow, in_queue.size()==>%d", node_name.c_str(), in_queue.size()));
-        this->in_queue.push(meta);
+        bool drain_events = false;
+        {
+            std::lock_guard<std::mutex> event_guard(this->in_queue_event_lock);
 
-        // arriving hooker activated if need
-        invoke_meta_arriving_hooker(node_name, in_queue.size(), meta);
-        
-        // notify consumer of in_queue
-        this->in_queue_semaphore.signal();
-        VP_DEBUG(vp_utils::string_format("[%s] after meta flow, in_queue.size()==>%d", node_name.c_str(), in_queue.size()));
+            int in_queue_size_after = 0;
+            {
+                std::lock_guard<std::mutex> queue_guard(this->in_queue_lock);
+                VP_DEBUG(vp_utils::string_format("[%s] before meta flow, in_queue.size()==>%d", node_name.c_str(), static_cast<int>(in_queue.size())));
+                this->in_queue.push(meta);
+                in_queue_size_after = static_cast<int>(this->in_queue.size());
+            }
+
+            this->in_queue_events.push({meta, in_queue_size_after});
+            if (!this->in_queue_event_draining) {
+                this->in_queue_event_draining = true;
+                drain_events = true;
+            }
+        }
+
+        if (!drain_events) {
+            return;
+        }
+
+        std::exception_ptr first_error;
+        while (true) {
+            vp_in_queue_event event;
+            {
+                std::lock_guard<std::mutex> guard(this->in_queue_event_lock);
+                if (this->in_queue_events.empty()) {
+                    this->in_queue_event_draining = false;
+                    break;
+                }
+                event = this->in_queue_events.front();
+                this->in_queue_events.pop();
+            }
+
+            try {
+                invoke_meta_arriving_hooker(node_name, event.queue_size_after, event.meta);
+            }
+            catch (...) {
+                if (first_error == nullptr) {
+                    first_error = std::current_exception();
+                }
+            }
+
+            this->in_queue_semaphore.signal();
+            VP_DEBUG(vp_utils::string_format("[%s] after meta flow, in_queue.size()==>%d", node_name.c_str(), event.queue_size_after));
+        }
+
+        if (first_error != nullptr) {
+            std::rethrow_exception(first_error);
+        }
     }
 
     void vp_node::detach() {
-        for(auto i : this->pre_nodes) {
-            i->remove_subscriber(shared_from_this());
+        auto self = shared_from_this();
+        for (auto& pre_node_ref: this->pre_nodes) {
+            if (auto pre_node = pre_node_ref.lock()) {
+                pre_node->remove_subscriber(self);
+            }
         }
         this->pre_nodes.clear();
     }
 
     void vp_node::detach_from(std::vector<std::string> pre_node_names) {
+        auto self = shared_from_this();
         for (auto i = this->pre_nodes.begin(); i != this->pre_nodes.end();) {
-            if (std::find(pre_node_names.begin(), pre_node_names.end(), (*i)->node_name) != pre_node_names.end()) {
-                (*i)->remove_subscriber(shared_from_this());
+            auto pre_node = i->lock();
+            if (pre_node == nullptr) {
+                i = this->pre_nodes.erase(i);
+            }
+            else if (std::find(pre_node_names.begin(), pre_node_names.end(), pre_node->node_name) != pre_node_names.end()) {
+                pre_node->remove_subscriber(self);
                 i = this->pre_nodes.erase(i);
             }
             else {

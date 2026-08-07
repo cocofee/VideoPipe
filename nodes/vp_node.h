@@ -32,19 +32,29 @@ namespace vp_nodes {
                     public vp_meta_hookable,
                     public std::enable_shared_from_this<vp_node> {
     private:
+        struct vp_in_queue_event {
+            std::shared_ptr<vp_objects::vp_meta> meta;
+            int queue_size_after;
+        };
+
         struct vp_out_queue_event {
             std::shared_ptr<vp_objects::vp_meta> meta;
             int queue_size_before;
             int queue_size_after;
         };
 
-        // previous nodes
-        std::vector<std::shared_ptr<vp_node>> pre_nodes;
+        // previous nodes are non-owning to avoid cycles with publisher subscribers
+        std::vector<std::weak_ptr<vp_node>> pre_nodes;
 
         // handle thread
         std::thread handle_thread;
         // dispatch thread
         std::thread dispatch_thread;
+
+        // serialize arriving hooks and semaphore notifications across producers
+        std::mutex in_queue_event_lock;
+        std::queue<vp_in_queue_event> in_queue_events;
+        bool in_queue_event_draining = false;
 
         // serialize output hook and semaphore notifications across producers
         std::mutex out_queue_event_lock;

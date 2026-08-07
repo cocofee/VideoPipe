@@ -29,11 +29,15 @@ namespace vp_nodes {
     }
 
     // by default, we push meta to next nodes indiscriminately, each next node has the same meta pointer.
-    // in some situations, we need push meta depend on condition, refer to vp_split_node which would push meta by channel index or push a deep copy pf meta(new pointer to new memory). 
+    // in some situations, we need push meta depend on condition, refer to vp_split_node which would push meta by channel index or push a deep copy pf meta(new pointer to new memory).
     void vp_meta_publisher::push_meta(std::shared_ptr<vp_objects::vp_meta> meta) {
-        std::lock_guard<std::mutex> guard(this->subscribers_lock);
-        for (auto i = this->subscribers.begin(); i != this->subscribers.end(); i++) {
-            (*i)->meta_flow(meta);
+        std::vector<std::shared_ptr<vp_meta_subscriber>> subscribers_snapshot;
+        {
+            std::lock_guard<std::mutex> guard(this->subscribers_lock);
+            subscribers_snapshot = this->subscribers;
+        }
+        for (auto& subscriber: subscribers_snapshot) {
+            subscriber->meta_flow(meta);
         }
     }
 }

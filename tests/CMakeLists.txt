@@ -20,6 +20,7 @@ add_executable(vp_node_ordering_test
     test_vp_node_ordering.cpp
     ${PROJECT_SOURCE_DIR}/nodes/vp_node.cpp
     ${PROJECT_SOURCE_DIR}/nodes/vp_src_node.cpp
+    ${PROJECT_SOURCE_DIR}/nodes/vp_split_node.cpp
     ${VP_TEST_SUPPORT_SOURCES}
 )
 

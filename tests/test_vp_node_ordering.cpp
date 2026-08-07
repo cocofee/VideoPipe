@@ -1,5 +1,8 @@
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -10,6 +13,7 @@
 #include <opencv2/core.hpp>
 
 #include "nodes/vp_node.h"
+#include "nodes/vp_split_node.h"
 #include "nodes/vp_src_node.h"
 
 namespace {
@@ -119,6 +123,49 @@ namespace {
 
     private:
         output_collector& outputs;
+    };
+
+    class manual_publisher_node : public vp_nodes::vp_node {
+    public:
+        explicit manual_publisher_node(std::string name): vp_node(std::move(name)) {
+        }
+
+        void publish(std::shared_ptr<vp_objects::vp_meta> meta) {
+            push_meta(std::move(meta));
+        }
+    };
+
+    class passive_node : public vp_nodes::vp_node {
+    public:
+        explicit passive_node(std::string name): vp_node(std::move(name)) {
+        }
+    };
+
+    class manual_split_node : public vp_nodes::vp_split_node {
+    public:
+        explicit manual_split_node(std::string name, bool split_with_channel_index = false):
+            vp_split_node(std::move(name), split_with_channel_index) {
+        }
+
+        void publish(std::shared_ptr<vp_objects::vp_meta> meta) {
+            push_meta(std::move(meta));
+        }
+    };
+
+    class lifecycle_node : public vp_nodes::vp_node {
+    public:
+        lifecycle_node(std::string name, std::atomic<int>& destroyed):
+            vp_node(std::move(name)), destroyed(destroyed) {
+            initialized();
+        }
+
+        ~lifecycle_node() {
+            deinitialized();
+            destroyed.fetch_add(1);
+        }
+
+    private:
+        std::atomic<int>& destroyed;
     };
 
     void require(bool condition, const std::string& message) {
@@ -238,6 +285,208 @@ namespace {
             "handled hook error stalled the output queue");
     }
 
+    void test_arriving_hook_can_reenter_meta_flow() {
+        output_collector outputs;
+        batch_collector batches;
+        recording_batch_node node(1, outputs, batches);
+        bool reentered = false;
+        node.set_meta_arriving_hooker(
+            [&node, &reentered](
+                std::string,
+                int,
+                std::shared_ptr<vp_objects::vp_meta>) {
+                if (!reentered) {
+                    reentered = true;
+                    node.meta_flow(make_frame(2));
+                }
+            });
+
+        node.meta_flow(make_frame(1));
+
+        require(reentered, "arriving hook did not reenter meta_flow");
+        require(outputs.wait_for_count(2), "reentrant arriving hook stalled the input queue");
+        require(
+            outputs.snapshot() == std::vector<int>({1, 2}),
+            "reentrant arriving hook changed input order");
+    }
+
+    void test_arriving_hook_can_replace_itself() {
+        output_collector outputs;
+        batch_collector batches;
+        recording_batch_node node(1, outputs, batches);
+        node.set_meta_arriving_hooker(
+            [&node](std::string, int, std::shared_ptr<vp_objects::vp_meta>) {
+                node.set_meta_arriving_hooker({});
+            });
+
+        node.meta_flow(make_frame(1));
+
+        require(outputs.wait_for_count(1), "self-replacing arriving hook stalled the input queue");
+        require(outputs.snapshot() == std::vector<int>({1}), "arriving hook changed frame output");
+    }
+
+    void test_throwing_arriving_hook_does_not_stall_input() {
+        output_collector outputs;
+        batch_collector batches;
+        recording_batch_node node(1, outputs, batches);
+        node.set_meta_arriving_hooker(
+            [](std::string, int, std::shared_ptr<vp_objects::vp_meta>) {
+                throw std::runtime_error("arriving hook failure");
+            });
+
+        bool hook_error_thrown = false;
+        try {
+            node.meta_flow(make_frame(1));
+        }
+        catch (const std::runtime_error&) {
+            hook_error_thrown = true;
+        }
+        require(hook_error_thrown, "arriving hook error was not propagated");
+
+        node.set_meta_arriving_hooker({});
+        node.meta_flow(make_frame(2));
+
+        require(outputs.wait_for_count(2), "arriving hook error stalled the input queue");
+        require(
+            outputs.snapshot() == std::vector<int>({1, 2}),
+            "arriving hook error changed input order");
+    }
+
+    void test_subscriber_can_detach_while_receiving_meta() {
+        auto upstream = std::make_shared<manual_publisher_node>("upstream");
+        auto downstream = std::make_shared<passive_node>("downstream");
+        downstream->attach_to({upstream});
+        std::weak_ptr<passive_node> downstream_weak = downstream;
+        downstream->set_meta_arriving_hooker(
+            [downstream_weak](std::string, int, std::shared_ptr<vp_objects::vp_meta>) {
+                if (auto downstream = downstream_weak.lock()) {
+                    downstream->detach();
+                }
+            });
+
+        upstream->publish(make_frame(1));
+
+        require(upstream->next_nodes().empty(), "subscriber did not detach during publication");
+    }
+
+    void test_split_subscriber_can_detach_while_receiving_meta() {
+        auto upstream = std::make_shared<manual_split_node>("split");
+        auto downstream = std::make_shared<passive_node>("downstream");
+        downstream->attach_to({upstream});
+        std::weak_ptr<passive_node> downstream_weak = downstream;
+        downstream->set_meta_arriving_hooker(
+            [downstream_weak](std::string, int, std::shared_ptr<vp_objects::vp_meta>) {
+                if (auto downstream = downstream_weak.lock()) {
+                    downstream->detach();
+                }
+            });
+
+        upstream->publish(make_frame(1));
+
+        require(upstream->next_nodes().empty(), "split subscriber did not detach during publication");
+    }
+
+    void test_channel_split_subscriber_can_detach_while_receiving_meta() {
+        auto upstream = std::make_shared<manual_split_node>("split", true);
+        auto downstream = std::make_shared<passive_node>("downstream");
+        downstream->attach_to({upstream});
+        std::weak_ptr<passive_node> downstream_weak = downstream;
+        downstream->set_meta_arriving_hooker(
+            [downstream_weak](std::string, int, std::shared_ptr<vp_objects::vp_meta>) {
+                if (auto downstream = downstream_weak.lock()) {
+                    downstream->detach();
+                }
+            });
+
+        upstream->publish(make_frame(1));
+
+        require(upstream->next_nodes().empty(), "channel split subscriber did not detach during publication");
+    }
+
+    void test_throwing_handling_hook_does_not_stop_node() {
+        output_collector outputs;
+        batch_collector batches;
+        recording_batch_node node(1, outputs, batches);
+        node.set_meta_handling_hooker(
+            [](std::string, int, std::shared_ptr<vp_objects::vp_meta>) {
+                throw std::runtime_error("handling hook failure");
+            });
+
+        node.meta_flow(make_frame(1));
+
+        require(outputs.wait_for_count(1), "handling hook error stopped the node");
+        require(outputs.snapshot() == std::vector<int>({1}), "handling hook error dropped the frame");
+    }
+
+    void test_throwing_leaving_hook_does_not_stop_node() {
+        output_collector outputs;
+        batch_collector batches;
+        recording_batch_node node(1, outputs, batches);
+        node.set_meta_leaving_hooker(
+            [](std::string, int, std::shared_ptr<vp_objects::vp_meta>) {
+                throw std::runtime_error("leaving hook failure");
+            });
+
+        node.meta_flow(make_frame(1));
+
+        require(outputs.wait_for_count(1), "leaving hook error stopped the node");
+        require(outputs.snapshot() == std::vector<int>({1}), "leaving hook error dropped the frame");
+    }
+
+    void test_attached_nodes_are_released_without_manual_detach() {
+        std::atomic<int> destroyed {0};
+        std::weak_ptr<lifecycle_node> upstream_weak;
+        std::weak_ptr<lifecycle_node> downstream_weak;
+        {
+            auto upstream = std::make_shared<lifecycle_node>("upstream", destroyed);
+            auto downstream = std::make_shared<lifecycle_node>("downstream", destroyed);
+            downstream->attach_to({upstream});
+            upstream_weak = upstream;
+            downstream_weak = downstream;
+        }
+
+        require(upstream_weak.expired(), "downstream retained its upstream node");
+        require(downstream_weak.expired(), "upstream did not release its downstream node");
+        require(destroyed.load() == 2, "attached node destructors did not run");
+    }
+
+    void test_multi_upstream_nodes_are_released_without_manual_detach() {
+        std::atomic<int> destroyed {0};
+        std::weak_ptr<lifecycle_node> upstream_a_weak;
+        std::weak_ptr<lifecycle_node> upstream_b_weak;
+        std::weak_ptr<lifecycle_node> downstream_weak;
+        {
+            auto upstream_a = std::make_shared<lifecycle_node>("upstream_a", destroyed);
+            auto upstream_b = std::make_shared<lifecycle_node>("upstream_b", destroyed);
+            auto downstream = std::make_shared<lifecycle_node>("downstream", destroyed);
+            downstream->attach_to({upstream_a, upstream_b});
+            upstream_a_weak = upstream_a;
+            upstream_b_weak = upstream_b;
+            downstream_weak = downstream;
+        }
+
+        require(upstream_a_weak.expired(), "downstream retained its first upstream node");
+        require(upstream_b_weak.expired(), "downstream retained its second upstream node");
+        require(downstream_weak.expired(), "upstream nodes did not release their shared downstream node");
+        require(destroyed.load() == 3, "multi-upstream node destructors did not run");
+    }
+
+    void test_detach_ignores_an_expired_upstream_node() {
+        std::atomic<int> destroyed {0};
+        auto downstream = std::make_shared<lifecycle_node>("downstream", destroyed);
+        std::weak_ptr<lifecycle_node> upstream_weak;
+        {
+            auto upstream = std::make_shared<lifecycle_node>("upstream", destroyed);
+            downstream->attach_to({upstream});
+            upstream_weak = upstream;
+        }
+
+        require(upstream_weak.expired(), "downstream retained an otherwise unused upstream node");
+        downstream->detach();
+        downstream.reset();
+        require(destroyed.load() == 2, "expired upstream prevented node destruction");
+    }
+
     template <typename Test>
     int run_test(const std::string& name, Test test) {
         try {
@@ -251,7 +500,7 @@ namespace {
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
     auto& logger = vp_utils::vp_logger::get_logger();
     logger.log_level = vp_utils::vp_log_level::ERROR;
     logger.log_to_console = false;
@@ -259,12 +508,40 @@ int main() {
     logger.log_to_kafka = false;
     logger.init();
 
+    const std::vector<std::pair<std::string, std::function<void()>>> tests = {
+        {"control_flush", test_control_meta_flushes_partial_batch_first},
+        {"complete_batch", test_complete_batch_is_dispatched},
+        {"shutdown_flush", test_shutdown_flushes_partial_batch},
+        {"source_control_order", test_source_controls_follow_queued_frames},
+        {"handled_hook_reentry", test_handled_hook_can_enqueue_source_control},
+        {"handled_hook_exception", test_throwing_handled_hook_does_not_stall_output},
+        {"arriving_hook_reentry", test_arriving_hook_can_reenter_meta_flow},
+        {"arriving_hook_replacement", test_arriving_hook_can_replace_itself},
+        {"arriving_hook_exception", test_throwing_arriving_hook_does_not_stall_input},
+        {"subscriber_detach", test_subscriber_can_detach_while_receiving_meta},
+        {"split_subscriber_detach", test_split_subscriber_can_detach_while_receiving_meta},
+        {"channel_split_subscriber_detach", test_channel_split_subscriber_can_detach_while_receiving_meta},
+        {"handling_hook_exception", test_throwing_handling_hook_does_not_stop_node},
+        {"leaving_hook_exception", test_throwing_leaving_hook_does_not_stop_node},
+        {"automatic_node_release", test_attached_nodes_are_released_without_manual_detach},
+        {"multi_upstream_release", test_multi_upstream_nodes_are_released_without_manual_detach},
+        {"expired_upstream_detach", test_detach_ignores_an_expired_upstream_node},
+    };
+
+    if (argc == 2) {
+        auto test = std::find_if(tests.begin(), tests.end(), [argv](const auto& candidate) {
+            return candidate.first == argv[1];
+        });
+        if (test == tests.end()) {
+            std::cerr << "unknown test: " << argv[1] << std::endl;
+            return 2;
+        }
+        return run_test(test->first, test->second);
+    }
+
     int failures = 0;
-    failures += run_test("control flush", test_control_meta_flushes_partial_batch_first);
-    failures += run_test("complete batch", test_complete_batch_is_dispatched);
-    failures += run_test("shutdown flush", test_shutdown_flushes_partial_batch);
-    failures += run_test("source control order", test_source_controls_follow_queued_frames);
-    failures += run_test("handled hook reentry", test_handled_hook_can_enqueue_source_control);
-    failures += run_test("handled hook exception", test_throwing_handled_hook_does_not_stall_output);
+    for (const auto& test: tests) {
+        failures += run_test(test.first, test.second);
+    }
     return failures == 0 ? 0 : 1;
 }

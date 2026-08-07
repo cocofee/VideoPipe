@@ -25,6 +25,9 @@ class IdentityConfig:
     min_direction_motion_ratio: float = 0.05
     min_direction_cosine: float = 0.0
     bib_layout_weight: float = 0.03
+    participant_retention_ms: float = 30_000.0
+    raw_track_retention_ms: float = 5_000.0
+    ambiguity_retention_ms: float = 5_000.0
 
 
 @dataclass(frozen=True)
@@ -65,23 +68,31 @@ class ParticipantIdentityManager:
         self._participants: dict[str, ParticipantIdentity] = {}
         self._states: dict[str, _ParticipantState] = {}
         self._raw_track_map: dict[tuple[int, int, int], str] = {}
+        self._raw_track_last_seen_ms: dict[tuple[int, int, int], float] = {}
+        self._fragment_merge_count = 0
+        self._ambiguity_count = 0
 
     def resolve(self, observation: ParticipantObservation) -> IdentityResolution:
         """Resolve one observation to an existing or newly created participant."""
 
+        self.prune_expired(observation.capture_time_ms)
         raw_track_key = self._raw_track_key(observation)
         if raw_track_key is not None:
             participant_id = self._raw_track_map.get(raw_track_key)
             if participant_id is not None:
-                participant = self._participants[participant_id]
-                self._update_participant(participant, observation)
-                return IdentityResolution(
-                    participant=participant,
-                    created=False,
-                    merged_raw_track=False,
-                    match_score=1.0,
-                    reasons=("exact_raw_track",),
-                )
+                participant = self._participants.get(participant_id)
+                if participant is None:
+                    self._raw_track_map.pop(raw_track_key, None)
+                    self._raw_track_last_seen_ms.pop(raw_track_key, None)
+                else:
+                    self._update_participant(participant, observation)
+                    return IdentityResolution(
+                        participant=participant,
+                        created=False,
+                        merged_raw_track=False,
+                        match_score=1.0,
+                        reasons=("exact_raw_track",),
+                    )
 
         candidates = sorted(
             self._match_candidates(observation),
@@ -110,6 +121,8 @@ class ParticipantIdentityManager:
 
             participant = best.participant
             self._update_participant(participant, observation)
+            if raw_track_key is not None:
+                self._fragment_merge_count += 1
             return IdentityResolution(
                 participant=participant,
                 created=False,
@@ -254,6 +267,9 @@ class ParticipantIdentityManager:
         raw_track_key = self._raw_track_key(observation)
         if raw_track_key is not None:
             self._raw_track_map[raw_track_key] = participant_id
+            self._raw_track_last_seen_ms[raw_track_key] = observation.capture_time_ms
+        if identity_status == "AMBIGUOUS":
+            self._ambiguity_count += 1
         return IdentityResolution(
             participant=participant,
             created=True,
@@ -289,6 +305,59 @@ class ParticipantIdentityManager:
             raw_track_key = self._raw_track_key(observation)
             if raw_track_key is not None:
                 self._raw_track_map[raw_track_key] = participant.participant_id
+                self._raw_track_last_seen_ms[raw_track_key] = observation.capture_time_ms
+
+    def prune_expired(self, current_time_ms: float) -> int:
+        """Prune stale identity indexes while preserving persisted race evidence."""
+
+        current_time_ms = float(current_time_ms)
+        raw_track_retention_ms = max(0.0, float(self.config.raw_track_retention_ms))
+        stale_raw_tracks = [
+            key
+            for key, last_seen_ms in self._raw_track_last_seen_ms.items()
+            if current_time_ms - last_seen_ms > raw_track_retention_ms
+        ]
+        for key in stale_raw_tracks:
+            self._raw_track_map.pop(key, None)
+            self._raw_track_last_seen_ms.pop(key, None)
+
+        stale_participants = []
+        for participant_id, participant in self._participants.items():
+            retention_ms = (
+                self.config.ambiguity_retention_ms
+                if participant.identity_status == "AMBIGUOUS"
+                else self.config.participant_retention_ms
+            )
+            if current_time_ms - participant.last_seen_ms > max(0.0, float(retention_ms)):
+                stale_participants.append(participant_id)
+
+        if not stale_participants:
+            return 0
+
+        stale_ids = set(stale_participants)
+        for participant_id in stale_participants:
+            self._participants.pop(participant_id, None)
+            self._states.pop(participant_id, None)
+        for key, participant_id in list(self._raw_track_map.items()):
+            if participant_id in stale_ids:
+                self._raw_track_map.pop(key, None)
+                self._raw_track_last_seen_ms.pop(key, None)
+        return len(stale_participants)
+
+    def runtime_metrics(self) -> dict[str, int]:
+        """Return lightweight identity-state counters for periodic monitoring."""
+
+        return {
+            "active_participants": len(self._participants),
+            "raw_track_mappings": len(self._raw_track_map),
+            "appearance_summaries": len(self._states),
+            "ambiguity_records": sum(
+                participant.identity_status == "AMBIGUOUS"
+                for participant in self._participants.values()
+            ),
+            "track_fragments_merged": self._fragment_merge_count,
+            "identity_ambiguities": self._ambiguity_count,
+        }
 
     @staticmethod
     def _raw_track_key(

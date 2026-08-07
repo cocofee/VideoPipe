@@ -130,3 +130,33 @@ def test_video_thread_passes_original_frame_and_capture_timestamp_to_detector():
     assert thread.last_frame_metrics["capture_latency_ms"] == 5.0
     assert thread.last_frame_metrics["queue_latency_ms"] >= 0.0
     assert thread.last_frame_metrics["processing_time_ms"] >= 0.0
+
+
+def test_video_thread_combines_identity_and_reader_metrics():
+    frame = np.zeros((8, 12, 3), dtype=np.uint8)
+    envelope = FrameEnvelope(
+        original_frame=frame,
+        frame_index=7,
+        capture_time_ms=1_700_000_000_000.0,
+        arrival_time_ms=1_700_000_000_002.0,
+        segment_id=2,
+    )
+    reader = _EnvelopeReader(envelope)
+    reader.get_info = lambda: {"queue_depth": 3, "dropped_frame_count": 4}
+    detector = _TimestampDetector()
+    detector.last_frame_metrics = {
+        "participants": 2,
+        "track_fragments_merged": 1,
+        "identity_ambiguities": 1,
+    }
+    thread = VideoThread(reader, detector, ui_skip=99)
+    reader.thread = thread
+    detector.thread = thread
+
+    thread.run()
+
+    assert thread.last_frame_metrics["participants"] == 2
+    assert thread.last_frame_metrics["track_fragments_merged"] == 1
+    assert thread.last_frame_metrics["identity_ambiguities"] == 1
+    assert thread.last_frame_metrics["queue_depth"] == 3
+    assert thread.last_frame_metrics["dropped_frames"] == 4

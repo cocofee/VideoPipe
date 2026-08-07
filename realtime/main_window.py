@@ -11,7 +11,10 @@ import time
 import threading
 import json
 import shutil
+import uuid
+import subprocess
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
@@ -20,7 +23,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QDateTimeEdit,
     QGroupBox, QFormLayout, QMenuBar, QMenu, QAction, QActionGroup,
     QComboBox, QRadioButton, QStackedWidget, QProgressDialog,
-    QPlainTextEdit, QAbstractItemView, QSpinBox, QDialogButtonBox
+    QPlainTextEdit, QAbstractItemView, QSpinBox, QDialogButtonBox, QInputDialog
 )
 import logging
 from ultralytics.utils import LOGGER
@@ -28,6 +31,19 @@ from ultralytics.utils import LOGGER
 LOGGER.setLevel(logging.ERROR)
 import os
 from collections import deque
+
+
+def _resolve_git_commit(path: str):
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
 
 # 将当前目录和项目根目录添加到 sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -141,7 +157,8 @@ try:
     from .event_recorder import EventRecorder
     from .event_list_widget import EventListWidget
     from .ocr_manager import OCRManager
-    from .io_utils import read_image_unicode
+    from .io_utils import read_image_unicode, write_image_unicode
+    from .field_issue_log import FIELD_ISSUE_CATEGORIES, FieldIssueLog
 except ImportError:
     import sys
     import os
@@ -157,7 +174,8 @@ except ImportError:
     from event_recorder import EventRecorder
     from event_list_widget import EventListWidget
     from ocr_manager import OCRManager
-    from io_utils import read_image_unicode
+    from io_utils import read_image_unicode, write_image_unicode
+    from field_issue_log import FIELD_ISSUE_CATEGORIES, FieldIssueLog
 
 
 class InteractiveVideoLabel(QLabel):
@@ -615,7 +633,13 @@ class VideoThread(QThread):
                 if capture_latency_ms < 0 or capture_latency_ms > 60_000:
                     capture_latency_ms = None
                 queue_latency_ms = max(0.0, processing_started_wall_ms - envelope.arrival_time_ms)
+                detector_metrics = dict(getattr(self.detector, "last_frame_metrics", {}) or {})
+                try:
+                    reader_metrics = dict(self.reader.get_info() or {})
+                except Exception:
+                    reader_metrics = {}
                 self.last_frame_metrics = {
+                    **detector_metrics,
                     "frame_index": envelope.frame_index,
                     "segment_id": envelope.segment_id,
                     "capture_time_ms": envelope.capture_time_ms,
@@ -624,6 +648,8 @@ class VideoThread(QThread):
                     "queue_latency_ms": queue_latency_ms,
                     "processing_time_ms": processing_time_ms,
                     "end_to_end_latency_ms": queue_latency_ms + processing_time_ms,
+                    "queue_depth": reader_metrics.get("queue_depth"),
+                    "dropped_frames": reader_metrics.get("dropped_frame_count"),
                 }
 
             # 发送过线事件
@@ -2119,6 +2145,7 @@ class MainWindow(QMainWindow):
     ocr_done_signal = pyqtSignal(dict)
     event_saved_signal = pyqtSignal(int)
     log_signal = pyqtSignal(str)
+    field_issue_saved_signal = pyqtSignal(object)
 
     def __init__(self, config: dict):
         super().__init__()
@@ -2129,6 +2156,7 @@ class MainWindow(QMainWindow):
         self.ocr_done_signal.connect(self._show_batch_ocr_done)
         self.event_saved_signal.connect(self._on_event_saved_ui)
         self.log_signal.connect(self._on_log_received_ui)
+        self.field_issue_saved_signal.connect(self._on_field_issue_saved_ui)
 
         # 组件 (支持多摄像头)
         self.readers = {}         # source_id -> StreamReader
@@ -2147,6 +2175,12 @@ class MainWindow(QMainWindow):
         self.recorder: Optional[EventRecorder] = None
         self.viewer_dialog: Optional[ImageViewerDialog] = None
         self.ocr_manager: Optional[OCRManager] = None
+        self.field_issue_log: Optional[FieldIssueLog] = None
+        self._field_issue_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="field-issue"
+        )
+        self._field_issue_closing = False
+        self._latest_frame_observations: Dict[int, tuple[list, list]] = {}
         self._manual_batch_ocr_running = False
 
         # 配置
@@ -2163,6 +2197,7 @@ class MainWindow(QMainWindow):
         self.model_path = config.get('model_path')
         self.race_root = Path.cwd() / "RaceData"
         self.output_dir = self.race_root.absolute()
+        self._software_commit = config.get("software_commit") or _resolve_git_commit(project_root)
         requested_ocr_engine = (config.get('ocr_engine') or 'paddleocr').lower()
         if requested_ocr_engine != 'paddleocr':
             logger.warning(f"[Main] 当前版本已锁定 PaddleOCR，忽略配置 ocr_engine={requested_ocr_engine}")
@@ -2423,6 +2458,7 @@ class MainWindow(QMainWindow):
     def _activate_race_dir(self, race_dir: Path):
         self.output_dir = race_dir.absolute()
         self.config['output_dir'] = str(self.output_dir)
+        self.field_issue_log = FieldIssueLog(self.output_dir / "issues.jsonl")
         self._save_global_config({"last_race_dir": str(self.output_dir)})
         db_path = self.output_dir / "timing.db"
         logger.info(f"[Main] 激活赛事目录: {race_dir.name}, 数据库路径: {db_path}")
@@ -2449,6 +2485,8 @@ class MainWindow(QMainWindow):
             self.ocr_manager.set_ocr(self.shared_ocr, getattr(self, 'shared_vlm', None))
         self._load_initial_config()
         self._race_ready = True
+        if hasattr(self, "field_issue_btn"):
+            self.field_issue_btn.setEnabled(True)
         self.statusBar().showMessage(f"当前赛事: {race_dir.name}")
 
     def _prompt_race_selection(self):
@@ -2649,6 +2687,14 @@ class MainWindow(QMainWindow):
         self.start_time_btn.setFixedHeight(40)
         self.start_time_btn.clicked.connect(self._show_start_time_dialog)
         btn_layout.addWidget(self.start_time_btn)
+
+        self.field_issue_btn = QPushButton("标记问题")
+        self.field_issue_btn.setObjectName("primary_btn")
+        self.field_issue_btn.setFixedHeight(40)
+        self.field_issue_btn.setToolTip("锁定当前原始视频帧，记录现场问题供赛后复现")
+        self.field_issue_btn.clicked.connect(self._mark_field_issue)
+        self.field_issue_btn.setEnabled(False)
+        btn_layout.addWidget(self.field_issue_btn)
 
         # 辅助功能按钮
         self.reset_btn = QPushButton("重置统计")
@@ -2869,9 +2915,24 @@ class MainWindow(QMainWindow):
         mismatch_flag = 1 if (bib_count >= 2 and athlete_count <= 1) else 0
         bib_only_flag = 1 if (bib_count > 0 and athlete_count == 0) else 0
         fps_val = float(getattr(self, f'_fps_{source_id}', 0.0))
+        thread = self.video_threads.get(source_id)
+        frame_metrics = dict(getattr(thread, 'last_frame_metrics', {}) or {})
 
         self._live_monitor_samples[source_id].append(
-            (now_ts, athlete_count, bib_count, split_count, mismatch_flag, bib_only_flag, fps_val)
+            (
+                now_ts,
+                athlete_count,
+                bib_count,
+                split_count,
+                mismatch_flag,
+                bib_only_flag,
+                fps_val,
+                int(frame_metrics.get('participants', 0) or 0),
+                int(frame_metrics.get('track_fragments_merged', 0) or 0),
+                int(frame_metrics.get('identity_ambiguities', 0) or 0),
+                int(frame_metrics.get('queue_depth', 0) or 0),
+                int(frame_metrics.get('dropped_frames', 0) or 0),
+            )
         )
 
         cutoff_ts = now_ts - max(8.0, float(self._live_monitor_window_seconds))
@@ -2897,6 +2958,18 @@ class MainWindow(QMainWindow):
 
         fps_values = [float(item[6]) for item in samples if float(item[6]) > 0.01]
         avg_fps = float(sum(fps_values) / max(1, len(fps_values))) if fps_values else 0.0
+        latest = samples[-1]
+        participant_count = int(latest[7]) if len(latest) > 7 else 0
+        fragment_merges = sum(int(item[8]) for item in samples if len(item) > 8)
+        identity_ambiguities = sum(int(item[9]) for item in samples if len(item) > 9)
+        queue_depth_max = max(
+            (int(item[10]) for item in samples if len(item) > 10),
+            default=0,
+        )
+        dropped_frames = max(
+            (int(item[11]) for item in samples if len(item) > 11),
+            default=0,
+        )
 
         severe = (avg_fps > 0 and avg_fps < float(self._live_monitor_min_fps) * 0.80) or \
                  mismatch_ratio >= 0.30 or bib_only_ratio >= 0.22
@@ -2922,6 +2995,11 @@ class MainWindow(QMainWindow):
             detail_parts.append(f"号码孤立={bib_only_ratio:.0%}")
         if split_hits > 0:
             detail_parts.append(f"大框拆分={split_hits}")
+        detail_parts.append(f"身份={participant_count}")
+        detail_parts.append(f"轨迹合并={fragment_merges}")
+        detail_parts.append(f"身份歧义={identity_ambiguities}")
+        detail_parts.append(f"队列峰值={queue_depth_max}")
+        detail_parts.append(f"丢帧={dropped_frames}")
 
         detail_text = " | ".join(detail_parts) if detail_parts else "采样正常"
         return {
@@ -2933,6 +3011,11 @@ class MainWindow(QMainWindow):
             'mismatch_ratio': mismatch_ratio,
             'bib_only_ratio': bib_only_ratio,
             'split_hits': split_hits,
+            'participant_count': participant_count,
+            'fragment_merges': fragment_merges,
+            'identity_ambiguities': identity_ambiguities,
+            'queue_depth_max': queue_depth_max,
+            'dropped_frames': dropped_frames,
             'detail': detail_text,
         }
 
@@ -4634,6 +4717,10 @@ class MainWindow(QMainWindow):
                 self.conn_status_indicator.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 16px; margin-right: 10px;")
 
     def _on_frame_ready(self, frame, athletes, bibs, source_id=0):
+        self._latest_frame_observations[source_id] = (
+            [dict(item) if isinstance(item, dict) else item for item in (athletes or [])],
+            [dict(item) if isinstance(item, dict) else item for item in (bibs or [])],
+        )
         """收到新帧 (支持多机位)"""
         if source_id == 0:
             self._frame_count += 1
@@ -5043,6 +5130,183 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.debug(f"[Main] 自动巡检补号异常: {e}")
 
+    def _capture_field_issue_context(self) -> Optional[Dict[str, Any]]:
+        candidates = []
+        for source_id, thread in self.video_threads.items():
+            envelope = getattr(thread, "last_processed_envelope", None)
+            if envelope is not None:
+                candidates.append((float(envelope.capture_time_ms), int(source_id), thread, envelope))
+        if not candidates or self.field_issue_log is None:
+            return None
+
+        _, source_id, thread, envelope = max(candidates, key=lambda item: item[0])
+        frame = np.array(envelope.original_frame, copy=True)
+        if frame.size == 0:
+            return None
+
+        metrics = dict(getattr(thread, "last_frame_metrics", {}) or {})
+        reader = self.readers.get(source_id)
+        if reader is not None:
+            try:
+                reader_info = reader.get_info()
+            except Exception:
+                reader_info = {}
+            metrics["queue_depth"] = reader_info.get("queue_depth")
+            metrics["dropped_frames"] = reader_info.get("dropped_frame_count")
+
+        participant_ids = set()
+        raw_track_ids = set()
+        event_ids = set()
+        athletes, _ = self._latest_frame_observations.get(source_id, ([], []))
+        for athlete in athletes:
+            if not isinstance(athlete, dict):
+                continue
+            participant_id = athlete.get("participant_id")
+            raw_track_id = athlete.get("raw_track_id", athlete.get("track_id"))
+            event_id = athlete.get("event_id")
+            if participant_id:
+                participant_ids.add(str(participant_id))
+            if raw_track_id is not None:
+                try:
+                    raw_track_ids.add(int(raw_track_id))
+                except (TypeError, ValueError):
+                    pass
+            if event_id is not None:
+                try:
+                    event_ids.add(int(event_id))
+                except (TypeError, ValueError):
+                    pass
+
+        model_identity = None
+        if self.model_path:
+            model_path = Path(self.model_path)
+            model_identity = f"{model_path.name}:{model_path.stat().st_size}" if model_path.exists() else model_path.name
+
+        return {
+            "issue_log": self.field_issue_log,
+            "session_id": self.output_dir.name,
+            "source_id": source_id,
+            "frame_index": int(envelope.frame_index),
+            "capture_time_ms": float(envelope.capture_time_ms),
+            "segment_id": int(envelope.segment_id),
+            "frame": frame,
+            "metrics": metrics,
+            "participant_ids": tuple(sorted(participant_ids)),
+            "raw_track_ids": tuple(sorted(raw_track_ids)),
+            "event_ids": tuple(sorted(event_ids)),
+            "software_commit": self._software_commit,
+            "model_identity": model_identity,
+            "event_profile": self.config.get("event_profile", self.config.get("sport_profile")),
+        }
+
+    def _mark_field_issue(self):
+        if self._field_issue_closing or self._field_issue_executor is None:
+            return
+        context = self._capture_field_issue_context()
+        if context is None:
+            self.statusBar().showMessage("尚无可标记的已处理视频帧", 3000)
+            return
+
+        preferred_order = [
+            "missed_athlete",
+            "duplicate_athlete",
+            "false_athlete",
+            "wrong_bib",
+            "missing_bib",
+            "ui_freeze",
+            "camera_reconnect",
+            "other",
+        ]
+        categories = [item for item in preferred_order if item in FIELD_ISSUE_CATEGORIES]
+        category, accepted = QInputDialog.getItem(
+            self,
+            "标记现场问题",
+            "问题类型:",
+            categories,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        note, accepted = QInputDialog.getText(
+            self,
+            "标记现场问题",
+            "简短说明（可留空）:",
+        )
+        if not accepted:
+            return
+
+        token = uuid.uuid4().hex[:12]
+        relative_screenshot = Path("field_issues") / "screenshots" / (
+            f"source_{context['source_id']}_frame_{context['frame_index']}_{token}.jpg"
+        )
+        context.update(
+            {
+                "category": category,
+                "note": note,
+                "screenshot_relative": relative_screenshot,
+                "screenshot_path": self.output_dir / relative_screenshot,
+            }
+        )
+        self._field_issue_executor.submit(self._persist_field_issue, context)
+        self.statusBar().showMessage(
+            f"已锁定机位 {context['source_id'] + 1} 帧 {context['frame_index']}，正在保存问题标记",
+            3000,
+        )
+
+    def _persist_field_issue(self, context: Dict[str, Any]):
+        try:
+            screenshot_saved = write_image_unicode(
+                context["screenshot_path"], context["frame"], quality=95
+            )
+            marker = context["issue_log"].record(
+                session_id=context["session_id"],
+                source_id=context["source_id"],
+                category=context["category"],
+                frame_index=context["frame_index"],
+                capture_time_ms=context["capture_time_ms"],
+                segment_id=context["segment_id"],
+                participant_ids=context["participant_ids"],
+                raw_track_ids=context["raw_track_ids"],
+                event_ids=context["event_ids"],
+                screenshot_path=(
+                    context["screenshot_relative"].as_posix() if screenshot_saved else None
+                ),
+                metrics=context["metrics"],
+                software_commit=context["software_commit"],
+                model_identity=context["model_identity"],
+                event_profile=context["event_profile"],
+                note=context["note"],
+            )
+            if not self._field_issue_closing:
+                self.field_issue_saved_signal.emit(
+                    {"marker": marker, "screenshot_saved": screenshot_saved, "error": None}
+                )
+        except Exception as exc:
+            logger.exception(f"[FieldIssue] 保存失败: {exc}")
+            if not self._field_issue_closing:
+                self.field_issue_saved_signal.emit(
+                    {"marker": None, "screenshot_saved": False, "error": str(exc)}
+                )
+
+    def _on_field_issue_saved_ui(self, result: Dict[str, Any]):
+        error = result.get("error")
+        if error:
+            self.statusBar().showMessage(f"问题标记保存失败: {error}", 5000)
+            return
+        marker = result.get("marker")
+        if marker is None:
+            return
+        screenshot_state = "含原始截图" if result.get("screenshot_saved") else "仅保存时间标记"
+        self.statusBar().showMessage(
+            f"问题标记已保存: {marker.category} ({screenshot_state})",
+            5000,
+        )
+        logger.info(
+            f"[FieldIssue] 已保存 {marker.issue_id}: source={marker.source_id}, "
+            f"frame={marker.frame_index}, category={marker.category}"
+        )
+
     def _on_event_detected(self, event: CrossingEvent):
         """检测到过线事件 (在主线程执行)"""
         if not self._running:
@@ -5299,6 +5563,12 @@ class MainWindow(QMainWindow):
     def _cleanup_resources(self):
         """窗口关闭时清理资源（此时 Qt C++ 对象仍存活，可安全操作子线程）"""
         try:
+            self._field_issue_closing = True
+            field_issue_executor = getattr(self, "_field_issue_executor", None)
+            if field_issue_executor is not None:
+                field_issue_executor.shutdown(wait=False, cancel_futures=False)
+                self._field_issue_executor = None
+
             # 1. 停止 OCR 初始化线程
             if getattr(self, 'ocr_init_thread', None):
                 thread = self.ocr_init_thread

@@ -3,14 +3,63 @@
 //#include "../objects/shapes/vp_rect.h"
 
 namespace vp_nodes {
+    namespace {
+        struct track_statistics_registry {
+            std::mutex mutex;
+            std::map<const vp_track_node*, vp_track_stats> stats_by_node;
+        };
+
+        track_statistics_registry& statistics_registry() {
+            static track_statistics_registry registry;
+            return registry;
+        }
+
+        thread_local const vp_track_node* score_context_node = nullptr;
+        thread_local const std::vector<float>* score_context_scores = nullptr;
+
+        class track_score_context {
+        private:
+            const vp_track_node* previous_node = nullptr;
+            const std::vector<float>* previous_scores = nullptr;
+
+        public:
+            track_score_context(
+                const vp_track_node* node,
+                const std::vector<float>* scores):
+                previous_node(score_context_node),
+                previous_scores(score_context_scores) {
+                score_context_node = node;
+                score_context_scores = scores;
+            }
+
+            ~track_score_context() {
+                score_context_node = previous_node;
+                score_context_scores = previous_scores;
+            }
+        };
+
+        void add_statistics(vp_track_stats& total, const vp_track_stats& delta) {
+            total.created_tracks += delta.created_tracks;
+            total.deleted_tracks += delta.deleted_tracks;
+            total.matched_detections += delta.matched_detections;
+            total.unmatched_detections += delta.unmatched_detections;
+            total.track_fragments += delta.track_fragments;
+        }
+    }
         
     vp_track_node::vp_track_node(std::string node_name, 
                                 vp_track_for track_for): 
                                 vp_node(node_name), 
                                 track_for(track_for) {
+        auto& registry = statistics_registry();
+        std::lock_guard<std::mutex> guard(registry.mutex);
+        registry.stats_by_node.emplace(this, vp_track_stats {});
     }
     
     vp_track_node::~vp_track_node() {
+        auto& registry = statistics_registry();
+        std::lock_guard<std::mutex> guard(registry.mutex);
+        registry.stats_by_node.erase(this);
     }
 
     std::shared_ptr<vp_objects::vp_meta> vp_track_node::handle_control_meta(std::shared_ptr<vp_objects::vp_control_meta> meta) {
@@ -24,13 +73,27 @@ namespace vp_nodes {
         // data used for tracking
         std::vector<vp_objects::vp_rect> rects;      // rects of targets
         std::vector<std::vector<float>> embeddings;  // embeddings of targets
+        std::vector<float> scores;                   // detector confidence of targets
         std::vector<int> track_ids;                  // track ids of targets
 
         // step 1, collect data
         preprocess(meta, rects, embeddings);
+        if (track_for == vp_track_for::NORMAL) {
+            for (const auto& target : meta->targets) {
+                scores.push_back(target->primary_score);
+            }
+        }
+        if (track_for == vp_track_for::FACE) {
+            for (const auto& face : meta->face_targets) {
+                scores.push_back(face->score);
+            }
+        }
 
         // step 2, track by channel
-        track(channel_index, rects, embeddings, track_ids);
+        {
+            track_score_context score_context(this, &scores);
+            track(channel_index, rects, embeddings, track_ids);
+        }
 
         // step 3, postprocess
         postprocess(meta, rects, embeddings, track_ids);
@@ -55,6 +118,30 @@ namespace vp_nodes {
             }
         }
         /* ... extend for more track for... */
+    }
+
+    const std::vector<float>& vp_track_node::current_target_scores() const noexcept {
+        static const std::vector<float> empty_scores;
+        if (score_context_node == this && score_context_scores != nullptr) {
+            return *score_context_scores;
+        }
+        return empty_scores;
+    }
+
+    void vp_track_node::record_tracking_statistics(const vp_track_stats& delta) {
+        auto& registry = statistics_registry();
+        std::lock_guard<std::mutex> guard(registry.mutex);
+        const auto entry = registry.stats_by_node.find(this);
+        if (entry != registry.stats_by_node.end()) {
+            add_statistics(entry->second, delta);
+        }
+    }
+
+    vp_track_stats vp_track_node::tracking_statistics() const {
+        auto& registry = statistics_registry();
+        std::lock_guard<std::mutex> guard(registry.mutex);
+        const auto entry = registry.stats_by_node.find(this);
+        return entry == registry.stats_by_node.end() ? vp_track_stats {} : entry->second;
     }
 
     // write track_ids back to frame meta

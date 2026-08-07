@@ -1,8 +1,18 @@
 #include "vp_app_src_node.h"
 
+#include <stdexcept>
+
 namespace vp_nodes {
     vp_app_src_node::vp_app_src_node(std::string node_name, 
-                        int channel_index):vp_src_node(node_name, channel_index, 1.0) {
+                        int channel_index):vp_app_src_node(node_name, channel_index, 1) {
+    }
+
+    vp_app_src_node::vp_app_src_node(std::string node_name,
+                        int channel_index,
+                        int source_fps):vp_src_node(node_name, channel_index, 1.0), source_fps(source_fps) {
+        if (source_fps <= 0) {
+            throw std::invalid_argument("app source FPS must be greater than zero");
+        }
         this->initialized();
     }
 
@@ -49,7 +59,7 @@ namespace vp_nodes {
         if (original_width == 0 || original_height == 0 || original_fps == 0) {    
             original_width = w;
             original_height = h;
-            original_fps = 1;  // set constant value 1 for vp_app_src_node
+            original_fps = source_fps;
         }
         // stream_info_hooker activated if need
         vp_stream_info stream_info {channel_index, original_fps, original_width, original_height, to_string()};

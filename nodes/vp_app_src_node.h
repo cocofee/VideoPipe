@@ -8,6 +8,7 @@ namespace vp_nodes {
     class vp_app_src_node: public vp_src_node
     {
     private:
+        int source_fps;
     protected:
         // just call vp_node::handle_run to ignore vp_src_node::handle_run
         virtual void handle_run() override;
@@ -19,6 +20,9 @@ namespace vp_nodes {
     public:
         vp_app_src_node(std::string node_name, 
                         int channel_index);
+        vp_app_src_node(std::string node_name,
+                        int channel_index,
+                        int source_fps);
         ~vp_app_src_node();
 
         // push frames into pipeline

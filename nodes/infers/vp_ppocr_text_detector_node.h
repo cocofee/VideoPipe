@@ -3,6 +3,10 @@
 #ifdef VP_WITH_PADDLE
 #include "../vp_primary_infer_node.h"
 #include "../../third_party/paddle_ocr/include/paddleocr.h"
+#ifdef VP_WITH_ASYNC_OCR
+#include "../../objects/vp_ocr_consensus.h"
+#include "../../objects/vp_ocr_job.h"
+#endif
 
 namespace vp_nodes {
     // ocr based on paddle ocr
@@ -28,6 +32,11 @@ namespace vp_nodes {
                                     std::string rec_model_dir = "", 
                                     std::string rec_char_dict_path = "");
         ~vp_ppocr_text_detector_node();
+
+#ifdef VP_WITH_ASYNC_OCR
+        // Single-crop boundary used by the async OCR worker adapter.
+        vp_objects::vp_ocr_candidate recognize_crop(const cv::Mat& crop);
+#endif
     };
 }
 #endif

@@ -8,6 +8,9 @@
 cmake_minimum_required(VERSION 3.10)
 project(video_pipe VERSION 1.0)
 
+set(VP_RUNTIME_PROFILE_MANIFEST "${CMAKE_BINARY_DIR}/vp_runtime_profile.txt")
+file(REMOVE "${VP_RUNTIME_PROFILE_MANIFEST}")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Debug)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -fPIC -w -fdiagnostics-color=always -pthread")
@@ -21,7 +24,19 @@ option(VP_WITH_PADDLE "prepared PaddlePaddle or not?" OFF)
 option(VP_WITH_KAFKA "prepared Kafka or not?" OFF)
 option(VP_WITH_LLM "prepared LLM or not?" OFF)
 option(VP_WITH_FFMPEG "prepared FFMPEG or not?" OFF)
+option(VP_WITH_YOLO11 "Build YOLO11 adapter" OFF)
+option(VP_WITH_ASYNC_OCR "Build asynchronous OCR adapter" OFF)
 option(VP_BUILD_COMPLEX_SAMPLES "build complex samples or not? (maybe source code not provided)" OFF)
+option(VP_BUILD_TESTS "build tests" OFF)
+
+set(VP_RUNTIME_PROFILE "baseline" CACHE STRING "Runtime profile for isolated VideoPipe builds")
+set_property(CACHE VP_RUNTIME_PROFILE PROPERTY STRINGS baseline yolo11-pilot)
+set(VP_RUNTIME_PROFILES baseline yolo11-pilot)
+if(NOT "${VP_RUNTIME_PROFILE}" IN_LIST VP_RUNTIME_PROFILES)
+    message(FATAL_ERROR
+        "Invalid VP_RUNTIME_PROFILE='${VP_RUNTIME_PROFILE}'. "
+        "Allowed values: baseline, yolo11-pilot")
+endif()
 
 # OpenCV required
 find_package(OpenCV REQUIRED)
@@ -113,6 +128,14 @@ if(VP_WITH_FFMPEG)
     list(APPEND VP_DEPEND_LIBS avcodec avformat avdevice swscale swresample avutil)
 endif()
 
+if(VP_WITH_YOLO11)
+    add_definitions(-DVP_WITH_YOLO11)
+endif()
+
+if(VP_WITH_ASYNC_OCR)
+    add_definitions(-DVP_WITH_ASYNC_OCR)
+endif()
+
 # tinyexpr
 message("-------------start build tinyexpr--------------")
 add_subdirectory(third_party/tinyexpr)
@@ -160,6 +183,13 @@ message("-------------collect version info--------------")
 file(GLOB_RECURSE NODES "nodes/*.cpp")
 file(GLOB_RECURSE OBJECTS "objects/*.cpp")
 file(GLOB_RECURSE UTILS "utils/*.cpp")
+if(NOT VP_WITH_YOLO11)
+    list(FILTER NODES EXCLUDE REGEX "vp_yolo11_detector_node\\.cpp$")
+endif()
+if(NOT VP_WITH_ASYNC_OCR)
+    list(FILTER NODES EXCLUDE REGEX "vp_async_ocr_node\\.cpp$")
+    list(FILTER OBJECTS EXCLUDE REGEX "vp_ocr_(job|consensus)\\.cpp$")
+endif()
 #...#
 list(APPEND VP_CPPS_SOURCES ${NODES} ${OBJECTS} ${UTILS})
 
@@ -169,3 +199,26 @@ target_link_libraries(${PROJECT_NAME} ${VP_DEPEND_LIBS})
 
 # build for samples
 add_subdirectory(samples)
+
+if(VP_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+set(VP_RUNTIME_PROFILE_CONTENT "VP_RUNTIME_PROFILE=${VP_RUNTIME_PROFILE}
+VP_WITH_CUDA=${VP_WITH_CUDA}
+VP_WITH_TRT=${VP_WITH_TRT}
+VP_WITH_PADDLE=${VP_WITH_PADDLE}
+VP_WITH_YOLO11=${VP_WITH_YOLO11}
+VP_WITH_ASYNC_OCR=${VP_WITH_ASYNC_OCR}
+VP_BUILD_TESTS=${VP_BUILD_TESTS}
+OpenCV_VERSION=${OpenCV_VERSION}
+GStreamer_core_VERSION=${GST_VERSION}
+GStreamer_app_VERSION=${GSTAPP_VERSION}
+GStreamer_rtsp_server_VERSION=${GST_RTSP_VERSION}
+")
+file(GENERATE
+    OUTPUT "${VP_RUNTIME_PROFILE_MANIFEST}"
+    CONTENT "${VP_RUNTIME_PROFILE_CONTENT}")
+message(STATUS "Runtime profile: ${VP_RUNTIME_PROFILE}")
+message(STATUS "Runtime profile manifest: ${VP_RUNTIME_PROFILE_MANIFEST}")

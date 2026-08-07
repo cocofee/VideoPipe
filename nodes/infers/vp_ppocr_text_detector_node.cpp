@@ -3,6 +3,8 @@
 #include "vp_ppocr_text_detector_node.h"
 #include "../../objects/vp_frame_text_target.h"
 
+#include <stdexcept>
+
 namespace vp_nodes {
         
     vp_ppocr_text_detector_node::vp_ppocr_text_detector_node(std::string node_name, 
@@ -20,6 +22,29 @@ namespace vp_nodes {
     vp_ppocr_text_detector_node::~vp_ppocr_text_detector_node() {
         deinitialized();
     }
+
+#ifdef VP_WITH_ASYNC_OCR
+    vp_objects::vp_ocr_candidate vp_ppocr_text_detector_node::recognize_crop(const cv::Mat& crop) {
+        if (crop.empty()) {
+            throw std::invalid_argument("Paddle OCR crop must not be empty");
+        }
+
+        std::vector<cv::Mat> crops {crop.clone()};
+        const auto results = ocr->ocr(crops);
+        if (results.size() != 1) {
+            throw std::runtime_error("Paddle OCR returned an unexpected crop result count");
+        }
+
+        vp_objects::vp_ocr_candidate best_candidate;
+        for (const auto& result : results.front()) {
+            const auto normalized = vp_objects::vp_ocr_consensus::normalize_numeric(result.text);
+            if (!normalized.empty() && result.score > best_candidate.confidence) {
+                best_candidate = {normalized, result.score};
+            }
+        }
+        return best_candidate;
+    }
+#endif
     
     void vp_ppocr_text_detector_node::postprocess(const std::vector<cv::Mat>& raw_outputs, const std::vector<std::shared_ptr<vp_objects::vp_frame_meta>>& frame_meta_with_batch) {
 

@@ -3,22 +3,57 @@
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
+#include <stdexcept>
 
 #include "vp_rtsp_src_node.h"
 #include "../utils/vp_utils.h"
 
 namespace vp_nodes {
-        
+    std::string build_rtsp_gst_pipeline(const std::string& url,
+                                        const vp_rtsp_profile& profile,
+                                        const std::string& decoder) {
+        if (profile.latency_ms < 0) {
+            throw std::invalid_argument("RTSP latency must not be negative");
+        }
+
+        const auto transport = profile.transport == vp_rtsp_transport::TCP ? "tcp" : "udp";
+        const auto depay_and_parse = profile.codec == vp_rtsp_codec::H264
+            ? "rtph264depay ! h264parse"
+            : "rtph265depay ! h265parse";
+
+        return "rtspsrc location=" + url +
+               " protocols=" + transport +
+               " latency=" + std::to_string(profile.latency_ms) +
+               " ! application/x-rtp,media=video ! " + depay_and_parse +
+               " ! " + decoder + " ! videoconvert ! appsink";
+    }
+
     vp_rtsp_src_node::vp_rtsp_src_node(std::string node_name, 
                                         int channel_index, 
                                         std::string rtsp_url, 
                                         float resize_ratio,
                                         std::string gst_decoder_name,
-                                        int skip_interval): 
+                                        int skip_interval):
+                                        vp_rtsp_src_node(node_name,
+                                                         channel_index,
+                                                         rtsp_url,
+                                                         vp_rtsp_profile {},
+                                                         gst_decoder_name,
+                                                         resize_ratio,
+                                                         skip_interval) {
+    }
+
+    vp_rtsp_src_node::vp_rtsp_src_node(std::string node_name,
+                                        int channel_index,
+                                        std::string rtsp_url,
+                                        vp_rtsp_profile profile,
+                                        std::string gst_decoder_name,
+                                        float resize_ratio,
+                                        int skip_interval):
                                         vp_src_node(node_name, channel_index, resize_ratio),
                                         rtsp_url(rtsp_url), gst_decoder_name(gst_decoder_name), skip_interval(skip_interval) {
         assert(skip_interval >= 0 && skip_interval <= 9);
-        this->gst_template = vp_utils::string_format(this->gst_template, rtsp_url.c_str(), gst_decoder_name.c_str());
+        this->gst_template = build_rtsp_gst_pipeline(rtsp_url, profile, gst_decoder_name);
         VP_INFO(vp_utils::string_format("[%s] [%s]", node_name.c_str(), gst_template.c_str()));
         this->initialized();
     }

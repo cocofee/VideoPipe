@@ -196,6 +196,14 @@ if(VP_WITH_TRT)
     target_link_libraries(rtmp_src_sample ${PROJECT_NAME})
 endif()
 
+if(VP_WITH_TRT OR VP_WITH_YOLO11)
+    add_executable(
+        cycling_upgrade_sample
+        "cycling_upgrade_sample.cpp"
+        "cycling_upgrade_options.cpp")
+    target_link_libraries(cycling_upgrade_sample ${PROJECT_NAME})
+endif()
+
 if(VP_BUILD_COMPLEX_SAMPLES)
     message("start build for complex sampels...")
     # save exe to 'face_recognize'

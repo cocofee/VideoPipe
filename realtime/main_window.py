@@ -2071,7 +2071,7 @@ class VLMConfigDialog(QDialog):
         
         self.model_type = QComboBox()
         self.model_type.addItems(["doubao", "qwen"]) # 目前主要支持豆包和通义
-        self.model_type.setCurrentText(self.config.get('model_type', 'doubao'))
+        self.model_type.setCurrentText(self.config.get('model_type', 'qwen'))
         form.addRow("模型类型:", self.model_type)
         
         self.api_key = QLineEdit()
@@ -2106,7 +2106,7 @@ class VLMConfigDialog(QDialog):
         def _refresh_endpoint_placeholder():
             model_type = self.model_type.currentText().strip().lower()
             if model_type == "qwen":
-                self.endpoint_id.setPlaceholderText("通义请填模型名（可留空用默认）：qwen-vl-ocr-latest / qwen-vl-plus-latest / qwen-vl-max-latest")
+                self.endpoint_id.setPlaceholderText("通义模型名（可留空）：qwen3.5-ocr")
             else:
                 self.endpoint_id.setPlaceholderText("豆包需提供推理接入点 ID (Endpoint ID)")
 
@@ -3430,7 +3430,7 @@ class MainWindow(QMainWindow):
 
         endpoint_id = vlm_config.get('endpoint_id')
         max_rpm = vlm_config.get('max_calls_per_minute', 30)
-        model_type = vlm_config.get('model_type', 'doubao')
+        model_type = vlm_config.get('model_type', 'qwen')
         
         # 初始化共享 VLM
         try:
@@ -3438,26 +3438,22 @@ class MainWindow(QMainWindow):
             if model_type == "doubao":
                 self.shared_vlm = DoubaoVLMAssistant(api_key, endpoint_id)
             else:
-                self.shared_vlm = QwenVLMAssistant(api_key, endpoint_id or "qwen-vl-max")
+                self.shared_vlm = QwenVLMAssistant(api_key, endpoint_id or "qwen3.5-ocr")
             logger.info(f"[Main] 全局 VLM 助手已就绪 ({model_type})")
             
             # 同步到 OCR 管理器
             if self.ocr_manager:
                 self.ocr_manager.vlm = self.shared_vlm
                 self.ocr_manager.vlm_mode = str(vlm_config.get("ocr_mode", "fallback") or "fallback").lower()
+                self.ocr_manager.vlm_max_calls_per_minute = max(1, int(max_rpm))
         except Exception as e:
             logger.error(f"[Main] 初始化 VLM 失败: {e}")
             self.shared_vlm = None
 
-        # 同步到所有检测器
+        # VLM only runs on saved events so network latency never enters the frame path.
         for detector in self.detectors.values():
-            if hasattr(detector, 'enable_vlm'):
-                detector.enable_vlm(
-                    api_key=api_key,
-                    endpoint_id=endpoint_id,
-                    max_calls_per_minute=max_rpm,
-                    model_type=model_type
-                )
+            if hasattr(detector, 'disable_vlm'):
+                detector.disable_vlm()
 
     def _config_camera(self):
         """打开摄像头配置对话框 (支持多机位)"""
@@ -5341,10 +5337,11 @@ def main():
         },
         'vlm_config': {
             'enabled': False,
-            'model_type': 'doubao',
+            'model_type': 'qwen',
             'api_key': '',
-            'endpoint_id': '',
-            'max_calls_per_minute': 30
+            'endpoint_id': 'qwen3.5-ocr',
+            'max_calls_per_minute': 30,
+            'ocr_mode': 'fallback'
         }
     }
 

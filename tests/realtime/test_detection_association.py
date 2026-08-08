@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 import pytest
 from datetime import datetime
@@ -883,7 +884,17 @@ def test_laptop_profile_keeps_ocr_crop_on_original_frame():
     detector.enable_static_background_filter = False
     detector.enable_finish_segment_filter = False
     frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-    frame[545:635, 715:845] = (17, 83, 201)
+    frame[545:635, 715:845] = (255, 255, 255)
+    cv2.putText(
+        frame,
+        "206",
+        (730, 605),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
 
     detector.process_frame(frame, timestamp=0.0)
 
@@ -1061,6 +1072,83 @@ def test_candidate_cache_keeps_only_best_crop_per_source_frame():
     assert len(state.bib_crops_cache) == 1
     assert state.bib_crops_cache[0].quality == 0.80
     assert int(state.bib_crops_cache[0].crop[0, 0, 0]) == 20
+
+
+def test_saturated_low_text_region_is_rejected_as_non_bib():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    flag_crop = np.full((68, 74, 3), (30, 220, 30), dtype=np.uint8)
+    cv2.rectangle(flag_crop, (0, 0), (73, 67), (20, 80, 20), 2)
+
+    assert detector._has_strong_non_bib_signature(flag_crop) is True
+
+
+def test_colored_bib_with_visible_digits_is_not_rejected():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    bib_crop = np.full((68, 74, 3), (30, 220, 30), dtype=np.uint8)
+    cv2.putText(
+        bib_crop,
+        "206",
+        (2, 48),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.15,
+        (10, 10, 10),
+        3,
+        cv2.LINE_AA,
+    )
+
+    assert detector._has_strong_non_bib_signature(bib_crop) is False
+
+
+def _owned_candidate(quality, rel_x, rel_y, frame_index, value):
+    athlete_bbox = (100, 100, 300, 500)
+    bib_width = 50
+    bib_height = 40
+    center_x = athlete_bbox[0] + rel_x * (athlete_bbox[2] - athlete_bbox[0])
+    center_y = athlete_bbox[1] + rel_y * (athlete_bbox[3] - athlete_bbox[1])
+    bib_bbox = (
+        int(center_x - bib_width / 2),
+        int(center_y - bib_height / 2),
+        int(center_x + bib_width / 2),
+        int(center_y + bib_height / 2),
+    )
+    return BibEvidenceCandidate(
+        quality=quality,
+        crop=np.full((48, 64, 3), value, dtype=np.uint8),
+        frame=None,
+        frame_index=frame_index,
+        capture_time_ms=float(frame_index) * 10.0,
+        athlete_bbox=athlete_bbox,
+        bib_bbox=bib_bbox,
+        source="detected",
+        owner_validated=True,
+    )
+
+
+def test_spatially_inconsistent_detected_history_falls_back_to_torso():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    fallback = (0.60, np.zeros((120, 90, 3), dtype=np.uint8), None, [120, 180, 210, 300])
+    state = TrackState(prev_x=0, prev_y=0)
+    state.bib_crops_cache = [
+        _owned_candidate(0.80, 0.68, 0.46, 10, 30),
+        _owned_candidate(0.75, 0.43, 0.40, 20, 60),
+    ]
+    state.fallback_bib_crops_cache = [fallback]
+
+    assert detector._get_plausible_detected_bib_candidates(state) == []
+    assert detector._get_ocr_candidates(state) == [fallback]
+
+
+def test_spatially_consistent_detected_history_keeps_best_pair():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    consistent_first = _owned_candidate(0.80, 0.48, 0.46, 10, 30)
+    consistent_second = _owned_candidate(0.75, 0.53, 0.50, 20, 60)
+    outlier = _owned_candidate(0.90, 0.78, 0.30, 30, 90)
+    state = TrackState(prev_x=0, prev_y=0)
+    state.bib_crops_cache = [outlier, consistent_first, consistent_second]
+
+    candidates = detector._get_plausible_detected_bib_candidates(state)
+
+    assert candidates == [consistent_first, consistent_second]
 
 
 def test_usable_detected_bib_candidates_keep_priority_without_fallback_noise():

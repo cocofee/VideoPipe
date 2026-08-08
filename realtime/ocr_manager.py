@@ -5,6 +5,7 @@ import threading
 import queue
 import logging
 from collections import defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -18,6 +19,25 @@ from .io_utils import read_image_unicode
 from .ocr_worker import OcrJob, OcrProcessController, OcrResult, collect_candidate_paths
 
 logger = logging.getLogger(__name__)
+
+
+_EVENT_VLM_PROMPT = """You are reading a cycling race bib number.
+The first {candidate_count} image(s) are owner-validated bib crops from the same athlete.
+The last image, when present, is the athlete crop for context only.
+
+Rules:
+1. Read only the large race number attached to the athlete.
+2. Ignore jersey text, sponsor text, logos, clocks, and people in the background.
+3. Use all bib crops together; do not guess a hidden leading or trailing digit.
+4. Allowed format: {allowed_format}.
+5. If the number is not readable, return UNREADABLE.
+{roster_hint}
+
+Return exactly three lines:
+line 1: bib number or UNREADABLE
+line 2: confidence from 0.0 to 1.0
+line 3: a short reason
+"""
 
 
 @dataclass
@@ -50,6 +70,17 @@ class ParticipantOcrState:
             self.status = "CONFLICT"
         else:
             self.status = "RECOGNIZED"
+
+
+@dataclass(frozen=True)
+class EventVlmResult:
+    event_id: int
+    text: str = ""
+    confidence: float = 0.0
+    note: str = ""
+    error: str = ""
+    source: str = ""
+    candidate_count: int = 0
 
 class OCRManager:
     """
@@ -89,6 +120,20 @@ class OCRManager:
         self._pending_process_jobs = deque(maxlen=64)
         self._queued_process_event_ids: set[int] = set()
         self._process_restart_count = 0
+        self._vlm_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="videopipe-event-vlm",
+        )
+        self._vlm_futures: Dict[Future, dict] = {}
+        self._vlm_pending_event_ids: set[int] = set()
+        self._vlm_call_times = deque(maxlen=1000)
+        self._vlm_lock = threading.Lock()
+        self.vlm_max_calls_per_minute = 30
+        self.vlm_auto_confirm_threshold = 0.72
+        self.vlm_agreement_threshold = 0.58
+        self.vlm_single_frame_threshold = 0.84
+        self.vlm_conflict_threshold = 0.88
+        self.vlm_max_pending_jobs = 64
         # Participant-keyed consensus is additive; event/track APIs remain intact.
         self._participant_ocr_states: Dict[str, ParticipantOcrState] = {}
         self._participant_ocr_lock = threading.Lock()
@@ -103,7 +148,8 @@ class OCRManager:
             "processed": 0,
             "failed": 0,
             "merged": 0,
-            "vlm_used": 0
+            "vlm_used": 0,
+            "vlm_pending": 0,
         }
         
         self.merge_window_seconds = 60.0
@@ -337,9 +383,7 @@ class OCRManager:
 
     def poll_process_results(self) -> List[OcrResult]:
         """Drain small child-process messages and apply event results in this process."""
-        if self.process_controller is None:
-            return []
-        results = self.process_controller.poll()
+        results = self.process_controller.poll() if self.process_controller is not None else []
         for result in results:
             if int(result.event_id) < 0:
                 normalized_state = str(result.status or "").strip().lower()
@@ -356,9 +400,354 @@ class OCRManager:
                 self.stats["pending"] -= 1
             self._apply_process_result(result)
             self._dispatch_pending_process_job()
-        if self.runtime_state in {"loading", "ready", "failed"} and not self.process_controller.is_alive:
+        self._poll_event_vlm_results()
+        if (
+            self.process_controller is not None
+            and self.runtime_state in {"loading", "ready", "failed"}
+            and not self.process_controller.is_alive
+        ):
             self._recover_process_runtime()
         return results
+
+    def _collect_owned_vlm_paths(
+        self,
+        event_dir: Path,
+        meta: dict,
+    ) -> tuple[tuple[Path, ...], Optional[Path]]:
+        metadata = meta.get("bib_candidate_metadata") if isinstance(meta, dict) else None
+        if not isinstance(metadata, list):
+            return (), None
+
+        candidates = []
+        seen_frames = set()
+        for item in metadata:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("source") or "").strip().lower() != "detected":
+                continue
+            if item.get("owner_validated") is not True:
+                continue
+            try:
+                frame_index = int(item.get("frame_index"))
+            except (TypeError, ValueError):
+                continue
+            if frame_index < 0 or frame_index in seen_frames:
+                continue
+            path_value = item.get("path")
+            if not path_value:
+                continue
+            candidate_path = Path(str(path_value))
+            if not candidate_path.is_absolute():
+                candidate_path = event_dir / candidate_path
+            if not candidate_path.is_file():
+                continue
+            seen_frames.add(frame_index)
+            candidates.append(candidate_path.resolve())
+            if len(candidates) >= 2:
+                break
+
+        if not candidates:
+            return (), None
+
+        paths = meta.get("paths") if isinstance(meta, dict) else None
+        paths = paths if isinstance(paths, dict) else {}
+        athlete_value = paths.get("athlete") or "athlete.jpg"
+        athlete_path = Path(str(athlete_value))
+        if not athlete_path.is_absolute():
+            athlete_path = event_dir / athlete_path
+        if athlete_path.is_file():
+            athlete_path = athlete_path.resolve()
+        else:
+            athlete_path = None
+        return tuple(candidates), athlete_path
+
+    def _get_roster_bibs(self) -> list[str]:
+        get_all = getattr(self.db, "get_all_athletes", None)
+        if not callable(get_all):
+            return []
+        try:
+            athletes = get_all() or []
+        except Exception:
+            return []
+        bibs = []
+        for athlete in athletes:
+            if not isinstance(athlete, dict):
+                continue
+            bib = str(athlete.get("bib_number") or "").strip().upper()
+            if bib and bib not in bibs:
+                bibs.append(bib)
+            if len(bibs) >= 200:
+                break
+        return bibs
+
+    def _build_event_vlm_prompt(self, candidate_count: int, roster_bibs: list[str]) -> str:
+        allowed_format = (
+            "1 to 6 digits"
+            if self.only_numeric
+            else "an optional letter prefix and 3 to 6 digits"
+        )
+        roster_hint = ""
+        if roster_bibs:
+            roster_hint = (
+                "Valid roster bibs (reference only; never invent a match): "
+                + ", ".join(roster_bibs)
+            )
+        return _EVENT_VLM_PROMPT.format(
+            candidate_count=max(1, int(candidate_count)),
+            allowed_format=allowed_format,
+            roster_hint=roster_hint,
+        )
+
+    @staticmethod
+    def _prepare_vlm_crop(image: np.ndarray) -> np.ndarray:
+        if image is None or image.size == 0:
+            return image
+        height, width = image.shape[:2]
+        shortest = max(1, min(height, width))
+        if shortest >= 160:
+            return image
+        scale = min(6.0, 160.0 / shortest)
+        target_width = max(1, int(round(width * scale)))
+        target_height = max(1, int(round(height * scale)))
+        return cv2.resize(
+            image,
+            (target_width, target_height),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    def _run_event_vlm_job(
+        self,
+        *,
+        event_id: int,
+        candidate_paths: tuple[Path, ...],
+        athlete_path: Optional[Path],
+        roster_bibs: list[str],
+        vlm_engine: Any,
+    ) -> EventVlmResult:
+        images = []
+        for candidate_path in candidate_paths:
+            image = read_image_unicode(candidate_path)
+            if image is None or image.size == 0:
+                continue
+            images.append(self._prepare_vlm_crop(image))
+        candidate_count = len(images)
+        if candidate_count == 0:
+            return EventVlmResult(
+                event_id=event_id,
+                error="VLM_NO_VALID_CANDIDATE",
+            )
+
+        if athlete_path is not None:
+            athlete_image = read_image_unicode(athlete_path)
+            if athlete_image is not None and athlete_image.size:
+                images.append(athlete_image)
+
+        prompt = self._build_event_vlm_prompt(candidate_count, roster_bibs)
+        try:
+            text, confidence, note = vlm_engine.ocr_bib(
+                images,
+                athlete_list=roster_bibs,
+                only_numeric=self.only_numeric,
+                prompt=prompt,
+            )
+        except Exception as exc:
+            logger.warning("[OCRManager] Event VLM failed for %s: %s", event_id, exc)
+            return EventVlmResult(
+                event_id=event_id,
+                error="VLM_REQUEST_FAILED",
+                source=type(vlm_engine).__name__,
+                candidate_count=candidate_count,
+            )
+        return EventVlmResult(
+            event_id=event_id,
+            text=str(text or "").strip(),
+            confidence=max(0.0, min(1.0, float(confidence or 0.0))),
+            note=str(note or "").strip(),
+            error="" if text else "VLM_UNREADABLE",
+            source=type(vlm_engine).__name__,
+            candidate_count=candidate_count,
+        )
+
+    def _schedule_event_vlm(
+        self,
+        *,
+        event: dict,
+        event_dir: Path,
+        meta: dict,
+        local_text: str,
+        local_confidence: float,
+        local_error: str,
+    ) -> bool:
+        vlm_engine = self.vlm
+        if vlm_engine is None:
+            return False
+        event_id = int(event.get("event_id") or meta.get("event_id") or 0)
+        if event_id <= 0 or event_id in self._vlm_pending_event_ids:
+            return False
+        candidate_paths, athlete_path = self._collect_owned_vlm_paths(event_dir, meta)
+        if not candidate_paths:
+            return False
+
+        now = time.monotonic()
+        with self._vlm_lock:
+            while self._vlm_call_times and now - self._vlm_call_times[0] >= 60.0:
+                self._vlm_call_times.popleft()
+            if len(self._vlm_call_times) >= max(1, int(self.vlm_max_calls_per_minute)):
+                logger.warning(
+                    "[OCRManager] Event VLM rate limit reached; event %s remains PENDING",
+                    event_id,
+                )
+                return False
+            if len(self._vlm_futures) >= max(1, int(self.vlm_max_pending_jobs)):
+                logger.warning(
+                    "[OCRManager] Event VLM queue full; event %s remains PENDING",
+                    event_id,
+                )
+                return False
+            self._vlm_call_times.append(now)
+
+        context = {
+            "event_id": event_id,
+            "event_dir": event_dir,
+            "meta": dict(meta),
+            "local_text": str(local_text or "").strip(),
+            "local_confidence": float(local_confidence or 0.0),
+            "local_error": str(local_error or ""),
+        }
+        future = self._vlm_executor.submit(
+            self._run_event_vlm_job,
+            event_id=event_id,
+            candidate_paths=candidate_paths,
+            athlete_path=athlete_path,
+            roster_bibs=self._get_roster_bibs(),
+            vlm_engine=vlm_engine,
+        )
+        self._vlm_futures[future] = context
+        self._vlm_pending_event_ids.add(event_id)
+        self.stats["vlm_pending"] = int(self.stats.get("vlm_pending", 0)) + 1
+        return True
+
+    def _poll_event_vlm_results(self) -> None:
+        completed = [future for future in self._vlm_futures if future.done()]
+        for future in completed:
+            context = self._vlm_futures.pop(future)
+            event_id = int(context["event_id"])
+            self._vlm_pending_event_ids.discard(event_id)
+            if self.stats.get("vlm_pending", 0) > 0:
+                self.stats["vlm_pending"] -= 1
+            try:
+                result = future.result()
+            except Exception as exc:
+                logger.warning(
+                    "[OCRManager] Event VLM worker failed for %s: %s",
+                    event_id,
+                    exc,
+                )
+                result = EventVlmResult(
+                    event_id=event_id,
+                    error="VLM_WORKER_FAILED",
+                )
+            self._apply_event_vlm_result(context, result)
+
+    def _apply_event_vlm_result(self, context: dict, result: EventVlmResult) -> None:
+        event_id = int(context["event_id"])
+        event = self.db.get_event(event_id)
+        if not event or int(event.get("manual_corrected") or 0) != 0:
+            return
+        event_dir = Path(context["event_dir"])
+        if not event_dir.is_dir():
+            return
+        meta = dict(context["meta"])
+        meta["event_id"] = event_id
+
+        normalized = self._normalize_bib_text(result.text)
+        local_text = self._normalize_bib_text(context.get("local_text"))
+        local_confidence = float(context.get("local_confidence") or 0.0)
+        confidence = float(result.confidence or 0.0)
+        agrees_with_local = bool(normalized and local_text and normalized == local_text)
+        strong_local_conflict = bool(
+            normalized
+            and local_text
+            and normalized != local_text
+            and len(local_text) >= 2
+            and local_confidence >= 0.75
+        )
+
+        required_confidence = float(self.vlm_auto_confirm_threshold)
+        if agrees_with_local:
+            required_confidence = float(self.vlm_agreement_threshold)
+        elif strong_local_conflict:
+            required_confidence = float(self.vlm_conflict_threshold)
+        if int(result.candidate_count or 0) < 2:
+            required_confidence = max(
+                required_confidence,
+                float(self.vlm_single_frame_threshold),
+            )
+
+        participant_state = None
+        if normalized:
+            participant_state = self._add_participant_ocr_vote(
+                event.get("participant_id"),
+                event.get("track_id"),
+                normalized,
+                confidence,
+            )
+        participant_conflict = bool(
+            participant_state and participant_state.status == "CONFLICT"
+        )
+        accepted = bool(
+            normalized
+            and not result.error
+            and confidence >= required_confidence
+            and not participant_conflict
+        )
+        status = "DONE" if accepted else "PENDING"
+        if accepted:
+            error = ""
+        elif participant_conflict:
+            error = "PARTICIPANT_OCR_CONFLICT"
+        elif result.error:
+            error = result.error
+        elif normalized:
+            error = "VLM_LOW_CONF"
+        else:
+            error = "VLM_UNREADABLE"
+
+        output_text = normalized or local_text or str(result.text or "").strip()
+        output_confidence = confidence if normalized else local_confidence
+        source = f"event_vlm:{result.source or 'unknown'}"
+        result_data = self._save_result(
+            event_dir,
+            meta,
+            output_text,
+            output_confidence,
+            status,
+            error=error,
+            source=source,
+            image_source="owned_bib_candidates+athlete",
+            participant_id=event.get("participant_id"),
+            raw_track_id=event.get("track_id"),
+            participant_status=(participant_state.status if participant_state else "PENDING"),
+        )
+        notes = f"Source: {source}"
+        if result.note:
+            notes += f"; note={result.note[:120]}"
+        self._persist_ocr_resolution(
+            event_id=event_id,
+            bib=normalized,
+            conf=output_confidence,
+            status=status,
+            evidence_dir=str(event_dir),
+            notes=notes,
+        )
+        self.stats["vlm_used"] = int(self.stats.get("vlm_used", 0)) + 1
+        if status == "DONE":
+            self.stats["done"] = int(self.stats.get("done", 0)) + 1
+            self.stats["resolved_done"] = int(self.stats.get("resolved_done", 0)) + 1
+        else:
+            self.stats["pending_result"] = int(self.stats.get("pending_result", 0)) + 1
+        if self.on_event_done:
+            self.on_event_done(event_id, result_data)
 
     def _recover_process_runtime(self) -> bool:
         if self.process_controller is None:
@@ -431,10 +820,20 @@ class OCRManager:
                 f"attempts={result.attempted_candidates}"
             ),
         )
+        vlm_scheduled = False
+        if status != "DONE":
+            vlm_scheduled = self._schedule_event_vlm(
+                event=event,
+                event_dir=event_dir,
+                meta=meta,
+                local_text=normalized or str(result.text or "").strip(),
+                local_confidence=float(result.confidence or 0.0),
+                local_error=error,
+            )
         if status == "DONE":
             self.stats["done"] = int(self.stats.get("done", 0)) + 1
             self.stats["resolved_done"] = int(self.stats.get("resolved_done", 0)) + 1
-        else:
+        elif not vlm_scheduled:
             self.stats["pending_result"] = int(self.stats.get("pending_result", 0)) + 1
         if self.on_event_done:
             self.on_event_done(event_id, result_data)
@@ -584,7 +983,7 @@ class OCRManager:
             event_id = int(event_id)
         except (TypeError, ValueError):
             return False
-        if event_id in self._queued_process_event_ids:
+        if event_id in self._queued_process_event_ids or event_id in self._vlm_pending_event_ids:
             return False
 
         event = self.db.get_event(event_id)
@@ -630,6 +1029,9 @@ class OCRManager:
             self.runtime_state = "disabled"
             self._pending_process_jobs.clear()
             self._queued_process_event_ids.clear()
+        self._vlm_pending_event_ids.clear()
+        self._vlm_futures.clear()
+        self._vlm_executor.shutdown(wait=False, cancel_futures=True)
         self._running = False
         if self._worker_thread:
             self._worker_thread.join(timeout=2.0)

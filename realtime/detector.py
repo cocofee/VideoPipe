@@ -731,12 +731,11 @@ def parse_ocr_result(response: str) -> Tuple[Optional[str], float, str]:
         clean = ''.join(c for c in clean_raw if c.isalnum() and ord(c) < 128)
         
         # 3. 提取核心号码 (正则表达式匹配 A1234 或 1234 这种模式)
-        # 只要包含至少 2 个数字，就认为可能是号码
-        match = re.search(r'[A-Z]?\d{2,6}', clean)
+        # Cycling events may use a one-digit bib.
+        match = re.search(r'[A-Z]?\d{1,6}', clean)
         if match:
             extracted = match.group()
-            # 规则校验：长度适中 (2-8位)
-            if 2 <= len(extracted) <= 8:
+            if 1 <= len(extracted) <= 8:
                 bib_number = extracted
     
     if len(lines) >= 2:
@@ -1466,6 +1465,11 @@ class Detector:
         self.ocr_detected_bib_min_quality = 0.55
         self.bib_candidate_max_aspect = 2.20
         self.bib_cache_max_median_aspect = 2.05
+        self.bib_candidate_max_rel_dx = 0.18
+        self.bib_candidate_max_rel_dy = 0.14
+        self.bib_nontext_saturation_min = 125.0
+        self.bib_nontext_gray_std_max = 58.0
+        self.bib_nontext_edge_density_max = 0.18
         self.crossing_direction: Optional[str] = None
         self.cross_confirm_frames = 1          # 过线最少确认帧数（低FPS下避免漏判）
         self.cross_signal_window = 0.45        # 连续过线信号合并窗口（秒）
@@ -4059,6 +4063,53 @@ class Detector:
         sharpness_score = min(1.0, laplacian_var / 700.0)
         return resolution_score * 0.55 + area_score * 0.25 + sharpness_score * 0.20
 
+    def _has_strong_non_bib_signature(self, crop: np.ndarray) -> bool:
+        """Reject only obvious solid-color regions that lack text-like structure."""
+        if crop is None or not isinstance(crop, np.ndarray) or crop.size == 0:
+            return True
+        height, width = crop.shape[:2]
+        if height < 12 or width < 12:
+            return True
+
+        y_pad = max(1, height // 6)
+        x_pad = max(1, width // 8)
+        central = crop[y_pad:height - y_pad, x_pad:width - x_pad]
+        if central.size == 0:
+            central = crop
+
+        try:
+            gray = cv2.cvtColor(central, cv2.COLOR_BGR2GRAY)
+            hsv = cv2.cvtColor(central, cv2.COLOR_BGR2HSV)
+            edges = cv2.Canny(gray, 60, 150)
+        except Exception:
+            return False
+
+        gray_std = float(gray.std())
+        mean_saturation = float(hsv[..., 1].mean())
+        edge_density = float(np.count_nonzero(edges)) / max(1, edges.size)
+        return bool(
+            mean_saturation >= self.bib_nontext_saturation_min
+            and gray_std <= self.bib_nontext_gray_std_max
+            and edge_density <= self.bib_nontext_edge_density_max
+        )
+
+    @staticmethod
+    def _candidate_relative_bib_position(candidate: Any) -> Optional[Tuple[float, float]]:
+        if not isinstance(candidate, BibEvidenceCandidate) or not candidate.owner_validated:
+            return None
+        if len(candidate.athlete_bbox) != 4 or len(candidate.bib_bbox) != 4:
+            return None
+        ax1, ay1, ax2, ay2 = [float(value) for value in candidate.athlete_bbox]
+        bx1, by1, bx2, by2 = [float(value) for value in candidate.bib_bbox]
+        athlete_width = ax2 - ax1
+        athlete_height = ay2 - ay1
+        if athlete_width <= 0.0 or athlete_height <= 0.0:
+            return None
+        return (
+            ((bx1 + bx2) * 0.5 - ax1) / athlete_width,
+            ((by1 + by2) * 0.5 - ay1) / athlete_height,
+        )
+
     def _get_plausible_detected_bib_candidates(
         self,
         state: TrackState,
@@ -4073,6 +4124,8 @@ class Detector:
                 continue
             if not bbox or len(bbox) != 4:
                 continue
+            if self._has_strong_non_bib_signature(crop):
+                continue
             width = max(1.0, float(bbox[2]) - float(bbox[0]))
             height = max(1.0, float(bbox[3]) - float(bbox[1]))
             aspect = width / height
@@ -4082,11 +4135,43 @@ class Detector:
         if len(aspects) >= 3 and float(np.median(aspects)) > self.bib_cache_max_median_aspect:
             return []
 
-        return [
+        filtered = [
             candidate
             for candidate, aspect in candidates
             if aspect <= self.bib_candidate_max_aspect
         ]
+        positioned = [
+            (index, candidate, self._candidate_relative_bib_position(candidate))
+            for index, candidate in enumerate(filtered)
+        ]
+        positioned = [item for item in positioned if item[2] is not None]
+        if len(positioned) < 2:
+            return filtered
+
+        best_indices = set()
+        best_rank = (0, 0.0)
+        for anchor_index, _, anchor_position in positioned:
+            cluster_indices = set()
+            cluster_quality = 0.0
+            for candidate_index, candidate, position in positioned:
+                if (
+                    abs(position[0] - anchor_position[0]) <= self.bib_candidate_max_rel_dx
+                    and abs(position[1] - anchor_position[1]) <= self.bib_candidate_max_rel_dy
+                ):
+                    cluster_indices.add(candidate_index)
+                    cluster_quality += float(candidate[0])
+            rank = (len(cluster_indices), cluster_quality)
+            if rank > best_rank:
+                best_rank = rank
+                best_indices = cluster_indices
+
+        if best_rank[0] < 2:
+            return [
+                candidate
+                for candidate in filtered
+                if self._candidate_relative_bib_position(candidate) is None
+            ]
+        return [candidate for index, candidate in enumerate(filtered) if index in best_indices]
 
     def _get_ocr_candidates(self, state: TrackState) -> List[Any]:
         """Prefer detector-backed bib crops, falling back to continuously refreshed torso crops."""
@@ -4876,9 +4961,9 @@ class Detector:
                     if not state:
                         continue
 
-                    state.last_bib_rel_pos = (rel_x, rel_y)
-                    state.has_bib_box = True
                     if not self.ocr_pipeline_enabled:
+                        state.last_bib_rel_pos = (rel_x, rel_y)
+                        state.has_bib_box = True
                         continue
                     bx1, by1, bx2, by2 = bib['bbox']
                     b_pad = 5
@@ -4890,6 +4975,16 @@ class Detector:
                         continue
 
                     quality = self._calculate_image_quality(b_crop)
+                    if self._has_strong_non_bib_signature(b_crop):
+                        logger.debug(
+                            "[Detector-%s] Reject non-bib crop for track %s at frame %s",
+                            self.source_id,
+                            tid,
+                            self._frame_count,
+                        )
+                        continue
+                    state.last_bib_rel_pos = (rel_x, rel_y)
+                    state.has_bib_box = True
                     frame_ref = frame_original if (by2 > int(height * 0.45) or quality >= 0.6) else None
                     self._cache_ocr_candidate(
                         state,

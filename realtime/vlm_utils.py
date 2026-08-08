@@ -192,7 +192,7 @@ def parse_ocr_result(response: str) -> Tuple[Optional[str], float, str]:
         
     # 提取号码：大写字母(可选) + 2-6位数字
     clean = ''.join(c for c in raw if c.isalnum())
-    match = re.search(r'[A-Z]?\d{2,6}', clean)
+    match = re.search(r'[A-Z]?\d{1,6}', clean)
     bib_number = match.group() if match else None
     
     confidence = 0.0

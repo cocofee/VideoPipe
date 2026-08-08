@@ -1,6 +1,8 @@
 import json
 import queue
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -9,6 +11,7 @@ import numpy as np
 import pytest
 
 import realtime.ocr_worker as ocr_worker
+from realtime.detector import parse_ocr_result
 from realtime.ocr_worker import (
     OcrJob,
     OcrProcessController,
@@ -317,6 +320,197 @@ def test_ocr_manager_applies_result_in_main_process_without_overwriting_manual_r
     controller.results.append(OcrResult(event_id=7, text="126", confidence=0.99, status="DONE"))
     manager.poll_process_results()
     assert len(database.updates) == 1
+
+
+def _write_owned_vlm_event(event_dir: Path, event_id: int = 7) -> None:
+    event_dir.mkdir()
+    _write_image(event_dir / "bib_candidate_01.jpg", 11)
+    _write_image(event_dir / "bib_candidate_02.jpg", 22)
+    _write_image(event_dir / "athlete.jpg", 33)
+    (event_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "event_id": event_id,
+                "paths": {
+                    "athlete": "athlete.jpg",
+                    "bib_candidates": [
+                        "bib_candidate_01.jpg",
+                        "bib_candidate_02.jpg",
+                    ],
+                },
+                "bib_candidate_metadata": [
+                    {
+                        "path": "bib_candidate_01.jpg",
+                        "source": "detected",
+                        "owner_validated": True,
+                        "frame_index": 10,
+                        "athlete_bbox": [0, 0, 100, 180],
+                        "bib_bbox": [25, 70, 70, 110],
+                    },
+                    {
+                        "path": "bib_candidate_02.jpg",
+                        "source": "detected",
+                        "owner_validated": True,
+                        "frame_index": 12,
+                        "athlete_bbox": [0, 0, 100, 180],
+                        "bib_bbox": [24, 69, 71, 111],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _poll_until(predicate, manager, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        manager.poll_process_results()
+        if predicate():
+            return
+        time.sleep(0.01)
+    assert predicate()
+
+
+def test_ocr_manager_runs_event_vlm_off_gui_thread_and_auto_confirms(tmp_path):
+    event_dir = tmp_path / "000007"
+    _write_owned_vlm_event(event_dir)
+    event = {
+        "event_id": 7,
+        "evidence_dir": str(event_dir),
+        "manual_corrected": 0,
+        "participant_id": "P000007",
+        "track_id": 17,
+    }
+    database = _Database(event)
+    controller = _ProcessController()
+    release = threading.Event()
+    calls = []
+
+    class _Vlm:
+        def ocr_bib(self, images, athlete_list=None, only_numeric=False, prompt=None):
+            calls.append((images, athlete_list, only_numeric, prompt, threading.current_thread().name))
+            release.wait(timeout=2.0)
+            return "145", 0.93, "clear"
+
+    manager = OCRManager(database, vlm_engine=_Vlm(), process_controller=controller)
+    controller.results.append(
+        OcrResult(
+            event_id=7,
+            text="45",
+            confidence=0.35,
+            status="PENDING",
+            source="bib_candidate_01.jpg",
+            error="OCR_CONFLICT",
+        )
+    )
+
+    started = time.perf_counter()
+    manager.poll_process_results()
+    assert time.perf_counter() - started < 0.2
+    assert database.updates[-1][0][:4] == (7, "", 0.35, "PENDING")
+
+    release.set()
+    _poll_until(lambda: database.updates[-1][0][3] == "DONE", manager)
+
+    assert database.updates[-1][0][:4] == (7, "145", 0.93, "DONE")
+    result = json.loads((event_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["bib"] == "145"
+    assert result["source"].startswith("event_vlm:")
+    assert len(calls) == 1
+    assert len(calls[0][0]) == 3
+    assert calls[0][4] != threading.current_thread().name
+    manager.stop()
+
+
+def test_ocr_manager_keeps_low_confidence_vlm_result_pending(tmp_path):
+    event_dir = tmp_path / "000007"
+    _write_owned_vlm_event(event_dir)
+    database = _Database(
+        {"event_id": 7, "evidence_dir": str(event_dir), "manual_corrected": 0}
+    )
+    controller = _ProcessController()
+
+    class _Vlm:
+        def ocr_bib(self, images, athlete_list=None, only_numeric=False, prompt=None):
+            return "145", 0.51, "blurred"
+
+    manager = OCRManager(database, vlm_engine=_Vlm(), process_controller=controller)
+    controller.results.append(
+        OcrResult(event_id=7, status="PENDING", error="OCR_FAILED")
+    )
+
+    manager.poll_process_results()
+    _poll_until(lambda: len(database.updates) >= 2, manager)
+
+    assert database.updates[-1][0][:4] == (7, "", 0.51, "PENDING")
+    result = json.loads((event_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["bib"] == "145"
+    assert result["error"] == "VLM_LOW_CONF"
+    manager.stop()
+
+
+def test_ocr_manager_does_not_send_unowned_legacy_crop_to_vlm(tmp_path):
+    event_dir = tmp_path / "000007"
+    event_dir.mkdir()
+    _write_image(event_dir / "bib.jpg", 7)
+    (event_dir / "meta.json").write_text(
+        json.dumps({"event_id": 7, "paths": {"bib": "bib.jpg"}}),
+        encoding="utf-8",
+    )
+    database = _Database(
+        {"event_id": 7, "evidence_dir": str(event_dir), "manual_corrected": 0}
+    )
+    controller = _ProcessController()
+    calls = []
+
+    class _Vlm:
+        def ocr_bib(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return "66", 0.99, "clear"
+
+    manager = OCRManager(database, vlm_engine=_Vlm(), process_controller=controller)
+    controller.results.append(
+        OcrResult(event_id=7, text="66", confidence=0.4, status="PENDING")
+    )
+
+    manager.poll_process_results()
+    time.sleep(0.05)
+    manager.poll_process_results()
+
+    assert calls == []
+    assert database.updates[-1][0][:4] == (7, "", 0.4, "PENDING")
+    manager.stop()
+
+
+def test_ocr_manager_does_not_overwrite_manual_edit_after_vlm_started(tmp_path):
+    event_dir = tmp_path / "000007"
+    _write_owned_vlm_event(event_dir)
+    event = {"event_id": 7, "evidence_dir": str(event_dir), "manual_corrected": 0}
+    database = _Database(event)
+    controller = _ProcessController()
+    release = threading.Event()
+
+    class _Vlm:
+        def ocr_bib(self, images, athlete_list=None, only_numeric=False, prompt=None):
+            release.wait(timeout=2.0)
+            return "145", 0.99, "clear"
+
+    manager = OCRManager(database, vlm_engine=_Vlm(), process_controller=controller)
+    controller.results.append(OcrResult(event_id=7, status="PENDING"))
+    manager.poll_process_results()
+    assert len(database.updates) == 1
+
+    event["manual_corrected"] = 1
+    release.set()
+    _poll_until(lambda: not manager._vlm_pending_event_ids, manager)
+
+    assert len(database.updates) == 1
+    manager.stop()
+
+
+def test_vlm_parser_accepts_single_digit_cycling_bib():
+    assert parse_ocr_result("7\n0.95\nclear") == ("7", 0.95, "clear")
 
 
 def test_ocr_manager_restarts_once_then_disables_failed_process():

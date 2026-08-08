@@ -95,6 +95,7 @@ try:
     from .io_utils import read_image_unicode, write_image_unicode
     from .field_issue_log import FIELD_ISSUE_CATEGORIES, FieldIssueLog
     from .runtime_paths import application_dir, find_model as find_runtime_model, resolve_output_dir, resolve_runtime_path, resolve_source
+    from .stream_recorder import ManualRecordingManager, RecordingError, is_rtsp_source
 except ImportError:
     import sys
     import os
@@ -113,6 +114,7 @@ except ImportError:
     from io_utils import read_image_unicode, write_image_unicode
     from field_issue_log import FIELD_ISSUE_CATEGORIES, FieldIssueLog
     from runtime_paths import application_dir, find_model as find_runtime_model, resolve_output_dir, resolve_runtime_path, resolve_source
+    from stream_recorder import ManualRecordingManager, RecordingError, is_rtsp_source
 
 
 class InteractiveVideoLabel(QLabel):
@@ -2176,6 +2178,7 @@ class MainWindow(QMainWindow):
         self._ocr_runtime_state = 'idle'  # idle/loading/ready/failed/disabled
         self.database: Optional[Database] = None
         self.recorder: Optional[EventRecorder] = None
+        self.recording_manager: Optional[ManualRecordingManager] = None
         self.viewer_dialog: Optional[ImageViewerDialog] = None
         self.ocr_manager: Optional[OCRManager] = None
         self.field_issue_log: Optional[FieldIssueLog] = None
@@ -2228,6 +2231,10 @@ class MainWindow(QMainWindow):
         self._ocr_poll_timer = QTimer(self)
         self._ocr_poll_timer.setInterval(100)
         self._ocr_poll_timer.timeout.connect(self._poll_ocr_runtime)
+
+        self._recording_poll_timer = QTimer(self)
+        self._recording_poll_timer.setInterval(500)
+        self._recording_poll_timer.timeout.connect(self._poll_recording_status)
 
         # 应用全局样式：统一字体大小为 16px，确保布局不拥挤且清晰
         self.setStyleSheet("""
@@ -2315,6 +2322,22 @@ class MainWindow(QMainWindow):
             }
             #primary_btn:hover {
                 background-color: #40a9ff;
+            }
+            #record_btn {
+                background-color: #cf1322;
+                color: white;
+                border: none;
+            }
+            #record_btn:hover {
+                background-color: #f5222d;
+            }
+            #recording_btn {
+                background-color: #820014;
+                color: white;
+                border: none;
+            }
+            #recording_btn:hover {
+                background-color: #a8071a;
             }
             QLabel {
                 font-size: 16px;
@@ -2655,6 +2678,14 @@ class MainWindow(QMainWindow):
         self.start_time_btn.clicked.connect(self._show_start_time_dialog)
         btn_layout.addWidget(self.start_time_btn)
 
+        self.record_btn = QPushButton("开始录像")
+        self.record_btn.setObjectName("record_btn")
+        self.record_btn.setFixedSize(150, 40)
+        self.record_btn.setToolTip("手动保存网络摄像头原始码流；再次点击停止并封装录像文件")
+        self.record_btn.clicked.connect(self._toggle_recording)
+        self.record_btn.setEnabled(False)
+        btn_layout.addWidget(self.record_btn)
+
         self.field_issue_btn = QPushButton("标记问题")
         self.field_issue_btn.setObjectName("primary_btn")
         self.field_issue_btn.setFixedHeight(40)
@@ -2784,6 +2815,13 @@ class MainWindow(QMainWindow):
         self.ocr_status_label.setStyleSheet("color: #666; font-weight: bold; font-size: 14px; border: none; text-align: left; padding: 0px 10px;")
         self.ocr_status_label.clicked.connect(self._init_ocr_runtime)
         self.statusBar().addPermanentWidget(self.ocr_status_label)
+
+        self.recording_status_label = QLabel("录像: 待机")
+        self.recording_status_label.setStyleSheet(
+            "margin-right: 12px; color: #666; font-weight: bold; font-size: 13px;"
+        )
+        self.recording_status_label.setToolTip("手动录像状态、持续时间和当前文件大小")
+        self.statusBar().addPermanentWidget(self.recording_status_label)
 
         # 轻量巡检状态标签（摄像头实时健康）
         self.live_monitor_label = QLabel("巡检: 待机")
@@ -4254,6 +4292,129 @@ class MainWindow(QMainWindow):
         else:
             self._start()
 
+    @staticmethod
+    def _format_recording_duration(seconds: float) -> str:
+        total_seconds = max(0, int(seconds))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _refresh_recording_ui(self):
+        manager = self.recording_manager
+        active = bool(manager and manager.is_recording)
+
+        if hasattr(self, "record_btn"):
+            self.record_btn.setText("停止录像" if active else "开始录像")
+            self.record_btn.setObjectName("recording_btn" if active else "record_btn")
+            self.record_btn.setEnabled(
+                active or (
+                    bool(self._running)
+                    and any(is_rtsp_source(source) for source in self.sources)
+                )
+            )
+            self.record_btn.setStyle(self.record_btn.style())
+
+        if not hasattr(self, "recording_status_label"):
+            return
+        if active:
+            duration = self._format_recording_duration(manager.elapsed_seconds)
+            size_mb = manager.total_size_bytes / (1024 * 1024)
+            self.recording_status_label.setText(f"录像: {duration} | {size_mb:.1f} MB")
+            self.recording_status_label.setStyleSheet(
+                "margin-right: 12px; color: #cf1322; font-weight: bold; font-size: 13px;"
+            )
+        else:
+            self.recording_status_label.setText("录像: 待机")
+            self.recording_status_label.setStyleSheet(
+                "margin-right: 12px; color: #666; font-weight: bold; font-size: 13px;"
+            )
+
+    def _toggle_recording(self):
+        if self.recording_manager is not None:
+            self._stop_manual_recording()
+        else:
+            self._start_manual_recording()
+
+    def _start_manual_recording(self):
+        if not self._race_ready:
+            QMessageBox.warning(self, "提示", "请先选择或创建赛事。")
+            return
+        if not self._running:
+            QMessageBox.warning(self, "提示", "请先启动AI检测，再开始录像。")
+            return
+
+        manager = ManualRecordingManager(
+            self.sources,
+            self.output_dir / "videos",
+        )
+        try:
+            paths = manager.start()
+        except RecordingError as exc:
+            logger.error(f"[Recording] 开始录像失败: {exc}")
+            QMessageBox.warning(self, "录像失败", str(exc))
+            self.recording_manager = None
+            self._refresh_recording_ui()
+            return
+
+        self.recording_manager = manager
+        self._recording_poll_timer.start()
+        self._refresh_recording_ui()
+        names = ", ".join(path.name for path in paths)
+        logger.info(f"[Recording] 已开始手动录像: {names}")
+        self.statusBar().showMessage(f"录像已开始，保存到: {self.output_dir / 'videos'}")
+
+    def _stop_manual_recording(self, *, show_message: bool = True):
+        manager = self.recording_manager
+        if manager is None:
+            self._recording_poll_timer.stop()
+            self._refresh_recording_ui()
+            return tuple()
+
+        elapsed = manager.elapsed_seconds
+        total_size = manager.total_size_bytes
+        self.recording_manager = None
+        self._recording_poll_timer.stop()
+        try:
+            paths = manager.stop()
+        except RecordingError as exc:
+            logger.error(f"[Recording] 停止录像失败: {exc}")
+            self._refresh_recording_ui()
+            if show_message:
+                QMessageBox.warning(self, "录像收尾异常", str(exc))
+            return tuple()
+
+        self._refresh_recording_ui()
+        names = ", ".join(path.name for path in paths)
+        duration = self._format_recording_duration(elapsed)
+        size_mb = total_size / (1024 * 1024)
+        logger.info(
+            f"[Recording] 录像已保存: {names} ({duration}, {size_mb:.1f} MB)"
+        )
+        if show_message:
+            self.statusBar().showMessage(f"录像已保存: {names}")
+        return paths
+
+    def _poll_recording_status(self):
+        manager = self.recording_manager
+        if manager is None:
+            self._recording_poll_timer.stop()
+            self._refresh_recording_ui()
+            return
+
+        error = manager.check_error()
+        if error:
+            logger.error(f"[Recording] {error}")
+            try:
+                manager.stop()
+            except RecordingError:
+                pass
+            self.recording_manager = None
+            self._recording_poll_timer.stop()
+            self._refresh_recording_ui()
+            QMessageBox.warning(self, "录像中断", error)
+            return
+        self._refresh_recording_ui()
+
     def start_when_race_ready(self):
         """Start once race selection has completed without opening a second dialog."""
         if self._race_ready:
@@ -4315,6 +4476,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setStyle(self.start_btn.style())  # 刷新样式
         self.reset_btn.setEnabled(True)
         self.clear_btn.setEnabled(False)  # 运行中禁止清空记录
+        self._refresh_recording_ui()
         
         # 强制刷新一次列表，确保显示最新状态
         if hasattr(self, 'event_list'):
@@ -4346,6 +4508,8 @@ class MainWindow(QMainWindow):
             thread.stop()
         self.video_threads.clear()
 
+        self._stop_manual_recording(show_message=False)
+
         # 停止所有读取器
         for reader in self.readers.values():
             reader.stop()
@@ -4358,6 +4522,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setStyle(self.start_btn.style())  # 刷新样式
         self.reset_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)   # 停止后可以清空
+        self._refresh_recording_ui()
         self._refresh_live_monitor_badge(time.time())
         self.statusBar().showMessage("已停止")
 
@@ -5257,6 +5422,10 @@ class MainWindow(QMainWindow):
 
             if getattr(self, "_ocr_poll_timer", None) and self._ocr_poll_timer.isActive():
                 self._ocr_poll_timer.stop()
+            if getattr(self, "_recording_poll_timer", None) and self._recording_poll_timer.isActive():
+                self._recording_poll_timer.stop()
+            if self.recording_manager is not None:
+                self._stop_manual_recording(show_message=False)
             if self.ocr_manager is not None:
                 self.ocr_manager.stop()
 

@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+import shutil
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
@@ -12,6 +13,12 @@ datas = [
 ]
 binaries = []
 hiddenimports = []
+
+ffmpeg_value = os.environ.get("VIDEOPIPE_FFMPEG") or shutil.which("ffmpeg")
+ffmpeg_path = Path(ffmpeg_value).expanduser().resolve() if ffmpeg_value else None
+if ffmpeg_path is None or not ffmpeg_path.is_file():
+    raise SystemExit("Required FFmpeg executable is missing; set VIDEOPIPE_FFMPEG")
+binaries.append((str(ffmpeg_path), "."))
 
 datas += collect_data_files("ultralytics", includes=["cfg/trackers/*.yaml"])
 for package in ("paddle", "paddleocr", "paddlex"):

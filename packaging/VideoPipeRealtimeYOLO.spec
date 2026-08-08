@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import shutil
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files
@@ -9,12 +11,20 @@ ROOT = Path(SPECPATH).resolve().parent
 datas = [
     (str(ROOT / "realtime" / "custom_bytetrack.yaml"), "realtime"),
 ]
+binaries = []
+
+ffmpeg_value = os.environ.get("VIDEOPIPE_FFMPEG") or shutil.which("ffmpeg")
+ffmpeg_path = Path(ffmpeg_value).expanduser().resolve() if ffmpeg_value else None
+if ffmpeg_path is None or not ffmpeg_path.is_file():
+    raise SystemExit("Required FFmpeg executable is missing; set VIDEOPIPE_FFMPEG")
+binaries.append((str(ffmpeg_path), "."))
+
 datas += collect_data_files("ultralytics", includes=["cfg/trackers/*.yaml"])
 
 a = Analysis(
     [str(ROOT / "realtime" / "main.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=[],
     hookspath=[],

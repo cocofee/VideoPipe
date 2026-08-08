@@ -3,7 +3,8 @@ param(
     [string]$Variant = "OCR",
     [string]$ModelPath,
     [string]$SourcePath,
-    [string]$OcrModelsPath = "$HOME\.paddlex\official_models"
+    [string]$OcrModelsPath = "$HOME\.paddlex\official_models",
+    [string]$FfmpegPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +17,12 @@ $AppName = "VideoPipeRealtime$Variant"
 $AppDir = Join-Path $DistRoot $AppName
 $ResolvedModel = if ($ModelPath) { (Resolve-Path -LiteralPath $ModelPath).Path } else { $null }
 $ResolvedSource = if ($SourcePath) { (Resolve-Path -LiteralPath $SourcePath).Path } else { $null }
+$ResolvedFfmpeg = if ($FfmpegPath) {
+    (Resolve-Path -LiteralPath $FfmpegPath).Path
+} else {
+    (Get-Command ffmpeg -ErrorAction Stop).Source
+}
+$env:VIDEOPIPE_FFMPEG = $ResolvedFfmpeg
 
 if ($Variant -eq "OCR") {
     $env:VIDEOPIPE_OCR_MODELS = (Resolve-Path -LiteralPath $OcrModelsPath).Path
@@ -29,6 +36,7 @@ try {
     }
 } finally {
     Pop-Location
+    Remove-Item Env:VIDEOPIPE_FFMPEG -ErrorAction SilentlyContinue
 }
 
 $ModelArg = $null

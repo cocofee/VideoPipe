@@ -23,12 +23,24 @@ def test_yolo_package_excludes_all_ocr_runtimes():
         assert f'"{package}"' in spec
 
 
+def test_realtime_packages_bundle_ffmpeg_for_manual_recording():
+    recorder = (ROOT / "realtime" / "stream_recorder.py").read_text(encoding="utf-8")
+    assert "resource_dir()" in recorder
+
+    for name in ("VideoPipeRealtimeOCR.spec", "VideoPipeRealtimeYOLO.spec"):
+        spec = (ROOT / "packaging" / name).read_text(encoding="utf-8")
+        assert "VIDEOPIPE_FFMPEG" in spec
+        assert 'binaries.append((str(ffmpeg_path), "."))' in spec
+
+
 def test_build_script_validates_inputs_before_replacing_package():
     script = (ROOT / "packaging" / "build_realtime.ps1").read_text(encoding="utf-8")
 
     build_index = script.index("python -m PyInstaller")
     assert script.index("$ResolvedModel =") < build_index
     assert script.index("$ResolvedSource =") < build_index
+    assert script.index("$ResolvedFfmpeg =") < build_index
+    assert "$env:VIDEOPIPE_FFMPEG = $ResolvedFfmpeg" in script
     assert "--ocr-cpu-threads 1" in script
 
 

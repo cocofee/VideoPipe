@@ -67,71 +67,6 @@ class GuiLogHandler(logging.Handler):
         self.slot(msg)
 
 
-class OCRInitThread(QThread):
-    """OCR 后台初始化线程"""
-    finished = pyqtSignal(object, str)  # (ocr_instance, error_msg)
-
-    def __init__(self, ocr_engine="paddleocr"):
-        super().__init__()
-        self.ocr_engine = ocr_engine
-
-    def run(self):
-        try:
-            logger.info(f"[OCR-Init] 正在初始化 {self.ocr_engine}...")
-            if self.ocr_engine.lower() == "paddleocr":
-                # 【关键】使用 paddlepaddle CPU-only 版本 (3.2.2)，GPU 100% 留给 YOLO
-                # 原因：PaddlePaddle GPU 和 PyTorch GPU 共享同一块显卡时会严重互相干扰，
-                # 导致实时流帧率从 30FPS 暴跌到 0-1 FPS。
-                # 解决：安装 paddlepaddle==3.2.2 (CPU-only)，不装 paddlepaddle-gpu。
-                # CPU OCR 约 1-2s/次，作为后台批处理完全可以接受。
-                import os
-                os.environ['DISABLE_MODEL_SOURCE_CHECK'] = 'True'
-
-                from paddleocr import PaddleOCR
-                try:
-                    from paddleocr import TextRecognition
-                except ImportError:
-                    TextRecognition = None
-                try:
-                    import paddle
-                    import paddleocr as _paddleocr_mod
-                    try:
-                        import paddlex as _paddlex_mod
-                    except Exception:
-                        _paddlex_mod = None
-                    logger.info(f"[OCR-Init] paddle={getattr(paddle, '__version__', None)}(CPU-only, cuda={paddle.is_compiled_with_cuda()}) paddleocr={getattr(_paddleocr_mod, '__version__', None)} paddlex={getattr(_paddlex_mod, '__version__', None) if _paddlex_mod else None}")
-                except Exception:
-                    pass
-                ocr = PaddleOCR(
-                    use_textline_orientation=False,
-                    lang="en",
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    text_rec_score_thresh=0.0,
-                    # Paddle 3.3 CPU oneDNN fails on PP-OCRv5 PIR attributes on Windows.
-                    enable_mkldnn=False,
-                )
-                recognizer = None
-                if TextRecognition is not None:
-                    try:
-                        recognizer = TextRecognition(
-                            model_name="en_PP-OCRv5_mobile_rec",
-                            device="cpu",
-                            enable_mkldnn=False,
-                        )
-                    except Exception as recognition_error:
-                        logger.warning(
-                            f"[OCR-Init] Recognition-only fallback unavailable: {recognition_error}"
-                        )
-                adapter = PaddleOcrAdapter(ocr, recognizer=recognizer)
-                logger.info("[OCR-Init] PaddleOCR 初始化成功 (CPU模式，不影响YOLO实时检测)")
-                self.finished.emit(adapter, "")
-            else:
-                self.finished.emit(None, f"不支持的 OCR 引擎: {self.ocr_engine}")
-        except Exception as e:
-            logger.error(f"[OCR-Init] 初始化失败: {e}")
-            self.finished.emit(None, str(e))
-
 # 尝试导入用于检测USB摄像头的库
 try:
     from pygrabber.dshow_graph import FilterGraph
@@ -152,13 +87,14 @@ except ImportError:
 try:
     from .frame_envelope import FrameEnvelope
     from .stream_reader import StreamReader, StreamStatus
-    from .detector import Detector, CrossingEvent, LOCAL_VIDEO_EVENT_SETTLE_SECONDS, PaddleOcrAdapter, resolve_athlete_validator_model
+    from .detector import Detector, CrossingEvent, LOCAL_VIDEO_EVENT_SETTLE_SECONDS, resolve_athlete_validator_model
     from .database import Database
     from .event_recorder import EventRecorder
     from .event_list_widget import EventListWidget
     from .ocr_manager import OCRManager
     from .io_utils import read_image_unicode, write_image_unicode
     from .field_issue_log import FIELD_ISSUE_CATEGORIES, FieldIssueLog
+    from .runtime_paths import application_dir, find_model as find_runtime_model, resolve_output_dir, resolve_runtime_path, resolve_source
 except ImportError:
     import sys
     import os
@@ -169,13 +105,14 @@ except ImportError:
     
     from frame_envelope import FrameEnvelope
     from stream_reader import StreamReader, StreamStatus
-    from detector import Detector, CrossingEvent, LOCAL_VIDEO_EVENT_SETTLE_SECONDS, PaddleOcrAdapter, resolve_athlete_validator_model
+    from detector import Detector, CrossingEvent, LOCAL_VIDEO_EVENT_SETTLE_SECONDS, resolve_athlete_validator_model
     from database import Database
     from event_recorder import EventRecorder
     from event_list_widget import EventListWidget
     from ocr_manager import OCRManager
     from io_utils import read_image_unicode, write_image_unicode
     from field_issue_log import FIELD_ISSUE_CATEGORIES, FieldIssueLog
+    from runtime_paths import application_dir, find_model as find_runtime_model, resolve_output_dir, resolve_runtime_path, resolve_source
 
 
 class InteractiveVideoLabel(QLabel):
@@ -530,10 +467,76 @@ class InteractiveVideoLabel(QLabel):
         painter.end()
 
 
+class PreviewThread(QThread):
+    """Publish the newest camera frame at a stable UI refresh rate."""
+
+    frame_ready = pyqtSignal(object, int)
+
+    def __init__(self, reader: StreamReader, source_id: int = 0, target_fps: float = 30.0):
+        super().__init__()
+        self.reader = reader
+        self.source_id = source_id
+        self.target_fps = max(1.0, float(target_fps))
+        self._running = False
+        self._pending_lock = threading.Lock()
+        self._frame_pending = False
+
+    def mark_consumed(self):
+        with self._pending_lock:
+            self._frame_pending = False
+
+    def _reserve_publish_slot(self) -> bool:
+        with self._pending_lock:
+            if self._frame_pending:
+                return False
+            self._frame_pending = True
+            return True
+
+    def run(self):
+        self._running = True
+        last_frame_ts = 0.0
+        frame_interval = 1.0 / self.target_fps
+
+        while self._running:
+            cycle_started = time.monotonic()
+            if not self._reserve_publish_slot():
+                time.sleep(min(0.005, frame_interval))
+                continue
+            try:
+                frame, frame_ts = self.reader.get_frame_after(last_frame_ts)
+            except Exception as exc:
+                self.mark_consumed()
+                logger.exception(f"[PreviewThread-{self.source_id}] get_frame_after failed: {exc}")
+                time.sleep(0.01)
+                continue
+
+            if frame is None:
+                self.mark_consumed()
+                if self.reader.status == StreamStatus.ENDED:
+                    break
+                time.sleep(0.001)
+                continue
+
+            last_frame_ts = frame_ts
+            self.frame_ready.emit(frame, self.source_id)
+
+            remaining = frame_interval - (time.monotonic() - cycle_started)
+            if remaining > 0:
+                time.sleep(remaining)
+
+        self._running = False
+
+    def stop(self):
+        self._running = False
+        self.mark_consumed()
+        self.wait(2000)
+
+
 class VideoThread(QThread):
     """视频处理线程"""
     # frame, athletes, bibs, source_id
     frame_ready = pyqtSignal(object, list, list, int)
+    detections_ready = pyqtSignal(list, list, int)
     event_detected = pyqtSignal(object)  # CrossingEvent
     bib_updated = pyqtSignal(int, str, float, object, int, object, object, object)  # track_id, bib, conf, status, source_id, bib_crop, athlete_crop, full_frame
     status_changed = pyqtSignal(object, int)  # StreamStatus, source_id
@@ -580,7 +583,9 @@ class VideoThread(QThread):
         while self._running:
             envelope = None
             try:
-                get_frame_envelope = getattr(self.reader, "get_frame_envelope", None)
+                get_frame_envelope = getattr(self.reader, "get_latest_frame_envelope", None)
+                if not callable(get_frame_envelope):
+                    get_frame_envelope = getattr(self.reader, "get_frame_envelope", None)
                 if callable(get_frame_envelope):
                     envelope = get_frame_envelope()
                     if envelope is None:
@@ -650,6 +655,7 @@ class VideoThread(QThread):
                     "end_to_end_latency_ms": queue_latency_ms + processing_time_ms,
                     "queue_depth": reader_metrics.get("queue_depth"),
                     "dropped_frames": reader_metrics.get("dropped_frame_count"),
+                    "consumer_skipped_frames": reader_metrics.get("consumer_skipped_frame_count"),
                 }
 
             # 发送过线事件
@@ -659,8 +665,7 @@ class VideoThread(QThread):
                 self.event_detected.emit(event)
 
             # UI刷新：降低刷新频率减轻GUI负担
-            if frame_count % self.ui_skip == 0:
-                self.frame_ready.emit(frame, athletes, bibs, self.source_id)
+            self.detections_ready.emit(athletes, bibs, self.source_id)
 
         self._running = False
 
@@ -2141,8 +2146,6 @@ class MainWindow(QMainWindow):
     """
 
     # 定义信号，用于跨线程更新 UI
-    ocr_progress_signal = pyqtSignal(int, int, dict)
-    ocr_done_signal = pyqtSignal(dict)
     event_saved_signal = pyqtSignal(int)
     log_signal = pyqtSignal(str)
     field_issue_saved_signal = pyqtSignal(object)
@@ -2150,10 +2153,10 @@ class MainWindow(QMainWindow):
     def __init__(self, config: dict):
         super().__init__()
         self.config = config
+        self._yolo_only_mode = bool(config.get("yolo_only_mode", False))
+        self.config["yolo_only_mode"] = self._yolo_only_mode
 
         # 连接信号
-        self.ocr_progress_signal.connect(self._on_ocr_progress_ui)
-        self.ocr_done_signal.connect(self._show_batch_ocr_done)
         self.event_saved_signal.connect(self._on_event_saved_ui)
         self.log_signal.connect(self._on_log_received_ui)
         self.field_issue_saved_signal.connect(self._on_field_issue_saved_ui)
@@ -2162,15 +2165,15 @@ class MainWindow(QMainWindow):
         self.readers = {}         # source_id -> StreamReader
         self.detectors = {}       # source_id -> Detector
         self.video_threads = {}   # source_id -> VideoThread
+        self.preview_threads = {} # source_id -> PreviewThread
         self.video_labels = {}    # source_id -> InteractiveVideoLabel
         self.finish_line_checkboxes = {} # source_id -> QCheckBox
         
         self.shared_model = None  # 共享 YOLO 模型
         self.shared_athlete_validator = None  # 仅在无号码事件落库前确认自行车
         self._athlete_validator_checked = False
-        self.shared_ocr = None    # 共享 OCR 引擎
         self.shared_vlm = None    # 共享 VLM 助手
-        self._ocr_runtime_state = 'idle'  # idle/loading/ready/failed
+        self._ocr_runtime_state = 'idle'  # idle/loading/ready/failed/disabled
         self.database: Optional[Database] = None
         self.recorder: Optional[EventRecorder] = None
         self.viewer_dialog: Optional[ImageViewerDialog] = None
@@ -2181,7 +2184,6 @@ class MainWindow(QMainWindow):
         )
         self._field_issue_closing = False
         self._latest_frame_observations: Dict[int, tuple[list, list]] = {}
-        self._manual_batch_ocr_running = False
 
         # 配置
         # source 现在可以是一个列表，支持多路
@@ -2195,7 +2197,7 @@ class MainWindow(QMainWindow):
         if not self.sources:
             self.sources = [config.get('source', 'rtsp://localhost:8554/test')]
         self.model_path = config.get('model_path')
-        self.race_root = Path.cwd() / "RaceData"
+        self.race_root = Path(config.get("output_dir") or (Path.cwd() / "RaceData")).expanduser().absolute()
         self.output_dir = self.race_root.absolute()
         self._software_commit = config.get("software_commit") or _resolve_git_commit(project_root)
         requested_ocr_engine = (config.get('ocr_engine') or 'paddleocr').lower()
@@ -2203,34 +2205,7 @@ class MainWindow(QMainWindow):
             logger.warning(f"[Main] 当前版本已锁定 PaddleOCR，忽略配置 ocr_engine={requested_ocr_engine}")
         self.ocr_engine = 'paddleocr'
         self.config['ocr_engine'] = 'paddleocr'
-        self.ocr_init_thread = None  # OCR 初始化线程引用
         self._race_ready = False
-
-        # 自动巡检补号（全自动兜底）：定时扫描最近 UNKNOWN/PENDING 事件并重试 OCR 入队
-        self._ocr_patrol_enabled = bool(config.get('ocr_patrol_enabled', True))
-        self._ocr_patrol_interval_ms = int(config.get('ocr_patrol_interval_ms', 8000))
-        self._ocr_patrol_recent_seconds = float(config.get('ocr_patrol_recent_seconds', 25.0))
-        self._ocr_patrol_max_scan = int(config.get('ocr_patrol_max_scan', 8))
-        self._ocr_patrol_retry_gap_seconds = float(config.get('ocr_patrol_retry_gap_seconds', 45.0))
-        self._ocr_patrol_max_enqueue_per_tick = int(config.get('ocr_patrol_max_enqueue_per_tick', 1))
-        self._ocr_patrol_max_retries = int(config.get('ocr_patrol_max_retries', 2))
-        self._ocr_patrol_retry_cooldown_seconds = float(config.get('ocr_patrol_retry_cooldown_seconds', 120.0))
-        self._ocr_patrol_last_enqueue = {}
-        self._ocr_patrol_attempts = {}
-        self._ocr_patrol_block_until = {}
-
-        # 波次模式（不停机）：实时优先抓人，OCR按波次/空档分批执行
-        self._wave_mode_enabled = bool(config.get('wave_mode_enabled', True))
-        self._wave_trigger_count = int(config.get('wave_trigger_count', 25))
-        self._wave_idle_seconds = float(config.get('wave_idle_seconds', 10.0))
-        self._wave_batch_limit = int(config.get('wave_batch_limit', 10))
-        self._wave_pause_fps = float(config.get('wave_pause_fps', 25.0))
-        self._wave_resume_fps = float(config.get('wave_resume_fps', 28.0))
-        self._wave_new_events_since_last_batch = 0
-        self._wave_last_crossing_walltime = 0.0
-        self._wave_ocr_paused_by_fps = False
-        self._wave_pending_event_ids = []
-        self._wave_pending_event_set = set()
         self._main_fps_value = 0.0
         self._gate_guard_enabled = bool(config.get('gate_guard_enabled', True))
 
@@ -2250,9 +2225,9 @@ class MainWindow(QMainWindow):
         self.config['live_monitor_min_fps'] = self._live_monitor_min_fps
         self.config['live_monitor_warn_cooldown_seconds'] = self._live_monitor_warn_cooldown_seconds
 
-        self._ocr_patrol_timer = QTimer(self)
-        self._ocr_patrol_timer.setInterval(max(1000, self._ocr_patrol_interval_ms))
-        self._ocr_patrol_timer.timeout.connect(self._run_auto_ocr_patrol)
+        self._ocr_poll_timer = QTimer(self)
+        self._ocr_poll_timer.setInterval(100)
+        self._ocr_poll_timer.timeout.connect(self._poll_ocr_runtime)
 
         # 应用全局样式：统一字体大小为 16px，确保布局不拥挤且清晰
         self.setStyleSheet("""
@@ -2368,8 +2343,9 @@ class MainWindow(QMainWindow):
         self._load_initial_config()
         self._setup_logging()
         
-        # 启动后自动初始化 OCR (异步)
-        QTimer.singleShot(500, self._init_shared_ocr)
+        # OCR model is initialized only inside the low-priority child process.
+        if not self._yolo_only_mode:
+            QTimer.singleShot(500, self._init_ocr_runtime)
         QTimer.singleShot(0, self._prompt_race_selection)
 
     def _load_initial_config(self):
@@ -2389,14 +2365,6 @@ class MainWindow(QMainWindow):
                 logger.info(f"[Main] 已加载纯数字模式状态: {is_numeric}")
             if self.ocr_manager:
                 self.ocr_manager.only_numeric = bool(is_numeric)
-
-            # 加载实时 OCR 开关状态
-            is_realtime_ocr = self.database.get_config('realtime_ocr', '0') == '1'
-            if hasattr(self, 'realtime_ocr_checkbox'):
-                self.realtime_ocr_checkbox.blockSignals(True)
-                self.realtime_ocr_checkbox.setChecked(is_realtime_ocr)
-                self.realtime_ocr_checkbox.blockSignals(False)
-                logger.info(f"[Main] 已加载实时 OCR 状态: {is_realtime_ocr}")
 
             gate_guard_enabled = self.database.get_config('gate_guard_enabled', '1') == '1'
             self._gate_guard_enabled = gate_guard_enabled
@@ -2473,18 +2441,17 @@ class MainWindow(QMainWindow):
                 logger.info("[Main] 已在赛事切换时绑定并重置事件列表")
             except Exception as e:
                 logger.warning(f"[Main] 事件列表数据库绑定失败: {e}")
-        if not self.ocr_manager:
+        if self._yolo_only_mode:
+            self.ocr_manager = None
+        elif not self.ocr_manager:
             self.ocr_manager = OCRManager(self.database)
-            self.ocr_manager.on_progress = self._on_ocr_progress
             self.ocr_manager.on_event_done = self._on_ocr_event_done
         else:
             self.ocr_manager.db = self.database
-
-        # 若 OCR 已经初始化完成，确保 OCRManager 同步到同一引擎（用于自动补号）
-        if self.ocr_manager and getattr(self, 'shared_ocr', None):
-            self.ocr_manager.set_ocr(self.shared_ocr, getattr(self, 'shared_vlm', None))
         self._load_initial_config()
         self._race_ready = True
+        if self.ocr_manager:
+            QTimer.singleShot(0, self._init_ocr_runtime)
         if hasattr(self, "field_issue_btn"):
             self.field_issue_btn.setEnabled(True)
         self.statusBar().showMessage(f"当前赛事: {race_dir.name}")
@@ -2742,14 +2709,6 @@ class MainWindow(QMainWindow):
         self.numeric_only_checkbox.stateChanged.connect(self._on_numeric_only_changed)
         btn_layout.addWidget(self.numeric_only_checkbox)
 
-        # 实时识别开关 (默认关闭，防止卡顿)
-        self.realtime_ocr_checkbox = QCheckBox("实时 OCR")
-        self.realtime_ocr_checkbox.setChecked(False) 
-        self.realtime_ocr_checkbox.setToolTip("开启：过线时实时识别号码(可能导致卡顿)；关闭：仅保存截图，由后台/手动处理(推荐)")
-        self.realtime_ocr_checkbox.setStyleSheet("color: #eb2f96; font-weight: bold; font-size: 16px;")
-        self.realtime_ocr_checkbox.stateChanged.connect(self._on_realtime_ocr_changed)
-        btn_layout.addWidget(self.realtime_ocr_checkbox)
-
         # 龙门安全模式（默认开启，抑制龙门/拱门误检）
         self.gate_guard_checkbox = QCheckBox("龙门安全模式")
         self.gate_guard_checkbox.setChecked(bool(self._gate_guard_enabled))
@@ -2777,34 +2736,6 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(5)
-
-        # 批处理工具栏
-        batch_tools = QWidget()
-        batch_tools_layout = QHBoxLayout(batch_tools)
-        batch_tools_layout.setContentsMargins(5, 5, 5, 5)
-        
-        self.batch_ocr_btn = QPushButton("开始批处理 OCR")
-        self.batch_ocr_btn.setToolTip("扫描 evidence_photos 目录，识别所有未完成的号码")
-        self.batch_ocr_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1890ff;
-                color: white;
-                font-weight: bold;
-                padding: 8px;
-                border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #40a9ff; }
-            QPushButton:disabled { background-color: #d9d9d9; }
-        """)
-        self.batch_ocr_btn.clicked.connect(self._start_batch_ocr)
-        batch_tools_layout.addWidget(self.batch_ocr_btn)
-        
-        self.ocr_progress_label = QLabel("")
-        self.ocr_progress_label.setStyleSheet("color: #666; font-size: 14px;")
-        batch_tools_layout.addWidget(self.ocr_progress_label)
-        batch_tools_layout.addStretch()
-        
-        right_layout.addWidget(batch_tools)
 
         self.event_list = EventListWidget(self.database)
         self.event_list.view_screenshot.connect(self._view_screenshot)
@@ -2840,9 +2771,9 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.stats_status_label)
 
         # OCR 引擎常驻标签：让用户一眼看到当前引擎
-        self.ocr_engine_label = QLabel("OCR引擎: PaddleOCR (已锁定)")
+        self.ocr_engine_label = QLabel("OCR引擎: Mobile Recognition")
         self.ocr_engine_label.setStyleSheet("margin-right: 15px; color: #1677ff; font-weight: bold; font-size: 14px;")
-        self.ocr_engine_label.setToolTip("当前版本固定使用 PaddleOCR")
+        self.ocr_engine_label.setToolTip("独立低优先级进程，仅加载移动识别模型")
         self.statusBar().addPermanentWidget(self.ocr_engine_label)
         self._refresh_ocr_engine_badge()
 
@@ -2851,7 +2782,7 @@ class MainWindow(QMainWindow):
         self.ocr_status_label.setFlat(True)
         self.ocr_status_label.setCursor(Qt.PointingHandCursor)
         self.ocr_status_label.setStyleSheet("color: #666; font-weight: bold; font-size: 14px; border: none; text-align: left; padding: 0px 10px;")
-        self.ocr_status_label.clicked.connect(self._init_shared_ocr)
+        self.ocr_status_label.clicked.connect(self._init_ocr_runtime)
         self.statusBar().addPermanentWidget(self.ocr_status_label)
 
         # 轻量巡检状态标签（摄像头实时健康）
@@ -3267,86 +3198,58 @@ class MainWindow(QMainWindow):
             self.shared_athlete_validator = None
             logger.warning(f"[Main] 运动员二次校验模型加载失败，保持原有放行策略: {exc}")
 
-    def _init_shared_ocr(self):
-        """后台异步初始化 OCR"""
-        if hasattr(self, 'ocr_init_thread') and self.ocr_init_thread and self.ocr_init_thread.isRunning():
+    def _init_ocr_runtime(self):
+        """Start recognition-only OCR in a low-priority child process."""
+        if self._yolo_only_mode:
+            self._ocr_runtime_state = "disabled"
+            self._refresh_ocr_runtime_ui()
             return
-            
-        self._ocr_runtime_state = 'loading'
+        if not self._race_ready or self.ocr_manager is None:
+            QTimer.singleShot(100, self._init_ocr_runtime)
+            return
+        if self.ocr_manager.runtime_state in {"loading", "ready"}:
+            self._ocr_runtime_state = self.ocr_manager.runtime_state
+            self._refresh_ocr_runtime_ui()
+            return
+
+        started = self.ocr_manager.start_process_runtime(
+            cpu_threads=max(1, min(2, int(self.config.get("ocr_cpu_threads", 1)))),
+        )
+        self._ocr_runtime_state = self.ocr_manager.runtime_state
+        self._refresh_ocr_runtime_ui()
+        if started and not self._ocr_poll_timer.isActive():
+            self._ocr_poll_timer.start()
+
+    def _poll_ocr_runtime(self):
+        if self._yolo_only_mode or self.ocr_manager is None:
+            return
+        self.ocr_manager.poll_process_results()
+        state = self.ocr_manager.runtime_state
+        if state != self._ocr_runtime_state:
+            self._ocr_runtime_state = state
+            self._refresh_ocr_runtime_ui()
+
+    def _refresh_ocr_runtime_ui(self):
         self._refresh_ocr_engine_badge()
-        self.ocr_status_label.setText("OCR: 正在启动...")
-        self.ocr_status_label.setStyleSheet("color: #faad14; font-weight: bold; font-size: 14px; border: none; text-align: left; padding: 0px 10px;")
-        
-        engine = (self.ocr_engine or "paddleocr").lower()
-        self.ocr_init_thread = OCRInitThread(engine)
-        self.ocr_init_thread.finished.connect(self._on_ocr_init_finished)
-        self.ocr_init_thread.start()
-
-    def _start_batch_ocr(self):
-        """开始批处理 OCR"""
-        if not self.shared_ocr:
-            QMessageBox.warning(self, "警告", "OCR 引擎尚未就绪，请稍后再试")
+        if not hasattr(self, "ocr_status_label"):
             return
-            
-        # 严格使用当前赛事目录下的 evidence_photos
-        evidence_root = self.output_dir / "evidence_photos"
-        
-        if not evidence_root.exists():
-            # 如果不存在，尝试创建它（以防万一）
-            try:
-                evidence_root.mkdir(parents=True, exist_ok=True)
-            except:
-                pass
-            
-        if not any(evidence_root.iterdir()) if evidence_root.exists() else True:
-            QMessageBox.information(self, "提示", f"当前赛事文件夹内尚未产生任何证据照片，无法开始批处理。\n目录: {evidence_root}")
-            return
-            
-        self.ocr_manager.set_ocr(self.shared_ocr, self.shared_vlm)
-        self._manual_batch_ocr_running = True
-        self.batch_ocr_btn.setEnabled(False)
-        self.batch_ocr_btn.setText("正在批处理...")
-        self.ocr_manager.start_batch(str(evidence_root))
-        logger.info(f"[Main] 启动 OCR 批处理，根目录: {evidence_root}")
-
-    def _on_ocr_progress(self, current, total, stats):
-        """OCR 进度回调 (由 OCR 线程调用)"""
-        self.ocr_progress_signal.emit(current, total, stats)
-
-    def _on_ocr_progress_ui(self, current, total, stats):
-        """OCR 进度更新 (UI 线程)"""
-        resolved_done = int(stats.get('resolved_done', stats.get('done', 0)))
-        pending_result = int(stats.get('pending_result', 0))
-        msg = (
-            f"进度: {current}/{total} | 已补号: {resolved_done} | "
-            f"待补(已处理): {pending_result} | 归并: {stats['merged']} | 失败: {stats['failed']}"
+        state = self._ocr_runtime_state
+        if state == "ready":
+            text, color, tooltip = "OCR: 已就绪", "#52c41a", "独立轻量识别进程已就绪"
+        elif state == "loading":
+            text, color, tooltip = "OCR: 正在启动...", "#faad14", "正在子进程加载移动识别模型"
+        elif state == "disabled":
+            text, color, tooltip = "OCR: 已停用", "#666", "YOLO-only 或 OCR 故障降级"
+        elif state == "failed":
+            text, color, tooltip = "OCR: 启动失败 (点击重试)", "#ff4d4f", "OCR失败不影响检测和事件保存"
+        else:
+            text, color, tooltip = "OCR: 未启动 (点击启动)", "#666", "启动独立轻量识别进程"
+        self.ocr_status_label.setText(text)
+        self.ocr_status_label.setStyleSheet(
+            f"color: {color}; font-weight: bold; font-size: 14px; border: none; "
+            "text-align: left; padding: 0px 10px;"
         )
-        if stats.get('vlm_used', 0) > 0:
-            msg += f" | VLM: {stats['vlm_used']}"
-            
-        self.ocr_progress_label.setText(msg)
-        
-        if current >= total:
-            if self._manual_batch_ocr_running:
-                self._manual_batch_ocr_running = False
-                self.batch_ocr_btn.setEnabled(True)
-                self.batch_ocr_btn.setText("开始批处理 OCR")
-                # 不再弹窗，统一改为状态栏提示，避免任何情况下卡界面
-                self.statusBar().showMessage("手工批处理 OCR 已完成", 2000)
-            else:
-                # 自动补号完成时仅更新状态栏，避免反复弹窗阻塞 UI
-                self.statusBar().showMessage("自动补号已完成一轮", 1500)
-
-    @pyqtSlot(dict)
-    def _show_batch_ocr_done(self, stats):
-        """兼容保留：批处理完成仅记录日志，不弹窗。"""
-        resolved_done = int(stats.get('resolved_done', stats.get('done', 0)))
-        pending_result = int(stats.get('pending_result', 0))
-        logger.info(
-            f"[Main] OCR批处理完成: total={stats.get('total', 0)}, "
-            f"resolved={resolved_done}, pending={pending_result}, "
-            f"merged={stats.get('merged', 0)}, failed={stats.get('failed', 0)}"
-        )
+        self.ocr_status_label.setToolTip(tooltip)
 
     def _on_ocr_event_done(self, event_id, result):
         """单个 OCR 任务完成回调"""
@@ -3355,47 +3258,11 @@ class MainWindow(QMainWindow):
 
     def _on_event_saved_ui(self, event_id):
         """事件保存后的 UI 刷新 (UI 线程)"""
-        # 优化：优先使用增量检查，避免全量刷新导致闪烁和批处理卡顿
+        # Prefer incremental refresh so OCR result updates do not redraw the full list.
         if hasattr(self.event_list, '_check_new_events'):
             self.event_list._check_new_events()
         else:
             self.event_list.refresh_data()
-
-    def _on_ocr_init_finished(self, ocr_instance, error_msg):
-        """OCR 初始化完成后的处理"""
-        if ocr_instance:
-            self.shared_ocr = ocr_instance
-            self._ocr_runtime_state = 'ready'
-            self._refresh_ocr_engine_badge()
-            self.ocr_status_label.setText("OCR: 已就绪")
-            self.ocr_status_label.setStyleSheet("color: #52c41a; font-weight: bold; font-size: 14px; border: none; text-align: left; padding: 0px 10px;")
-            self.ocr_status_label.setToolTip("OCR 引擎已正常启动")
-            
-            # 将新 OCR 实例同步到所有已存在的检测器
-            if hasattr(self, 'detectors') and self.detectors:
-                for detector in self.detectors.values():
-                    if hasattr(detector, 'set_ocr'):
-                        detector.set_ocr(self.shared_ocr)
-                    else:
-                        detector._ocr = self.shared_ocr
-                        detector.ensure_ocr()
-
-            # 同步给 OCRManager，支持“事件保存后自动补号”
-            if self.ocr_manager:
-                self.ocr_manager.set_ocr(self.shared_ocr, getattr(self, 'shared_vlm', None))
-            
-            logger.info("[Main] OCR 引擎后台加载完成")
-        else:
-            self.shared_ocr = None
-            self._ocr_runtime_state = 'failed'
-            self._refresh_ocr_engine_badge()
-            self.ocr_status_label.setText("OCR: 启动失败 (点击重试)")
-            self.ocr_status_label.setStyleSheet("color: #ff4d4f; font-weight: bold; font-size: 14px; border: none; text-align: left; padding: 0px 10px;")
-            self.ocr_status_label.setToolTip(f"错误: {error_msg}\n点击可尝试重新启动")
-            logger.error(f"[Main] OCR 引擎加载失败: {error_msg}")
-
-            if self.ocr_manager:
-                self.ocr_manager.ocr = None
 
     def _on_roi_toggle(self, source_id: int, state: int):
         """处理 ROI 开关切换"""
@@ -3434,9 +3301,7 @@ class MainWindow(QMainWindow):
         """设置菜单栏"""
         menubar = self.menuBar()
         
-        # 资源清理统一在 closeEvent -> _cleanup_resources() 中执行。
-        # 注意：不要挂在 destroyed 信号上——该信号在 Qt C++ 对象销毁后才发出，
-        # 此时再访问 ocr_init_thread 会触发 "wrapped C/C++ object has been deleted"。
+        # Resource cleanup is centralized in closeEvent -> _cleanup_resources().
         
         # 数据管理菜单
         data_menu = menubar.addMenu("数据管理(&D)")
@@ -3541,6 +3406,12 @@ class MainWindow(QMainWindow):
 
     def _apply_vlm_settings(self):
         """应用 VLM 设置到所有检测器及 OCR 管理器"""
+        if self._yolo_only_mode:
+            self.shared_vlm = None
+            for detector in self.detectors.values():
+                if hasattr(detector, 'disable_vlm'):
+                    detector.disable_vlm()
+            return
         vlm_config = self.config.get('vlm_config', {})
         if not vlm_config.get('enabled'):
             self.shared_vlm = None
@@ -3679,19 +3550,12 @@ class MainWindow(QMainWindow):
             self.shared_model.predict(source=dummy_frame, verbose=False)
             logger.info("[Main] 新 YOLO 模型预热完成")
             
-            # 确保 OCR 已初始化或正在初始化
-            if not self.shared_ocr:
-                if not self.ocr_init_thread or not self.ocr_init_thread.isRunning():
-                    self._init_shared_ocr()
-            
             # 4. 更新所有检测器 (支持多机位)
             if self.detectors:
                 for i, detector in self.detectors.items():
                     detector._model = self.shared_model
-                    # 注意：如果 OCR 还在后台初始化，这里的 _ocr 可能是 None
-                    # 等 _on_ocr_init_finished 完成后会再次同步给所有 detector
-                    detector._ocr = self.shared_ocr 
-                    detector.ensure_ocr()
+                    detector._ocr = None
+                    detector.realtime_ocr_enabled = False
                     detector.model_path = self.model_path
                     # 重新应用配置
                     line_config = self.config.get('finish_lines', {}).get(str(i))
@@ -4209,8 +4073,8 @@ class MainWindow(QMainWindow):
 
             self._init_shared_athlete_validator()
             
-            if not self.shared_ocr:
-                self._init_shared_ocr()
+            if not self._yolo_only_mode:
+                self._init_ocr_runtime()
 
             # 3. 初始化各机位组件
             max_event_id = self.database.get_latest_event_id()
@@ -4229,10 +4093,10 @@ class MainWindow(QMainWindow):
                     self.model_path, 
                     source_id=i, 
                     model=self.shared_model, 
-                    ocr=self.shared_ocr,
+                    ocr=None,
                     ocr_engine=self.ocr_engine,
                     only_numeric=self.numeric_only_checkbox.isChecked(),
-                    realtime_ocr=(False if self._is_wave_mode_active() else self.realtime_ocr_checkbox.isChecked()),
+                    realtime_ocr=False,
                     gate_guard_enabled=bool(self._gate_guard_enabled),
                     athlete_validator=self.shared_athlete_validator,
                     performance_profile=str(self.config.get("performance_profile") or "auto"),
@@ -4241,9 +4105,8 @@ class MainWindow(QMainWindow):
                         if StreamReader.is_video_file_source(source)
                         else None
                     ),
+                    ocr_pipeline_enabled=not self._yolo_only_mode,
                 )
-                detector.ensure_ocr()
-                
                 # 设置终点线 (优先加载该机位的独立配置)
                 line_config = self.config.get('finish_lines', {}).get(str(i))
                 if not line_config and i == 0:
@@ -4273,7 +4136,7 @@ class MainWindow(QMainWindow):
                 self.detectors[i] = detector
 
                 # 流读取器
-                reader = StreamReader(source)
+                reader = StreamReader(source, queue_size=1)
                 if not reader.start():
                     logger.warning(f"[Main] 无法连接到机位 {i+1}: {source}")
                     # 继续尝试其他机位
@@ -4322,36 +4185,13 @@ class MainWindow(QMainWindow):
             for detector in self.detectors.values():
                 detector.only_numeric = is_numeric_only
 
-        # 同步到批处理 OCR（否则会出现：检测是纯数字，但批处理仍按“字母+3~6位数字”过滤）
+        # Keep event OCR validation aligned with the operator's race rule.
         if self.ocr_manager:
             self.ocr_manager.only_numeric = bool(is_numeric_only)
                 
         status = "开启" if is_numeric_only else "关闭"
         logger.info(f"[Main] 仅限纯数字模式已{status}")
         self.statusBar().showMessage(f"仅限纯数字模式已{status}")
-
-    def _on_realtime_ocr_changed(self, state):
-        """处理实时 OCR 开关切换"""
-        is_realtime_ocr = (state == Qt.Checked)
-
-        if self._is_wave_mode_active() and is_realtime_ocr:
-            is_realtime_ocr = False
-            if hasattr(self, 'realtime_ocr_checkbox'):
-                self.realtime_ocr_checkbox.blockSignals(True)
-                self.realtime_ocr_checkbox.setChecked(False)
-                self.realtime_ocr_checkbox.blockSignals(False)
-            logger.info("[Main] 波次模式下已强制关闭实时 OCR")
-
-        self.database.set_config('realtime_ocr', '1' if is_realtime_ocr else '0')
-        
-        # 同步到已启动的检测器
-        if hasattr(self, 'detectors') and self.detectors:
-            for detector in self.detectors.values():
-                detector.realtime_ocr_enabled = is_realtime_ocr
-                
-        status = "开启" if is_realtime_ocr else "关闭"
-        logger.info(f"[Main] 实时 OCR 已{status}")
-        self.statusBar().showMessage(f"实时 OCR 已{status}")
 
     def _on_gate_guard_changed(self, state):
         """处理龙门安全模式开关切换"""
@@ -4373,72 +4213,6 @@ class MainWindow(QMainWindow):
         status = "开启" if enabled else "关闭"
         logger.info(f"[Main] 龙门安全模式已{status}")
         self.statusBar().showMessage(f"龙门安全模式已{status}")
-
-    def _is_wave_mode_active(self) -> bool:
-        return bool(self._wave_mode_enabled)
-
-    def _enqueue_wave_ocr_candidate(self, event_id: int):
-        if event_id is None:
-            return
-        try:
-            eid = int(event_id)
-        except Exception:
-            return
-        if eid in self._wave_pending_event_set:
-            return
-        self._wave_pending_event_set.add(eid)
-        self._wave_pending_event_ids.append(eid)
-
-    def _drain_wave_ocr_batch(self, reason: str):
-        if not self._is_wave_mode_active():
-            return
-        if not self.ocr_manager or not self.database:
-            return
-
-        if self._wave_ocr_paused_by_fps:
-            return
-
-        if not self._wave_pending_event_ids:
-            return
-
-        # 若 OCR 队列已有积压，避免继续加压
-        try:
-            task_queue = getattr(self.ocr_manager, 'task_queue', None)
-            queue_size = task_queue.qsize() if task_queue is not None else 0
-            if queue_size >= 2:
-                return
-        except Exception:
-            pass
-
-        batch_limit = max(1, int(self._wave_batch_limit))
-        take_n = min(batch_limit, len(self._wave_pending_event_ids))
-        batch_ids = self._wave_pending_event_ids[:take_n]
-        self._wave_pending_event_ids = self._wave_pending_event_ids[take_n:]
-
-        enqueued = 0
-        for eid in batch_ids:
-            self._wave_pending_event_set.discard(eid)
-            try:
-                ev = self.database.get_event(eid)
-                if not ev:
-                    continue
-                bib = str(ev.get('bib_number') or '').strip().upper()
-                ocr_state = str(ev.get('ocr_state') or 'PENDING').strip().upper()
-                should_enqueue = (not bib or bib == 'UNKNOWN' or ocr_state in {'PENDING', 'FAIL'})
-                if not should_enqueue:
-                    continue
-                ok = self.ocr_manager.enqueue_live_event(
-                    event_id=eid,
-                    evidence_dir=ev.get('evidence_dir'),
-                    cross_time=ev.get('cross_time')
-                )
-                if ok:
-                    enqueued += 1
-            except Exception:
-                continue
-
-        if enqueued > 0:
-            logger.info(f"[Main] 波次OCR入队: +{enqueued} (reason={reason})")
 
     def _update_detector_athletes(self):
         """同步数据库中的选手名单特征到所有检测器 (支持多机位)"""
@@ -4484,6 +4258,15 @@ class MainWindow(QMainWindow):
         else:
             self._start()
 
+    def start_when_race_ready(self):
+        """Start once race selection has completed without opening a second dialog."""
+        if self._race_ready:
+            if not self._running:
+                self._start()
+            return
+        if self.isVisible():
+            QTimer.singleShot(100, self.start_when_race_ready)
+
     def _start(self):
         """启动 (支持多机位)"""
         if not self._race_ready:
@@ -4499,26 +4282,10 @@ class MainWindow(QMainWindow):
         self._frame_count = 0
         self._fps_timestamps = deque(maxlen=30)  # 滑动窗口FPS：最近30帧
 
-        # 每次启动都重置波次状态，避免上一次残留队列影响本次实时性
-        self._wave_new_events_since_last_batch = 0
-        self._wave_last_crossing_walltime = 0.0
-        self._wave_ocr_paused_by_fps = False
-        self._wave_pending_event_ids.clear()
-        self._wave_pending_event_set.clear()
         self._live_monitor_samples.clear()
         self._live_monitor_last_warn_ts.clear()
         self._live_monitor_last_render_ts = 0.0
         self._refresh_live_monitor_badge(self._start_time)
-
-        if self._is_wave_mode_active() and hasattr(self, 'realtime_ocr_checkbox'):
-            self.realtime_ocr_checkbox.blockSignals(True)
-            self.realtime_ocr_checkbox.setChecked(False)
-            self.realtime_ocr_checkbox.blockSignals(False)
-            if self.database:
-                self.database.set_config('realtime_ocr', '0')
-            for detector in self.detectors.values():
-                detector.realtime_ocr_enabled = False
-            logger.info("[Main] 波次模式已启用：实时OCR关闭，转为波次分批OCR")
 
         # 启动所有机位的视频线程
         for source_id in self.readers:
@@ -4528,12 +4295,21 @@ class MainWindow(QMainWindow):
             if reader and detector:
                 ui_skip = 1 if source_id == 0 else 2
                 thread = VideoThread(reader, detector, source_id=source_id, ui_skip=ui_skip)
-                thread.frame_ready.connect(self._on_frame_ready)
+                thread.detections_ready.connect(self._on_detections_ready)
                 thread.event_detected.connect(self._on_event_detected)
                 thread.bib_updated.connect(self._on_bib_updated)
                 thread.status_changed.connect(self._update_conn_status)
-                thread.start()
                 self.video_threads[source_id] = thread
+                thread.start()
+
+                preview_thread = PreviewThread(
+                    reader,
+                    source_id=source_id,
+                    target_fps=float(self.config.get("preview_fps", 30.0)),
+                )
+                preview_thread.frame_ready.connect(self._on_preview_frame)
+                self.preview_threads[source_id] = preview_thread
+                preview_thread.start()
                 
                 # 初始状态同步
                 self._update_conn_status(reader.status, source_id)
@@ -4548,26 +4324,24 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'event_list'):
             self.event_list.refresh_list()
 
-        if self._ocr_patrol_enabled and not self._ocr_patrol_timer.isActive():
-            self._ocr_patrol_timer.start()
-            logger.info(
-                f"[Main] 自动巡检补号已启动: interval={self._ocr_patrol_timer.interval()}ms, "
-                f"recent={self._ocr_patrol_recent_seconds}s"
-            )
-            
         self.statusBar().showMessage(f"运行中 (已连接 {len(self.video_threads)} 路机位)")
 
     def _stop(self):
         """停止 (支持多机位)"""
         self._running = False
 
-        if self._ocr_patrol_timer.isActive():
-            self._ocr_patrol_timer.stop()
+        for preview_thread in self.preview_threads.values():
+            try:
+                preview_thread.frame_ready.disconnect()
+            except Exception:
+                pass
+            preview_thread.stop()
+        self.preview_threads.clear()
 
         # 停止所有视频线程
         for source_id, thread in self.video_threads.items():
             try:
-                thread.frame_ready.disconnect()
+                thread.detections_ready.disconnect()
                 thread.event_detected.disconnect()
                 thread.bib_updated.disconnect()
                 thread.status_changed.disconnect()
@@ -4631,10 +4405,10 @@ class MainWindow(QMainWindow):
                     self.model_path, 
                     source_id=i, 
                     model=self.shared_model, 
-                    ocr=self.shared_ocr,
+                    ocr=None,
                     ocr_engine=self.ocr_engine,
                     only_numeric=self.numeric_only_checkbox.isChecked(),
-                    realtime_ocr=(False if self._is_wave_mode_active() else self.realtime_ocr_checkbox.isChecked()),
+                    realtime_ocr=False,
                     gate_guard_enabled=bool(self._gate_guard_enabled),
                     athlete_validator=self.shared_athlete_validator,
                     performance_profile=str(self.config.get("performance_profile") or "auto"),
@@ -4643,6 +4417,7 @@ class MainWindow(QMainWindow):
                         if i < len(self.sources) and StreamReader.is_video_file_source(self.sources[i])
                         else None
                     ),
+                    ocr_pipeline_enabled=not self._yolo_only_mode,
                 )
                 if i == 0:
                     detector.set_finish_line(self.line_pt1, self.line_pt2)
@@ -4716,6 +4491,21 @@ class MainWindow(QMainWindow):
                 self.conn_status_indicator.setText(f"● {text}")
                 self.conn_status_indicator.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 16px; margin-right: 10px;")
 
+    def _on_detections_ready(self, athletes, bibs, source_id=0):
+        self._latest_frame_observations[source_id] = (
+            [dict(item) if isinstance(item, dict) else item for item in (athletes or [])],
+            [dict(item) if isinstance(item, dict) else item for item in (bibs or [])],
+        )
+
+    def _on_preview_frame(self, frame, source_id=0):
+        try:
+            athletes, bibs = self._latest_frame_observations.get(source_id, ([], []))
+            self._on_frame_ready(frame, athletes, bibs, source_id)
+        finally:
+            preview_thread = self.preview_threads.get(source_id)
+            if preview_thread is not None:
+                preview_thread.mark_consumed()
+
     def _on_frame_ready(self, frame, athletes, bibs, source_id=0):
         self._latest_frame_observations[source_id] = (
             [dict(item) if isinstance(item, dict) else item for item in (athletes or [])],
@@ -4772,12 +4562,29 @@ class MainWindow(QMainWindow):
             self._live_monitor_last_render_ts = now
 
         # 3. 绘制检测结果
-        display = frame.copy()
-        orig_h, orig_w = display.shape[:2]
+        orig_h, orig_w = frame.shape[:2]
+        label_size = video_label.size()
+        max_display_w = max(1, int(label_size.width()))
+        max_display_h = max(1, int(label_size.height()))
+        display_scale = min(
+            max_display_w / max(1, orig_w),
+            max_display_h / max(1, orig_h),
+            1.0,
+        )
+        display_w = max(1, int(round(orig_w * display_scale)))
+        display_h = max(1, int(round(orig_h * display_scale)))
+        if display_w == orig_w and display_h == orig_h:
+            display = frame.copy()
+        else:
+            display = cv2.resize(frame, (display_w, display_h), interpolation=cv2.INTER_AREA)
+        scale_x = display_w / max(1, orig_w)
+        scale_y = display_h / max(1, orig_h)
 
         # 绘制运动员（绿色/红色）
         for athlete in athletes:
             x1, y1, x2, y2 = athlete['bbox']
+            dx1, dy1 = int(round(x1 * scale_x)), int(round(y1 * scale_y))
+            dx2, dy2 = int(round(x2 * scale_x)), int(round(y2 * scale_y))
             track_id = athlete.get('track_id', -1)
             bib_text = athlete.get('bib_text', "")
             
@@ -4786,7 +4593,7 @@ class MainWindow(QMainWindow):
             color = (0, 255, 0) # 始终使用绿色
             thickness = 2
             
-            cv2.rectangle(display, (x1, y1), (x2, y2), color, thickness)
+            cv2.rectangle(display, (dx1, dy1), (dx2, dy2), color, thickness)
             
             label = f"ID:{track_id}{bib_text}"
             if is_crossed:
@@ -4795,7 +4602,7 @@ class MainWindow(QMainWindow):
             # 减小字体大小和粗细
             font_scale = 0.6
             font_thickness = 1
-            cv2.putText(display, label, (x1, y1-10),
+            cv2.putText(display, label, (dx1, max(12, dy1 - 10)),
                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thickness)
 
         # 绘制BIB（蓝色）
@@ -4803,7 +4610,9 @@ class MainWindow(QMainWindow):
             if not isinstance(bib, dict) or 'bbox' not in bib:
                 continue
             x1, y1, x2, y2 = bib['bbox']
-            cv2.rectangle(display, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            dx1, dy1 = int(round(x1 * scale_x)), int(round(y1 * scale_y))
+            dx2, dy2 = int(round(x2 * scale_x)), int(round(y2 * scale_y))
+            cv2.rectangle(display, (dx1, dy1), (dx2, dy2), (255, 0, 0), 2)
 
         # 绘制终点线 (仅在未开启控件叠加绘制时，避免出现两条线)
         line_config = self.config.get('finish_lines', {}).get(str(source_id))
@@ -4814,13 +4623,15 @@ class MainWindow(QMainWindow):
             lx1, ly1 = line_config.get('x1'), line_config.get('y1')
             lx2, ly2 = line_config.get('x2'), line_config.get('y2')
             if all(v is not None for v in [lx1, ly1, lx2, ly2]):
-                cv2.line(display, (lx1, ly1), (lx2, ly2), (0, 0, 255), 2)
-                cv2.putText(display, "FINISH LINE", (lx1, ly1 - 10), 
+                dlx1, dly1 = int(round(lx1 * scale_x)), int(round(ly1 * scale_y))
+                dlx2, dly2 = int(round(lx2 * scale_x)), int(round(ly2 * scale_y))
+                cv2.line(display, (dlx1, dly1), (dlx2, dly2), (0, 0, 255), 2)
+                cv2.putText(display, "FINISH LINE", (dlx1, max(12, dly1 - 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
 
         # 绘制叠加信息
         overlay = display.copy()
-        cv2.rectangle(overlay, (0, 0), (orig_w, 85), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (0, 0), (display_w, min(display_h, 85)), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.4, display, 0.6, 0, display)
 
         # 只有主摄像头显示 FPS 和时间
@@ -4839,23 +4650,6 @@ class MainWindow(QMainWindow):
             self._main_fps_value = float(fps)
             time_str = f"{int(runtime//3600):02d}:{int((runtime%3600)//60):02d}:{int(runtime%60):02d}"
 
-            if self._is_wave_mode_active():
-                if (not self._wave_ocr_paused_by_fps) and self._main_fps_value < float(self._wave_pause_fps):
-                    self._wave_ocr_paused_by_fps = True
-                    logger.info(f"[Main] 波次OCR暂停: FPS={self._main_fps_value:.1f} < {self._wave_pause_fps:.1f}")
-                elif self._wave_ocr_paused_by_fps and self._main_fps_value >= float(self._wave_resume_fps):
-                    self._wave_ocr_paused_by_fps = False
-                    logger.info(f"[Main] 波次OCR恢复: FPS={self._main_fps_value:.1f} >= {self._wave_resume_fps:.1f}")
-
-                now_wall = time.time()
-                idle_gap = now_wall - float(self._wave_last_crossing_walltime or 0.0)
-                if self._wave_new_events_since_last_batch >= int(self._wave_trigger_count):
-                    self._drain_wave_ocr_batch(reason="count")
-                    self._wave_new_events_since_last_batch = 0
-                elif self._wave_last_crossing_walltime > 0 and idle_gap >= float(self._wave_idle_seconds):
-                    self._drain_wave_ocr_batch(reason="idle")
-                    self._wave_new_events_since_last_batch = 0
-            
             # --- 增强版 FPS 显示 ---
             fps_color = (0, 255, 0) if fps >= 10 else (0, 0, 255)
             
@@ -4915,11 +4709,7 @@ class MainWindow(QMainWindow):
         bytes_per_line = ch * w
         qt_image = QImage(display.data, w, h, bytes_per_line, QImage.Format_BGR888)
 
-        label_size = video_label.size()
-        pixmap = QPixmap.fromImage(qt_image)
-        scaled_pixmap = pixmap.scaled(
-            label_size, Qt.KeepAspectRatio, Qt.FastTransformation
-        )
+        scaled_pixmap = QPixmap.fromImage(qt_image)
 
         if not scaled_pixmap.isNull():
             if video_label.orig_w != orig_w:
@@ -5009,14 +4799,14 @@ class MainWindow(QMainWindow):
             from PyQt5.QtCore import QMetaObject, Qt
             QMetaObject.invokeMethod(self.event_list, "_check_new_events", Qt.QueuedConnection)
 
+        if self._yolo_only_mode:
+            return
+
         # 自动补号：事件落库后自动将 UNKNOWN/PENDING 事件加入 OCR 队列
         try:
             if self.ocr_manager and self.database:
                 ev = self.database.get_event(event_id)
                 if ev:
-                    if self._is_wave_mode_active():
-                        self._enqueue_wave_ocr_candidate(int(event_id))
-                        return
                     bib = str(ev.get('bib_number') or '').strip().upper()
                     ocr_state = str(ev.get('ocr_state') or 'PENDING').strip().upper()
                     should_enqueue = (not bib or bib == 'UNKNOWN' or ocr_state in {'PENDING', 'FAIL'})
@@ -5032,103 +4822,6 @@ class MainWindow(QMainWindow):
                         )
         except Exception as e:
             logger.debug(f"[Main] 自动入队 OCR 失败: event_id={event_id}, err={e}")
-
-    def _run_auto_ocr_patrol(self):
-        """定时巡检：自动重试最近 UNKNOWN/PENDING 事件，减少偶发漏触发。"""
-        if self._is_wave_mode_active():
-            return
-        if not self._running:
-            return
-        if not self._ocr_patrol_enabled:
-            return
-        if not self.ocr_manager or not self.database:
-            return
-
-        # OCR 正在处理且队列已有积压时，本轮不再补充，避免 UI 高频刷新
-        try:
-            task_queue = getattr(self.ocr_manager, 'task_queue', None)
-            queue_size = task_queue.qsize() if task_queue is not None else 0
-            if getattr(self.ocr_manager, '_running', False) and queue_size >= 2:
-                return
-        except Exception:
-            pass
-
-        try:
-            events = self.database.get_events_since_time(seconds=float(self._ocr_patrol_recent_seconds))
-            if not events:
-                return
-
-            now = time.time()
-            enqueued_count = 0
-            scanned = 0
-            max_scan = max(1, int(self._ocr_patrol_max_scan))
-            retry_gap = max(1.0, float(self._ocr_patrol_retry_gap_seconds))
-            max_enqueue = max(1, int(self._ocr_patrol_max_enqueue_per_tick))
-            max_retries = max(1, int(self._ocr_patrol_max_retries))
-            retry_cooldown = max(10.0, float(self._ocr_patrol_retry_cooldown_seconds))
-
-            for ev in events:
-                if scanned >= max_scan:
-                    break
-                if enqueued_count >= max_enqueue:
-                    break
-                scanned += 1
-
-                event_id = ev.get('event_id')
-                if event_id is None:
-                    continue
-
-                try:
-                    event_id_int = int(event_id)
-                except Exception:
-                    continue
-
-                bib = str(ev.get('bib_number') or '').strip().upper()
-                ocr_state = str(ev.get('ocr_state') or 'PENDING').strip().upper()
-                should_enqueue = (not bib or bib == 'UNKNOWN' or ocr_state in {'PENDING', 'FAIL'})
-                if not should_enqueue:
-                    self._ocr_patrol_attempts.pop(event_id_int, None)
-                    self._ocr_patrol_block_until.pop(event_id_int, None)
-                    continue
-
-                blocked_until = float(self._ocr_patrol_block_until.get(event_id_int, 0.0))
-                if now < blocked_until:
-                    continue
-
-                last_try = float(self._ocr_patrol_last_enqueue.get(event_id_int, 0.0))
-                if now - last_try < retry_gap:
-                    continue
-
-                attempts = int(self._ocr_patrol_attempts.get(event_id_int, 0))
-                if attempts >= max_retries:
-                    self._ocr_patrol_block_until[event_id_int] = now + retry_cooldown
-                    self._ocr_patrol_attempts[event_id_int] = 0
-                    continue
-
-                enqueued = self.ocr_manager.enqueue_live_event(
-                    event_id=event_id_int,
-                    evidence_dir=ev.get('evidence_dir'),
-                    cross_time=ev.get('cross_time')
-                )
-                self._ocr_patrol_last_enqueue[event_id_int] = now
-                if enqueued:
-                    self._ocr_patrol_attempts[event_id_int] = attempts + 1
-                    if self._ocr_patrol_attempts[event_id_int] >= max_retries:
-                        self._ocr_patrol_block_until[event_id_int] = now + retry_cooldown
-                    enqueued_count += 1
-
-            # 定期清理巡检缓存，避免无限增长
-            expire_before = now - max(60.0, retry_gap * 8.0)
-            stale_keys = [eid for eid, ts in self._ocr_patrol_last_enqueue.items() if float(ts) < expire_before]
-            for eid in stale_keys:
-                self._ocr_patrol_last_enqueue.pop(eid, None)
-                self._ocr_patrol_attempts.pop(eid, None)
-                self._ocr_patrol_block_until.pop(eid, None)
-
-            if enqueued_count > 0:
-                logger.info(f"[Main] 自动巡检补号入队: +{enqueued_count} (scan={scanned})")
-        except Exception as e:
-            logger.debug(f"[Main] 自动巡检补号异常: {e}")
 
     def _capture_field_issue_context(self) -> Optional[Dict[str, Any]]:
         candidates = []
@@ -5313,9 +5006,6 @@ class MainWindow(QMainWindow):
             return
         # 1. 更新本次会话计数
         self._session_event_count += 1
-        self._wave_last_crossing_walltime = time.time()
-        if self._is_wave_mode_active():
-            self._wave_new_events_since_last_batch += 1
         logger.info(f"[MainWindow] 检测到过线事件: ID {event.track_id}, Bib {event.bib_number}, Source {event.source_id}")
         
         # 2. 保存到记录器 (异步处理 IO)
@@ -5372,7 +5062,7 @@ class MainWindow(QMainWindow):
                     )
                     
                     # 4. 刷新右侧列表
-                    if hasattr(self, 'event_list') and (not self._is_wave_mode_active()):
+                    if hasattr(self, 'event_list'):
                         # 触发增量刷新
                         QMetaObject.invokeMethod(self.event_list, "_check_new_events", Qt.QueuedConnection)
                     
@@ -5569,20 +5259,12 @@ class MainWindow(QMainWindow):
                 field_issue_executor.shutdown(wait=False, cancel_futures=False)
                 self._field_issue_executor = None
 
-            # 1. 停止 OCR 初始化线程
-            if getattr(self, 'ocr_init_thread', None):
-                thread = self.ocr_init_thread
-                if thread.isRunning():
-                    logger.info("[Main] 正在停止 OCR 初始化线程...")
-                    try:
-                        thread.finished.disconnect()
-                    except Exception:
-                        pass
-                    thread.terminate()
-                    thread.wait(1000)
-                self.ocr_init_thread = None
+            if getattr(self, "_ocr_poll_timer", None) and self._ocr_poll_timer.isActive():
+                self._ocr_poll_timer.stop()
+            if self.ocr_manager is not None:
+                self.ocr_manager.stop()
 
-            # 2. 移除日志 handler，防止后台线程继续写入已销毁组件
+            # Remove the GUI handler before its Qt target is destroyed.
             import logging
             root_logger = logging.getLogger()
             if getattr(self, '_gui_log_handler', None):
@@ -5597,30 +5279,11 @@ class MainWindow(QMainWindow):
 
 def find_model() -> str:
     """自动查找模型文件"""
-    from pathlib import Path
-
-    # 获取脚本所在目录
-    script_dir = Path(__file__).parent.parent
-
-    # 搜索常见位置
-    search_paths = [
-        script_dir / "runs" / "detect",
-        script_dir / "runs" / "detect" / "runs" / "detect",
-        Path("runs/detect"),
-        Path("runs/detect/runs/detect"),
-    ]
-
-    candidates = []
-    for base in search_paths:
-        if not base.exists():
-            continue
-        for pattern in ["**/best.engine", "**/best.pt"]:
-            candidates.extend(list(base.glob(pattern)))
-    if candidates:
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return str(candidates[0])
-
-    return None
+    model_path = find_runtime_model(
+        base_dir=application_dir(),
+        project_root=Path(__file__).resolve().parent.parent,
+    )
+    return str(model_path) if model_path else None
 
 
 def main():
@@ -5639,11 +5302,16 @@ def main():
                        help='终点线终点 (x,y)')
     parser.add_argument('--auto-start', action='store_true',
                        help='启动后自动开始')
+    parser.add_argument('--yolo-only', action='store_true',
+                       help='禁用 OCR，仅运行 YOLO 检测与事件保存')
+    parser.add_argument('--ocr-cpu-threads', type=int, default=2,
+                       help='本地 OCR 使用的 CPU 线程数（1-4）')
 
     args = parser.parse_args()
+    runtime_root = application_dir()
 
     # 查找模型
-    model_path = args.model
+    model_path = str(resolve_runtime_path(args.model, base_dir=runtime_root)) if args.model else None
     if not model_path:
         model_path = find_model()
         if not model_path:
@@ -5659,10 +5327,14 @@ def main():
     except:
         x1, y1, x2, y2 = 0, 850, 1920, 850
 
+    output_path = resolve_output_dir(args.output, base_dir=runtime_root)
     config = {
-        'source': args.source,
+        'source': resolve_source(args.source, base_dir=runtime_root),
         'model_path': model_path,
-        'output_dir': args.output,
+        'output_dir': str(output_path),
+        'runtime_dir': str(runtime_root),
+        'yolo_only_mode': bool(args.yolo_only),
+        'ocr_cpu_threads': max(1, min(4, int(args.ocr_cpu_threads))),
         'finish_line': {
             'x1': x1, 'y1': y1,
             'x2': x2, 'y2': y2,
@@ -5677,7 +5349,6 @@ def main():
     }
 
     # 尝试加载上次保存的配置
-    output_path = Path(args.output)
     config_file = output_path / "config.json"
     if config_file.exists():
         try:
@@ -5693,14 +5364,21 @@ def main():
         except Exception as e:
             logger.warning(f"加载保存配置失败: {e}")
 
+    # Runtime/CLI choices must not be replaced by a stale race-root config.
+    config['output_dir'] = str(output_path)
+    config['runtime_dir'] = str(runtime_root)
+    config['yolo_only_mode'] = bool(args.yolo_only)
+    config['ocr_cpu_threads'] = max(1, min(4, int(args.ocr_cpu_threads)))
+    if args.model:
+        config['model_path'] = model_path
+
     app = QApplication(sys.argv)
     window = MainWindow(config)
     window.show()
     
     if args.auto_start:
         logger.info("Auto-Start: 正在启动系统...")
-        # 延迟一下，等 UI 稳定
-        QTimer.singleShot(1000, window._start)
+        QTimer.singleShot(0, window.start_when_race_ready)
         
     sys.exit(app.exec_())
 

@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+from realtime.frame_envelope import FrameEnvelope
 from realtime.stream_reader import StreamReader, StreamStatus
 
 
@@ -138,6 +139,27 @@ def test_bounded_queue_drops_oldest_frame_and_reports_metrics(monkeypatch):
     assert all(envelope.arrival_time_ms > 0 for envelope in envelopes)
     assert reader.queue_depth == 0
     assert reader.get_info()["dropped_frame_count"] == 1
+
+
+def test_get_latest_frame_envelope_discards_stale_inference_frames():
+    reader = StreamReader("race.mp4", queue_size=4)
+    for frame_index in range(3):
+        reader._enqueue_envelope(
+            FrameEnvelope(
+                original_frame=f"frame-{frame_index}",
+                frame_index=frame_index,
+                capture_time_ms=frame_index * 40.0,
+                arrival_time_ms=1_000.0 + frame_index * 40.0,
+                segment_id=0,
+            )
+        )
+
+    envelope = reader.get_latest_frame_envelope()
+
+    assert envelope.original_frame == "frame-2"
+    assert envelope.frame_index == 2
+    assert reader.queue_depth == 0
+    assert reader.get_info()["consumer_skipped_frame_count"] == 2
 
 
 class _LiveCapture:

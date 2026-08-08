@@ -1,7 +1,7 @@
 import numpy as np
 
 from realtime.frame_envelope import FrameEnvelope
-from realtime.main_window import VideoThread
+from realtime.main_window import PreviewThread, VideoThread
 from realtime.stream_reader import StreamStatus
 
 
@@ -160,3 +160,64 @@ def test_video_thread_combines_identity_and_reader_metrics():
     assert thread.last_frame_metrics["identity_ambiguities"] == 1
     assert thread.last_frame_metrics["queue_depth"] == 3
     assert thread.last_frame_metrics["dropped_frames"] == 4
+
+
+class _LatestEnvelopeReader(_EnvelopeReader):
+    def __init__(self, envelope):
+        super().__init__(envelope)
+        self.fifo_calls = 0
+
+    def get_latest_frame_envelope(self):
+        self.calls += 1
+        return self.envelope
+
+    def get_frame_envelope(self):
+        self.fifo_calls += 1
+        return self.envelope
+
+
+def test_video_thread_prefers_latest_frame_for_inference():
+    frame = np.zeros((8, 12, 3), dtype=np.uint8)
+    envelope = FrameEnvelope(
+        original_frame=frame,
+        frame_index=9,
+        capture_time_ms=2_000.0,
+        arrival_time_ms=2_005.0,
+        segment_id=0,
+    )
+    reader = _LatestEnvelopeReader(envelope)
+    detector = _TimestampDetector()
+    thread = VideoThread(reader, detector, ui_skip=99)
+    detector.thread = thread
+
+    thread.run()
+
+    assert reader.calls == 1
+    assert reader.fifo_calls == 0
+    assert detector.received_frame is frame
+
+
+class _PreviewReader:
+    status = StreamStatus.CONNECTED
+
+    def __init__(self):
+        self.calls = []
+        self.thread = None
+
+    def get_frame_after(self, timestamp):
+        self.calls.append(timestamp)
+        self.thread._running = False
+        return np.zeros((4, 6, 3), dtype=np.uint8), 12.5
+
+
+def test_preview_thread_reads_latest_frame_without_detector():
+    reader = _PreviewReader()
+    thread = PreviewThread(reader, source_id=3, target_fps=30.0)
+    reader.thread = thread
+    emitted = []
+    thread.frame_ready.connect(lambda frame, source_id: emitted.append((frame.shape, source_id)))
+
+    thread.run()
+
+    assert reader.calls == [0.0]
+    assert emitted == [((4, 6, 3), 3)]

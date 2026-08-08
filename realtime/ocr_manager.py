@@ -4,7 +4,7 @@ import time
 import threading
 import queue
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -15,6 +15,7 @@ import numpy as np
 from .detector import PaddleOcrAdapter, BibStatus
 from .database import Database
 from .io_utils import read_image_unicode
+from .ocr_worker import OcrJob, OcrProcessController, OcrResult, collect_candidate_paths
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,13 @@ class OCRManager:
     """
     OCR 管理器：负责从磁盘加载证据、执行批处理识别、断点续传及归并逻辑。
     """
-    def __init__(self, database: Database, ocr_engine: Optional[PaddleOcrAdapter] = None, vlm_engine: Optional[Any] = None):
+    def __init__(
+        self,
+        database: Database,
+        ocr_engine: Optional[PaddleOcrAdapter] = None,
+        vlm_engine: Optional[Any] = None,
+        process_controller: Optional[OcrProcessController] = None,
+    ):
         self.db = database
         self.ocr = ocr_engine
         self.vlm = vlm_engine
@@ -77,6 +84,11 @@ class OCRManager:
         self._worker_thread = None
         self._queue_lock = threading.Lock()
         self._queued_event_dirs = set()
+        self.process_controller = process_controller
+        self.runtime_state = "idle"
+        self._pending_process_jobs = deque(maxlen=64)
+        self._queued_process_event_ids: set[int] = set()
+        self._process_restart_count = 0
         # Participant-keyed consensus is additive; event/track APIs remain intact.
         self._participant_ocr_states: Dict[str, ParticipantOcrState] = {}
         self._participant_ocr_lock = threading.Lock()
@@ -294,6 +306,139 @@ class OCRManager:
         if vlm_engine:
             self.vlm = vlm_engine
 
+    def start_process_runtime(
+        self,
+        *,
+        cpu_threads: int = 1,
+        models_root: Optional[str] = None,
+    ) -> bool:
+        """Start the recognition-only child without importing Paddle in this process."""
+        if self.process_controller is None:
+            self.process_controller = OcrProcessController(
+                cpu_threads=cpu_threads,
+                models_root=models_root,
+            )
+        if self.process_controller.disabled:
+            self.runtime_state = "disabled"
+            return False
+        started = bool(self.process_controller.start())
+        self.runtime_state = "loading" if started else "failed"
+        return started
+
+    def _dispatch_pending_process_job(self) -> None:
+        if self.runtime_state != "ready" or self.process_controller is None:
+            return
+        while self._pending_process_jobs:
+            job = self._pending_process_jobs[0]
+            if not self.process_controller.submit(job):
+                return
+            self._pending_process_jobs.popleft()
+            return
+
+    def poll_process_results(self) -> List[OcrResult]:
+        """Drain small child-process messages and apply event results in this process."""
+        if self.process_controller is None:
+            return []
+        results = self.process_controller.poll()
+        for result in results:
+            if int(result.event_id) < 0:
+                normalized_state = str(result.status or "").strip().lower()
+                if normalized_state == "ready":
+                    self.runtime_state = "ready"
+                    self._dispatch_pending_process_job()
+                elif normalized_state == "failed":
+                    self.runtime_state = "failed"
+                    logger.error("[OCRManager] OCR process initialization failed: %s", result.error)
+                continue
+
+            self._queued_process_event_ids.discard(int(result.event_id))
+            if self.stats.get("pending", 0) > 0:
+                self.stats["pending"] -= 1
+            self._apply_process_result(result)
+            self._dispatch_pending_process_job()
+        if self.runtime_state in {"loading", "ready", "failed"} and not self.process_controller.is_alive:
+            self._recover_process_runtime()
+        return results
+
+    def _recover_process_runtime(self) -> bool:
+        if self.process_controller is None:
+            self.runtime_state = "disabled"
+            return False
+        if self._process_restart_count >= 1:
+            logger.error("[OCRManager] OCR process failed again; disabling OCR for this run")
+            disable = getattr(self.process_controller, "disable", None)
+            if callable(disable):
+                disable()
+            else:
+                self.process_controller.stop(timeout=1.0)
+            self.runtime_state = "disabled"
+            return False
+
+        self._process_restart_count += 1
+        logger.warning("[OCRManager] OCR process exited; restarting once")
+        restart = getattr(self.process_controller, "restart", None)
+        restarted = bool(restart()) if callable(restart) else False
+        self.runtime_state = "loading" if restarted else "disabled"
+        return restarted
+
+    def _apply_process_result(self, result: OcrResult) -> None:
+        event_id = int(result.event_id)
+        event = self.db.get_event(event_id)
+        if not event:
+            return
+        if int(event.get("manual_corrected") or 0) != 0:
+            logger.info("[OCRManager] Skip async OCR for manually corrected event %s", event_id)
+            return
+
+        event_dir = Path(str(event.get("evidence_dir") or ""))
+        if not event_dir.is_dir():
+            return
+        meta_path = event_dir / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            meta = {"event_id": event_id}
+        meta["event_id"] = event_id
+
+        normalized = self._normalize_bib_text(result.text)
+        accepted = (
+            str(result.status or "").upper() == "DONE"
+            and bool(normalized)
+            and float(result.confidence or 0.0) >= float(self.conf_threshold)
+        )
+        status = "DONE" if accepted else "PENDING"
+        error = "" if accepted else (result.error or "OCR_FAILED")
+        result_data = self._save_result(
+            event_dir,
+            meta,
+            normalized or str(result.text or "").strip(),
+            float(result.confidence or 0.0),
+            status,
+            error=error,
+            source=f"mobile_rec:{result.source}" if result.source else "mobile_rec",
+            image_source=result.source,
+            participant_id=event.get("participant_id"),
+            raw_track_id=event.get("track_id"),
+        )
+        self._persist_ocr_resolution(
+            event_id=event_id,
+            bib=normalized,
+            conf=float(result.confidence or 0.0),
+            status=status,
+            evidence_dir=str(event_dir),
+            notes=(
+                f"Source: mobile_rec:{result.source}; elapsed_ms={result.elapsed_ms:.1f}; "
+                f"attempts={result.attempted_candidates}"
+            ),
+        )
+        if status == "DONE":
+            self.stats["done"] = int(self.stats.get("done", 0)) + 1
+            self.stats["resolved_done"] = int(self.stats.get("resolved_done", 0)) + 1
+        else:
+            self.stats["pending_result"] = int(self.stats.get("pending_result", 0)) + 1
+        if self.on_event_done:
+            self.on_event_done(event_id, result_data)
+
     def _persist_ocr_resolution(
         self,
         event_id: int,
@@ -347,110 +492,6 @@ class OCRManager:
         self.stats["processed"] = current
         return current
 
-    def start_batch(self, evidence_root: str):
-        """
-        开始批处理扫描
-        evidence_root: runs/race_xxx/evidence_photos/
-        """
-        if self._running:
-            logger.warning("OCR Manager 已经在运行中")
-            return
-            
-        root_path = Path(evidence_root)
-        if not root_path.exists():
-            logger.error(f"证据根目录不存在: {evidence_root}")
-            return
-
-        # 刷新号码规则（确保最新的 bib_ranges 生效）
-        self._refresh_rules_from_db()
-        if self._bib_ranges:
-            logger.info(f"[OCRManager] 批处理启动，号码范围过滤已启用 ({len(self._bib_ranges)} 条规则)")
-        else:
-            logger.warning("[OCRManager] 批处理启动，未配置号码范围，所有格式均接受")
-
-        # 1. 扫描所有事件子目录
-        event_dirs = [d for d in root_path.iterdir() if d.is_dir() and d.name.isdigit()]
-        logger.info(f"扫描到 {len(event_dirs)} 个事件目录")
-        
-        self.stats = {
-            "total": 0,
-            "pending": 0,
-            "done": 0,
-            "resolved_done": 0,
-            "pending_result": 0,
-            "processed": 0,
-            "failed": 0,
-            "merged": 0,
-            "vlm_used": 0
-        }
-        with self._queue_lock:
-            self._queued_event_dirs.clear()
-        
-        # 2. 读取 meta.json，按时间排序入队
-        tasks = []
-        for edir in event_dirs:
-            meta_path = edir / "meta.json"
-            result_path = edir / "result.json"
-            
-            if not meta_path.exists():
-                continue
-                
-            try:
-                with open(meta_path, 'r', encoding='utf-8') as f:
-                    meta = json.load(f)
-                
-                # 检查是否已完成且有效 (断点续传核心)
-                if result_path.exists():
-                    try:
-                        with open(result_path, 'r', encoding='utf-8') as f:
-                            res = json.load(f)
-                        if res.get("status") == "MANUAL":
-                            # 人工修改的结果永远不重新处理
-                            self.stats["done"] += 1
-                            self.stats["resolved_done"] += 1
-                            continue
-                        if res.get("status") == "DONE":
-                            old_bib = res.get("bib", "")
-                            # 如果配置了号码范围，检查旧结果是否在范围内
-                            # 不在范围内 = 之前识别了垃圾（广告/计时器文字），需要重新处理
-                            if self._bib_ranges and old_bib and not self._is_in_bib_ranges(old_bib):
-                                logger.info(f"[OCRManager] 事件 {edir.name} 旧结果 '{old_bib}' 不在号码范围内，重新识别")
-                            else:
-                                self.stats["done"] += 1
-                                self.stats["resolved_done"] += 1
-                                continue
-                    except:
-                        pass # 文件损坏则重新识别
-                
-                # 入队：(优先级=时间戳, 数据=目录路径)
-                participant_id = str(meta.get("participant_id") or "").strip()
-                raw_track_id = meta.get("track_id")
-                try:
-                    raw_track_id = int(raw_track_id) if raw_track_id is not None else None
-                except (TypeError, ValueError):
-                    raw_track_id = None
-                tasks.append((meta.get("cross_time_unix", 0), str(edir), participant_id, raw_track_id))
-                self.stats["pending"] += 1
-                
-            except Exception as e:
-                logger.error(f"解析 {meta_path} 失败: {e}")
-                
-        # 排序并加入 PriorityQueue
-        tasks.sort()
-        for t in tasks:
-            self.task_queue.put(t)
-            with self._queue_lock:
-                self._queued_event_dirs.add(str(t[1]))
-
-        self.stats["total"] = int(self.stats.get("done", 0)) + int(self.stats.get("pending", 0))
-        self._sync_processed_stat()
-            
-        # 3. 启动后台工作线程
-        self._running = True
-        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-        self._worker_thread.start()
-        logger.info(f"OCR 批处理启动: {self.stats['pending']} 个任务待处理")
-
     def enqueue_live_event(
         self,
         event_id: int,
@@ -462,6 +503,14 @@ class OCRManager:
         """实时自动补号入口：将单个事件加入 OCR 队列（若可处理）。"""
         if event_id is None:
             return False
+
+        if self.process_controller is not None:
+            return self._enqueue_process_event(
+                event_id=event_id,
+                evidence_dir=evidence_dir,
+                participant_id=participant_id,
+                raw_track_id=raw_track_id,
+            )
 
         if not self.ocr:
             logger.debug(f"[OCRManager] 跳过自动OCR: OCR引擎未就绪 (event_id={event_id})")
@@ -522,8 +571,65 @@ class OCRManager:
 
         return True
 
+    def _enqueue_process_event(
+        self,
+        *,
+        event_id: int,
+        evidence_dir: Optional[str],
+        participant_id: Optional[str],
+        raw_track_id: Optional[int],
+    ) -> bool:
+        """Queue paths only; never wait for Paddle or copy image arrays."""
+        try:
+            event_id = int(event_id)
+        except (TypeError, ValueError):
+            return False
+        if event_id in self._queued_process_event_ids:
+            return False
+
+        event = self.db.get_event(event_id)
+        if not event:
+            return False
+        if int(event.get("manual_corrected") or 0) != 0:
+            return False
+        bib = str(event.get("bib_number") or "").strip().upper()
+        ocr_state = str(event.get("ocr_state") or "PENDING").strip().upper()
+        if bib and bib != "UNKNOWN" and ocr_state == "DONE":
+            return False
+
+        event_dir = Path(str(evidence_dir or event.get("evidence_dir") or ""))
+        if not event_dir.is_dir():
+            return False
+        candidate_paths = collect_candidate_paths(event_dir, max_candidates=2)
+        if not candidate_paths:
+            return False
+
+        job = OcrJob(
+            event_id=event_id,
+            event_dir=str(event_dir.resolve()),
+            candidate_paths=tuple(str(path) for path in candidate_paths),
+        )
+        accepted = False
+        if self.runtime_state == "ready":
+            accepted = bool(self.process_controller.submit(job))
+        if not accepted:
+            if len(self._pending_process_jobs) >= self._pending_process_jobs.maxlen:
+                logger.warning("[OCRManager] Pending OCR ids are full; event %s remains PENDING", event_id)
+                return False
+            self._pending_process_jobs.append(job)
+
+        self._queued_process_event_ids.add(event_id)
+        self.stats["total"] = int(self.stats.get("total", 0)) + 1
+        self.stats["pending"] = int(self.stats.get("pending", 0)) + 1
+        return True
+
     def stop(self):
         """停止处理"""
+        if self.process_controller is not None:
+            self.process_controller.stop(timeout=2.0)
+            self.runtime_state = "disabled"
+            self._pending_process_jobs.clear()
+            self._queued_process_event_ids.clear()
         self._running = False
         if self._worker_thread:
             self._worker_thread.join(timeout=2.0)

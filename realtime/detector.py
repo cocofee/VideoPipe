@@ -94,12 +94,12 @@ def resolve_performance_profile(
         },
         "balanced": {
             "name": "balanced",
-            "process_imgsz": 768,
+            "process_imgsz": 832,
             "adaptive_frame_skip": True,
         },
         "laptop": {
             "name": "laptop",
-            "process_imgsz": 896,
+            "process_imgsz": 832,
             "adaptive_frame_skip": True,
         },
     }
@@ -341,6 +341,47 @@ class BibStatus(Enum):
     NEEDS_REVIEW = "needs_review"
     RECOGNIZED = "recognized"
 
+
+@dataclass(eq=False)
+class BibEvidenceCandidate:
+    """One bib crop with the same-frame athlete association used to create it."""
+
+    quality: float
+    crop: np.ndarray
+    frame: Optional[np.ndarray]
+    frame_index: int
+    capture_time_ms: float
+    athlete_bbox: Tuple[int, int, int, int]
+    bib_bbox: Tuple[int, int, int, int]
+    source: str
+    owner_validated: bool = False
+
+    def _legacy_tuple(self):
+        return self.quality, self.crop, self.frame, list(self.bib_bbox)
+
+    def __iter__(self):
+        return iter(self._legacy_tuple())
+
+    def __len__(self):
+        return 4
+
+    def __getitem__(self, index):
+        return self._legacy_tuple()[index]
+
+    def detached_copy(self) -> "BibEvidenceCandidate":
+        return BibEvidenceCandidate(
+            quality=float(self.quality),
+            crop=self.crop.copy(),
+            frame=None,
+            frame_index=int(self.frame_index),
+            capture_time_ms=float(self.capture_time_ms),
+            athlete_bbox=tuple(int(value) for value in self.athlete_bbox),
+            bib_bbox=tuple(int(value) for value in self.bib_bbox),
+            source=str(self.source),
+            owner_validated=bool(self.owner_validated),
+        )
+
+
 class VLMRateLimitError(Exception):
     """VLM API 频率限制或配额耗尽错误"""
     def __init__(self, message, status_code=429, is_quota_exceeded=False):
@@ -371,7 +412,7 @@ class CrossingEvent:
     bib_crop: Optional[np.ndarray] = None
     bib_bbox: Optional[List[int]] = None # 新增：号码牌框
     bib_evidence_kind: str = ""
-    bib_candidates: List[Tuple[float, np.ndarray, List[int]]] = field(default_factory=list)
+    bib_candidates: List[BibEvidenceCandidate] = field(default_factory=list)
     quality_score: float = 0.0 # 新增：质量分
     is_update_only: bool = False # 新增：标记为仅更新截图数据
     is_info_update: bool = False # 新增：标记为仅更新文本/状态信息
@@ -412,9 +453,8 @@ class TrackState:
     last_bib_rel_pos: Optional[Tuple[float, float]] = None # 号码牌相对于运动员框的相对位置 (rx, ry)
     
     # 【新增】高质量截图缓存
-    # 存储格式: [(quality_score, crop, frame, bib_bbox), ...]
-    bib_crops_cache: List[Tuple[float, np.ndarray, np.ndarray, List[int]]] = field(default_factory=list)
-    fallback_bib_crops_cache: List[Tuple[float, np.ndarray, np.ndarray, List[int]]] = field(default_factory=list)
+    bib_crops_cache: List[Any] = field(default_factory=list)
+    fallback_bib_crops_cache: List[Any] = field(default_factory=list)
     max_cache_size: int = 8
     
     # 运动活性检查
@@ -1349,14 +1389,16 @@ class Detector:
                  gate_guard_enabled: bool = True, athlete_validator: Optional[Any] = None,
                  performance_profile: str = "auto", sport_profile: str = "cycling",
                  event_settle_seconds: Optional[float] = None,
-                 event_profile: Optional[EventProfile] = None):
+                 event_profile: Optional[EventProfile] = None,
+                 ocr_pipeline_enabled: bool = True):
         self.model_path = model_path
         self.source_id = source_id
         self._model = model
-        self._ocr = ocr
+        self.ocr_pipeline_enabled = bool(ocr_pipeline_enabled)
+        self._ocr = ocr if self.ocr_pipeline_enabled else None
         self.ocr_engine = ocr_engine
         self.only_numeric = only_numeric # 新增：是否仅允许纯数字号码
-        self.realtime_ocr_enabled = realtime_ocr # 是否启用实时 OCR
+        self.realtime_ocr_enabled = bool(realtime_ocr and self.ocr_pipeline_enabled)
         self.enable_gate_guard = bool(gate_guard_enabled) # 龙门安全模式（抑制龙门/拱门误检）
         self._athlete_validator = athlete_validator
         normalized_sport_profile = (
@@ -1415,6 +1457,9 @@ class Detector:
         self.iou_threshold = 0.65 if source_id == 0 else 0.60  # 马拉松并排人流：提高NMS阈值，减少互相压框
         self.ocr_conf_threshold = 0.55  # ✅ 优化: 拒绝低质量OCR
         self.bib_assignment_min_score_margin = 0.05
+        self.bib_assignment_min_rel_y = 0.25
+        self.bib_assignment_max_rel_y = 0.90
+        self.bib_assignment_min_overlap = 0.90
         self.untracked_detection_conf = 0.20
         self.ocr_detected_bib_min_width = 40
         self.ocr_detected_bib_min_height = 32
@@ -1980,9 +2025,14 @@ class Detector:
                 continue
 
             bx1, by1, bx2, by2 = [float(v) for v in bib_bbox]
-            bib_w = max(1.0, bx2 - bx1)
-            bib_h = max(1.0, by2 - by1)
+            if bx2 <= bx1 or by2 <= by1:
+                continue
+            bib_w = bx2 - bx1
+            bib_h = by2 - by1
             bib_area = bib_w * bib_h
+            bib_aspect = bib_w / bib_h
+            if bib_aspect < 0.35 or bib_aspect > self.bib_candidate_max_aspect:
+                continue
             bib_cx = float(bib.get('center_x', (bx1 + bx2) * 0.5))
             bib_cy = float(bib.get('center_y', (by1 + by2) * 0.5))
             bib_conf = float(bib.get('conf', 0.0) or 0.0)
@@ -2007,12 +2057,24 @@ class Detector:
                 ix2 = min(ax2, bx2)
                 iy2 = min(ay2, by2)
                 overlap_ratio = (max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)) / bib_area
-                if overlap_ratio < 0.65:
+                if overlap_ratio < self.bib_assignment_min_overlap:
                     continue
 
                 rel_x = (bib_cx - ax1) / aw
                 rel_y = (bib_cy - ay1) / ah
-                if rel_y < 0.12 or rel_y > 0.92:
+                if not (0.08 <= rel_x <= 0.92):
+                    continue
+                if not (self.bib_assignment_min_rel_y <= rel_y <= self.bib_assignment_max_rel_y):
+                    continue
+
+                bib_area_ratio = bib_area / (aw * ah)
+                bib_width_ratio = bib_w / aw
+                bib_height_ratio = bib_h / ah
+                if not (0.002 <= bib_area_ratio <= 0.16):
+                    continue
+                if not (0.08 <= bib_width_ratio <= 0.80):
+                    continue
+                if not (0.035 <= bib_height_ratio <= 0.34):
                     continue
 
                 center_score = max(0.0, 1.0 - abs(rel_x - 0.5) * 2.0)
@@ -2531,11 +2593,16 @@ class Detector:
     
     def set_ocr(self, ocr_instance):
         """设置并初始化 OCR 引擎"""
+        if not self.ocr_pipeline_enabled:
+            self._ocr = None
+            return
         self._ocr = ocr_instance
         self.ensure_ocr()
 
     def ensure_ocr(self):
         """确保 OCR 引擎已初始化"""
+        if not self.ocr_pipeline_enabled:
+            return
         if self._ocr is not None and not self._ocr_running:
             self.start_ocr_worker()
 
@@ -3995,7 +4062,7 @@ class Detector:
     def _get_plausible_detected_bib_candidates(
         self,
         state: TrackState,
-    ) -> List[Tuple[float, np.ndarray, np.ndarray, List[int]]]:
+    ) -> List[Any]:
         candidates = []
         aspects = []
         for candidate in state.bib_crops_cache:
@@ -4021,8 +4088,10 @@ class Detector:
             if aspect <= self.bib_candidate_max_aspect
         ]
 
-    def _get_ocr_candidates(self, state: TrackState) -> List[Tuple[float, np.ndarray, np.ndarray, List[int]]]:
+    def _get_ocr_candidates(self, state: TrackState) -> List[Any]:
         """Prefer detector-backed bib crops, falling back to continuously refreshed torso crops."""
+        if not self.ocr_pipeline_enabled:
+            return []
         detected_candidates = self._get_plausible_detected_bib_candidates(state)
         if detected_candidates:
             best_detected = detected_candidates[0]
@@ -4041,11 +4110,23 @@ class Detector:
     def _cache_ocr_candidate(
         self,
         state: TrackState,
-        candidate: Tuple[float, np.ndarray, np.ndarray, List[int]],
+        candidate: Any,
         *,
         detected_bib: bool,
     ) -> None:
+        if not self.ocr_pipeline_enabled:
+            return
         cache = state.bib_crops_cache if detected_bib else state.fallback_bib_crops_cache
+        if isinstance(candidate, BibEvidenceCandidate) and candidate.frame_index >= 0:
+            for index, existing in enumerate(cache):
+                if not isinstance(existing, BibEvidenceCandidate):
+                    continue
+                if existing.source != candidate.source or existing.frame_index != candidate.frame_index:
+                    continue
+                if candidate.quality > existing.quality:
+                    cache[index] = candidate
+                cache.sort(key=lambda item: item[0], reverse=True)
+                return
         cache.append(candidate)
         cache.sort(key=lambda item: item[0], reverse=True)
         if len(cache) > state.max_cache_size:
@@ -4612,7 +4693,7 @@ class Detector:
 
         # 3.5 OCR 兜底：若未检出 bib 框，仍为每个运动员缓存一个躯干候选
         # 注意：即使关闭“实时 OCR”，也要保留这份轻量缓存，供“过线短窗同步 OCR”使用。
-        if athletes:
+        if self.ocr_pipeline_enabled and athletes:
             with self._lock:
                 for athlete in athletes:
                     tid = athlete.get('track_id', -1)
@@ -4655,7 +4736,17 @@ class Detector:
                     frame_ref = frame_original if athlete['bbox'][3] > int(height * 0.45) else None
                     self._cache_ocr_candidate(
                         state,
-                        (quality, fallback_crop, frame_ref, fallback_bbox),
+                        BibEvidenceCandidate(
+                            quality=float(quality),
+                            crop=fallback_crop,
+                            frame=frame_ref,
+                            frame_index=int(self._frame_count),
+                            capture_time_ms=float(current_time) * 1000.0,
+                            athlete_bbox=tuple(int(value) for value in athlete['bbox']),
+                            bib_bbox=tuple(int(value) for value in fallback_bbox),
+                            source="fallback",
+                            owner_validated=False,
+                        ),
                         detected_bib=False,
                     )
 
@@ -4786,6 +4877,9 @@ class Detector:
                         continue
 
                     state.last_bib_rel_pos = (rel_x, rel_y)
+                    state.has_bib_box = True
+                    if not self.ocr_pipeline_enabled:
+                        continue
                     bx1, by1, bx2, by2 = bib['bbox']
                     b_pad = 5
                     b_crop = frame_original[
@@ -4799,7 +4893,17 @@ class Detector:
                     frame_ref = frame_original if (by2 > int(height * 0.45) or quality >= 0.6) else None
                     self._cache_ocr_candidate(
                         state,
-                        (quality, b_crop, frame_ref, bib['bbox']),
+                        BibEvidenceCandidate(
+                            quality=float(quality),
+                            crop=b_crop,
+                            frame=frame_ref,
+                            frame_index=int(self._frame_count),
+                            capture_time_ms=float(current_time) * 1000.0,
+                            athlete_bbox=tuple(int(value) for value in matched_athlete['bbox']),
+                            bib_bbox=tuple(int(value) for value in bib['bbox']),
+                            source="detected",
+                            owner_validated=True,
+                        ),
                         detected_bib=True,
                     )
                     state.has_bib_box = True
@@ -5344,7 +5448,9 @@ class Detector:
                     if self.realtime_ocr_enabled and (not state.best_bib) and candidates and time_passed >= 0.20:
                         self._try_sync_crossing_ocr(tid, state, current_time)
                     
-                    if self.event_settle_seconds is not None:
+                    if not self.ocr_pipeline_enabled:
+                        wait_window = 0.0
+                    elif self.event_settle_seconds is not None:
                         wait_window = self.event_settle_seconds
                     elif state.best_bib:
                         wait_window = 0.18
@@ -5629,12 +5735,33 @@ class Detector:
                     bib_quality_for_save = float(getattr(state, "best_bib_quality", 0.0) or 0.0)
 
                     bib_candidates_for_event = []
-                    for q, candidate_crop, _, candidate_bbox in detected_candidates[:4]:
+                    seen_candidate_frames = set()
+                    for candidate in detected_candidates:
+                        q, candidate_crop, _, candidate_bbox = candidate
                         if candidate_crop is None or not isinstance(candidate_crop, np.ndarray) or candidate_crop.size == 0:
                             continue
-                        bib_candidates_for_event.append(
-                            (float(q), candidate_crop.copy(), list(candidate_bbox or []))
-                        )
+                        if isinstance(candidate, BibEvidenceCandidate):
+                            frame_key = (candidate.source, candidate.frame_index)
+                            if frame_key in seen_candidate_frames:
+                                continue
+                            seen_candidate_frames.add(frame_key)
+                            bib_candidates_for_event.append(candidate.detached_copy())
+                        else:
+                            bib_candidates_for_event.append(
+                                BibEvidenceCandidate(
+                                    quality=float(q),
+                                    crop=candidate_crop.copy(),
+                                    frame=None,
+                                    frame_index=-1,
+                                    capture_time_ms=float(data.get('cross_time', current_time)) * 1000.0,
+                                    athlete_bbox=tuple(int(value) for value in data['bbox']),
+                                    bib_bbox=tuple(int(value) for value in (candidate_bbox or [])),
+                                    source="detected",
+                                    owner_validated=False,
+                                )
+                            )
+                        if len(bib_candidates_for_event) >= 2:
+                            break
                     candidates = self._get_ocr_candidates(state)
                     if candidates:
                         try:

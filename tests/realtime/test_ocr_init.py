@@ -1,19 +1,19 @@
 import sys
 from types import ModuleType
+from pathlib import Path
 
 import numpy as np
 
 from realtime.detector import PaddleOcrAdapter
-from realtime.main_window import OCRInitThread
+from realtime import ocr_worker
 
 
-def test_paddle_ocr_init_disables_mkldnn(monkeypatch):
-    captured_ocr_kwargs = {}
+def test_recognition_worker_uses_mobile_model_without_server_detector(monkeypatch, tmp_path):
     captured_recognition_kwargs = {}
 
     class FakePaddleOCR:
         def __init__(self, **kwargs):
-            captured_ocr_kwargs.update(kwargs)
+            raise AssertionError("Full PaddleOCR must not be constructed")
 
     class FakeTextRecognition:
         def __init__(self, **kwargs):
@@ -24,23 +24,23 @@ def test_paddle_ocr_init_disables_mkldnn(monkeypatch):
     paddleocr_module.TextRecognition = FakeTextRecognition
     paddleocr_module.__version__ = "3.3.2"
 
-    paddle_module = ModuleType("paddle")
-    paddle_module.__version__ = "3.3.0"
-    paddle_module.is_compiled_with_cuda = lambda: False
-
-    paddlex_module = ModuleType("paddlex")
-    paddlex_module.__version__ = "3.3.13"
-
     monkeypatch.setitem(sys.modules, "paddleocr", paddleocr_module)
-    monkeypatch.setitem(sys.modules, "paddle", paddle_module)
-    monkeypatch.setitem(sys.modules, "paddlex", paddlex_module)
+    recognition_model = tmp_path / "en_PP-OCRv5_mobile_rec"
+    recognition_model.mkdir()
+    monkeypatch.setattr(
+        ocr_worker,
+        "find_recognition_model_dir",
+        lambda models_root=None: recognition_model.resolve(),
+    )
 
-    thread = OCRInitThread("paddleocr")
-    thread.run()
+    recognizer = ocr_worker._create_recognizer(cpu_threads=2, models_root=str(tmp_path))
 
-    assert captured_ocr_kwargs["enable_mkldnn"] is False
+    assert isinstance(recognizer, FakeTextRecognition)
     assert captured_recognition_kwargs["enable_mkldnn"] is False
+    assert captured_recognition_kwargs["cpu_threads"] == 2
+    assert captured_recognition_kwargs["device"] == "cpu"
     assert captured_recognition_kwargs["model_name"] == "en_PP-OCRv5_mobile_rec"
+    assert captured_recognition_kwargs["model_dir"] == str(recognition_model.resolve())
 
 
 def test_paddle_adapter_uses_recognition_only_when_detection_returns_empty():

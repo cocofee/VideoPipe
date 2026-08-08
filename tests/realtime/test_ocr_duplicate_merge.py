@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 
 from realtime.database import Database
-from realtime.detector import BibStatus, CrossingEvent
+from realtime.detector import BibEvidenceCandidate, BibStatus, CrossingEvent
 from realtime.event_recorder import EventRecorder
 from realtime.ocr_manager import OCRManager
 
@@ -513,8 +513,28 @@ def test_event_recorder_saves_ranked_bib_candidates(tmp_path):
             bib_crop=np.full((40, 60, 3), 20, dtype=np.uint8),
             bib_evidence_kind="detected",
             bib_candidates=[
-                (0.9, np.full((40, 60, 3), 40, dtype=np.uint8), [20, 40, 80, 80]),
-                (0.8, np.full((38, 58, 3), 80, dtype=np.uint8), [21, 41, 79, 79]),
+                BibEvidenceCandidate(
+                    quality=0.9,
+                    crop=np.full((40, 60, 3), 40, dtype=np.uint8),
+                    frame=None,
+                    frame_index=100,
+                    capture_time_ms=3333.0,
+                    athlete_bbox=(20, 30, 80, 110),
+                    bib_bbox=(20, 40, 80, 80),
+                    source="detected",
+                    owner_validated=True,
+                ),
+                BibEvidenceCandidate(
+                    quality=0.8,
+                    crop=np.full((38, 58, 3), 80, dtype=np.uint8),
+                    frame=None,
+                    frame_index=101,
+                    capture_time_ms=3366.0,
+                    athlete_bbox=(21, 31, 79, 111),
+                    bib_bbox=(21, 41, 79, 79),
+                    source="detected",
+                    owner_validated=True,
+                ),
             ],
             participant_id="P4",
             raw_track_ids=(405, 605),
@@ -528,6 +548,28 @@ def test_event_recorder_saves_ranked_bib_candidates(tmp_path):
         assert meta["paths"]["bib_candidates"] == [
             "bib_candidate_01.jpg",
             "bib_candidate_02.jpg",
+        ]
+        assert meta["bib_candidate_metadata"] == [
+            {
+                "path": "bib_candidate_01.jpg",
+                "frame_index": 100,
+                "capture_time_ms": 3333.0,
+                "athlete_bbox": [20, 30, 80, 110],
+                "bib_bbox": [20, 40, 80, 80],
+                "source": "detected",
+                "owner_validated": True,
+                "quality": 0.9,
+            },
+            {
+                "path": "bib_candidate_02.jpg",
+                "frame_index": 101,
+                "capture_time_ms": 3366.0,
+                "athlete_bbox": [21, 31, 79, 111],
+                "bib_bbox": [21, 41, 79, 79],
+                "source": "detected",
+                "owner_validated": True,
+                "quality": 0.8,
+            },
         ]
         assert meta["bib_evidence_kind"] == "detected"
         assert meta["participant_id"] == "P4"

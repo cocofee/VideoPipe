@@ -85,6 +85,7 @@ class StreamReader:
         self._frame_queue = deque()
         self._queue_lock = threading.Lock()
         self._dropped_frame_count = 0
+        self._consumer_skipped_frame_count = 0
         self._frame_time: float = 0  # 帧时间戳
 
         # 流信息
@@ -162,6 +163,12 @@ class StreamReader:
         """Return the number of unread frame envelopes."""
         with self._queue_lock:
             return len(self._frame_queue)
+
+    @property
+    def consumer_skipped_frame_count(self) -> int:
+        """Return frames intentionally skipped by latest-frame consumers."""
+        with self._queue_lock:
+            return self._consumer_skipped_frame_count
 
     def set_on_status_change(self, callback: Callable[[StreamStatus], None]):
         """设置状态变化回调"""
@@ -466,6 +473,18 @@ class StreamReader:
         with self._queue_lock:
             return self._frame_queue.popleft() if self._frame_queue else None
 
+    def get_latest_frame_envelope(self) -> Optional[FrameEnvelope]:
+        """Consume only the newest envelope and discard stale queued frames."""
+        with self._queue_lock:
+            if not self._frame_queue:
+                return None
+            envelope = self._frame_queue.pop()
+            skipped = len(self._frame_queue)
+            if skipped:
+                self._consumer_skipped_frame_count += skipped
+                self._frame_queue.clear()
+            return envelope
+
     def get_frame_with_time(self) -> Tuple[Optional[cv2.typing.MatLike], float]:
         """
         获取最新帧及其时间戳
@@ -508,6 +527,7 @@ class StreamReader:
             "overflow_policy": self.overflow_policy,
             "queue_depth": self.queue_depth,
             "dropped_frame_count": self.dropped_frame_count,
+            "consumer_skipped_frame_count": self.consumer_skipped_frame_count,
         }
 
 

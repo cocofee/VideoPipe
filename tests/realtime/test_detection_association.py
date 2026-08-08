@@ -4,6 +4,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from realtime.detector import (
+    BibEvidenceCandidate,
     Detector,
     LOCAL_VIDEO_EVENT_SETTLE_SECONDS,
     TrackState,
@@ -153,6 +154,19 @@ class _OriginalFrameTrackingModel:
         self.source = frame
         self.kwargs = kwargs
         return [SimpleNamespace(boxes=_Boxes(), names=self.names)]
+
+
+class _BackgroundBibTrackingModel:
+    names = {0: "bike", 1: "BIB"}
+
+    def track(self, frame, **kwargs):
+        boxes = _SimpleBoxes(
+            cls=[0, 1],
+            conf=[0.95, 0.93],
+            xyxy=[[715, 484, 858, 812], [790, 511, 836, 565]],
+            ids=[9, 99],
+        )
+        return [SimpleNamespace(boxes=boxes, names=self.names)]
 
 
 class _SimpleBoxes:
@@ -436,6 +450,39 @@ def test_clear_bib_owner_is_still_assigned():
         "center_y": 75,
         "conf": 0.9,
     }]
+
+    assignments, unmatched = detector._assign_bibs_to_athletes(athletes, bibs)
+
+    assert assignments == {0: [0]}
+    assert unmatched == set()
+
+
+def test_background_bib_above_rider_torso_is_not_assigned():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    athletes = [_athlete(9, [715, 484, 858, 812])]
+    bibs = [_bib([790, 511, 836, 565], conf=0.93)]
+
+    assignments, unmatched = detector._assign_bibs_to_athletes(athletes, bibs)
+
+    assert assignments == {}
+    assert unmatched == {0}
+
+
+def test_background_bib_never_enters_detected_candidate_cache():
+    detector = Detector(model_path="fake.pt", model=_BackgroundBibTrackingModel(), ocr=None)
+    detector.enable_static_background_filter = False
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    detector.process_frame(frame, timestamp=1.0)
+
+    assert detector._last_bib_assign_stats == {"bibs": 1, "assigned": 0, "rejected": 1}
+    assert detector._track_states[9].bib_crops_cache == []
+
+
+def test_lower_torso_bib_is_assigned_to_unique_rider():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    athletes = [_athlete(1, [100, 100, 260, 420])]
+    bibs = [_bib([155, 280, 210, 335], conf=0.93)]
 
     assignments, unmatched = detector._assign_bibs_to_athletes(athletes, bibs)
 
@@ -804,8 +851,25 @@ def test_auto_performance_profile_preserves_small_target_resolution_without_cuda
     profile = resolve_performance_profile("auto", cuda_available=False)
 
     assert profile["name"] == "laptop"
-    assert profile["process_imgsz"] == 896
+    assert profile["process_imgsz"] == 832
     assert profile["adaptive_frame_skip"] is True
+
+
+def test_yolo_only_detector_keeps_ocr_pipeline_disabled():
+    detector = Detector(
+        model_path="fake.pt",
+        model=None,
+        ocr=object(),
+        realtime_ocr=True,
+        ocr_pipeline_enabled=False,
+    )
+
+    detector.set_ocr(object())
+
+    assert detector._ocr is None
+    assert detector.realtime_ocr_enabled is False
+    assert detector._ocr_running is False
+    assert detector._get_ocr_candidates(TrackState(prev_x=0, prev_y=0)) == []
 
 
 def test_laptop_profile_keeps_ocr_crop_on_original_frame():
@@ -824,7 +888,7 @@ def test_laptop_profile_keeps_ocr_crop_on_original_frame():
     detector.process_frame(frame, timestamp=0.0)
 
     assert model.source is frame
-    assert model.kwargs["imgsz"] == 896
+    assert model.kwargs["imgsz"] == 832
     state = detector._track_states[11]
     _, crop, frame_ref, bbox = state.bib_crops_cache[0]
     assert bbox == [720, 550, 840, 630]
@@ -965,6 +1029,40 @@ def test_small_detected_bib_candidate_keeps_fallback_as_secondary_evidence():
     assert candidates == [state.bib_crops_cache[0], state.fallback_bib_crops_cache[0]]
 
 
+def test_candidate_cache_keeps_only_best_crop_per_source_frame():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    state = TrackState(prev_x=0, prev_y=0)
+    first = BibEvidenceCandidate(
+        quality=0.50,
+        crop=np.full((40, 60, 3), 10, dtype=np.uint8),
+        frame=None,
+        frame_index=12,
+        capture_time_ms=400.0,
+        athlete_bbox=(100, 100, 260, 420),
+        bib_bbox=(150, 260, 210, 310),
+        source="detected",
+        owner_validated=True,
+    )
+    better = BibEvidenceCandidate(
+        quality=0.80,
+        crop=np.full((40, 60, 3), 20, dtype=np.uint8),
+        frame=None,
+        frame_index=12,
+        capture_time_ms=400.0,
+        athlete_bbox=(100, 100, 260, 420),
+        bib_bbox=(150, 260, 210, 310),
+        source="detected",
+        owner_validated=True,
+    )
+
+    detector._cache_ocr_candidate(state, first, detected_bib=True)
+    detector._cache_ocr_candidate(state, better, detected_bib=True)
+
+    assert len(state.bib_crops_cache) == 1
+    assert state.bib_crops_cache[0].quality == 0.80
+    assert int(state.bib_crops_cache[0].crop[0, 0, 0]) == 20
+
+
 def test_usable_detected_bib_candidates_keep_priority_without_fallback_noise():
     detector = Detector(model_path="fake.pt", model=None, ocr=None)
     real_crop = np.zeros((48, 64, 3), dtype=np.uint8)
@@ -998,7 +1096,7 @@ def test_implausibly_wide_bib_sequence_falls_back_to_athlete_evidence():
     assert candidates == state.fallback_bib_crops_cache
 
 
-def test_event_keeps_ranked_detected_bib_candidates_for_batch_consensus():
+def test_event_keeps_two_ranked_detected_bib_candidates_for_frame_consensus():
     frame = np.zeros((320, 320, 3), dtype=np.uint8)
     detector = Detector(
         model_path="fake.pt",
@@ -1021,7 +1119,7 @@ def test_event_keeps_ranked_detected_bib_candidates_for_batch_consensus():
 
     assert len(events) == 1
     assert events[0].bib_evidence_kind == "detected"
-    assert [int(candidate[1][0, 0, 0]) for candidate in events[0].bib_candidates] == [30, 60, 90]
+    assert [int(candidate[1][0, 0, 0]) for candidate in events[0].bib_candidates] == [30, 60]
 
 
 def test_event_marks_implausible_detected_bib_history_as_fallback_evidence():

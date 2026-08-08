@@ -526,6 +526,7 @@ class EventRecorder:
         event_dir.mkdir(parents=True, exist_ok=True)
         
         paths = {"full": None, "athlete": None, "bib": None, "bib_candidates": []}
+        bib_candidate_metadata = []
         
         # 原子写函数
         def atomic_save(img: np.ndarray, target_path: Path):
@@ -573,15 +574,25 @@ class EventRecorder:
             if atomic_save(event.bib_crop, bib_path):
                 paths["bib"] = "bib.jpg"
 
-        for index, candidate in enumerate(getattr(event, "bib_candidates", [])[:4], start=1):
+        for index, candidate in enumerate(getattr(event, "bib_candidates", [])[:2], start=1):
             if len(candidate) < 2:
                 continue
-            candidate_image = candidate[1]
+            candidate_image = getattr(candidate, "crop", candidate[1])
             if candidate_image is None or not isinstance(candidate_image, np.ndarray) or candidate_image.size == 0:
                 continue
             candidate_name = f"bib_candidate_{index:02d}.jpg"
             if atomic_save(candidate_image, event_dir / candidate_name):
                 paths["bib_candidates"].append(candidate_name)
+                bib_candidate_metadata.append({
+                    "path": candidate_name,
+                    "frame_index": int(getattr(candidate, "frame_index", -1)),
+                    "capture_time_ms": float(getattr(candidate, "capture_time_ms", 0.0)),
+                    "athlete_bbox": list(getattr(candidate, "athlete_bbox", event.bbox) or []),
+                    "bib_bbox": list(getattr(candidate, "bib_bbox", candidate[2] if len(candidate) > 2 else []) or []),
+                    "source": str(getattr(candidate, "source", "detected") or "detected"),
+                    "owner_validated": bool(getattr(candidate, "owner_validated", False)),
+                    "quality": float(getattr(candidate, "quality", candidate[0] if len(candidate) > 0 else 0.0)),
+                })
         
         # 4. 生成/更新 meta.json
         meta_path = event_dir / "meta.json"
@@ -611,6 +622,10 @@ class EventRecorder:
                 meta = self._create_initial_meta(event, paths)
         else:
             meta = self._create_initial_meta(event, paths)
+        if bib_candidate_metadata:
+            meta["bib_candidate_metadata"] = bib_candidate_metadata
+        elif "bib_candidate_metadata" not in meta:
+            meta["bib_candidate_metadata"] = []
         
         tmp_meta_path = event_dir / "meta.json.tmp"
         with open(tmp_meta_path, "w", encoding="utf-8") as f:

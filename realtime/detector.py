@@ -30,12 +30,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 if __package__:
     from .crossing_lifecycle import CrossingLifecycle
-    from .event_profile import EventProfile, build_event_profile
+    from .event_profile import EventProfile, build_sport_event_profile
     from .participant_identity import IdentityConfig, ParticipantIdentityManager
     from .participant_models import CrossingCandidate, ParticipantObservation
 else:
     from crossing_lifecycle import CrossingLifecycle
-    from event_profile import EventProfile, build_event_profile
+    from event_profile import EventProfile, build_sport_event_profile
     from participant_identity import IdentityConfig, ParticipantIdentityManager
     from participant_models import CrossingCandidate, ParticipantObservation
 
@@ -1404,11 +1404,7 @@ class Detector:
             str(sport_profile or "cycling").strip().lower() or "cycling"
         )
         if event_profile is None:
-            required_equipment = "bicycle" if normalized_sport_profile == "cycling" else None
-            event_profile = build_event_profile(
-                name=normalized_sport_profile,
-                required_equipment=required_equipment,
-            )
+            event_profile = build_sport_event_profile(normalized_sport_profile)
         self.event_profile = event_profile
         self.sport_profile = self.event_profile.name
         self._participant_identity_manager = ParticipantIdentityManager(
@@ -1456,9 +1452,21 @@ class Detector:
         self.iou_threshold = 0.65 if source_id == 0 else 0.60  # 马拉松并排人流：提高NMS阈值，减少互相压框
         self.ocr_conf_threshold = 0.55  # ✅ 优化: 拒绝低质量OCR
         self.bib_assignment_min_score_margin = 0.05
-        self.bib_assignment_min_rel_y = 0.25
-        self.bib_assignment_max_rel_y = 0.90
-        self.bib_assignment_min_overlap = 0.90
+        speed_skating_bibs = {
+            "helmet",
+            "left_thigh",
+            "right_thigh",
+        }.intersection(self.event_profile.bib_regions)
+        self.bib_assignment_min_rel_y = 0.02 if speed_skating_bibs else 0.25
+        self.bib_assignment_max_rel_y = 0.98 if speed_skating_bibs else 0.90
+        self.bib_assignment_min_overlap = 0.75 if speed_skating_bibs else 0.90
+        self.bib_preferred_rel_y_ranges = (
+            ((0.02, 0.30), (0.36, 0.98))
+            if speed_skating_bibs
+            else ((0.28, 0.90),)
+        )
+        self.profile_min_athlete_area_ratio = 0.0025 if speed_skating_bibs else 0.0
+        self.profile_min_athlete_height_ratio = 0.07 if speed_skating_bibs else 0.0
         self.untracked_detection_conf = 0.20
         self.ocr_detected_bib_min_width = 40
         self.ocr_detected_bib_min_height = 32
@@ -2082,10 +2090,13 @@ class Detector:
                     continue
 
                 center_score = max(0.0, 1.0 - abs(rel_x - 0.5) * 2.0)
-                if 0.28 <= rel_y <= 0.86:
-                    vertical_score = 1.0
-                else:
-                    vertical_score = max(0.0, 1.0 - min(abs(rel_y - 0.28), abs(rel_y - 0.86)) * 4.0)
+                vertical_distance = min(
+                    0.0
+                    if lower <= rel_y <= upper
+                    else min(abs(rel_y - lower), abs(rel_y - upper))
+                    for lower, upper in self.bib_preferred_rel_y_ranges
+                )
+                vertical_score = max(0.0, 1.0 - vertical_distance * 4.0)
 
                 athlete_cx = float(athlete.get('center_x', (ax1 + ax2) * 0.5))
                 athlete_cy = float(athlete.get('center_y', (ay1 + ay2) * 0.5))
@@ -3590,6 +3601,27 @@ class Detector:
                 return True
         return False
 
+    def _passes_profile_athlete_geometry(
+        self,
+        bbox: List[int],
+        frame_shape: Tuple[int, int],
+    ) -> bool:
+        """Reject distant spectator-sized boxes for profiles with a fixed finish camera."""
+        if self.profile_min_athlete_area_ratio <= 0.0:
+            return True
+        if bbox is None or len(bbox) != 4:
+            return False
+        height, width = int(frame_shape[0]), int(frame_shape[1])
+        x1, y1, x2, y2 = [int(value) for value in bbox]
+        box_width = max(0, x2 - x1)
+        box_height = max(0, y2 - y1)
+        area_ratio = (box_width * box_height) / max(1, width * height)
+        height_ratio = box_height / max(1, height)
+        return (
+            area_ratio >= self.profile_min_athlete_area_ratio
+            and height_ratio >= self.profile_min_athlete_height_ratio
+        )
+
     def set_crossing_direction(self, direction: Optional[str] = None):
         """设置过线方向"""
         self.crossing_direction = direction
@@ -4217,6 +4249,55 @@ class Detector:
         if len(cache) > state.max_cache_size:
             del cache[state.max_cache_size:]
 
+    def _extract_bib_fallbacks_from_athlete(
+        self,
+        frame: np.ndarray,
+        athlete_bbox: List[int],
+    ) -> List[Tuple[str, np.ndarray, List[int]]]:
+        """Extract profile-specific OCR regions when the detector has no bib box."""
+        if frame is None or athlete_bbox is None or len(athlete_bbox) != 4:
+            return []
+
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(value) for value in athlete_bbox]
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        if bw < 20 or bh < 24:
+            return []
+
+        region_specs = {
+            "torso": (("torso", 0.20, 0.18, 0.80, 0.74),),
+            "back": (("back", 0.16, 0.12, 0.84, 0.68),),
+            "rear_saddle": (
+                ("rear_saddle_left", 0.02, 0.34, 0.58, 0.88),
+                ("rear_saddle_right", 0.42, 0.34, 0.98, 0.88),
+            ),
+            "helmet": (
+                ("helmet_left", 0.02, 0.00, 0.58, 0.34),
+                ("helmet_right", 0.42, 0.00, 0.98, 0.34),
+            ),
+            "left_thigh": (("left_thigh", 0.00, 0.34, 0.62, 0.94),),
+            "right_thigh": (("right_thigh", 0.38, 0.34, 1.00, 0.94),),
+        }
+
+        results: List[Tuple[str, np.ndarray, List[int]]] = []
+        seen_boxes = set()
+        for region in self.event_profile.bib_regions:
+            for source, rx1, ry1, rx2, ry2 in region_specs.get(region, ()):
+                fx1 = max(0, x1 + int(round(bw * rx1)))
+                fy1 = max(0, y1 + int(round(bh * ry1)))
+                fx2 = min(w, x1 + int(round(bw * rx2)))
+                fy2 = min(h, y1 + int(round(bh * ry2)))
+                bbox = (fx1, fy1, fx2, fy2)
+                if bbox in seen_boxes or fx2 - fx1 < 14 or fy2 - fy1 < 14:
+                    continue
+                crop = frame[fy1:fy2, fx1:fx2].copy()
+                if crop.size == 0:
+                    continue
+                seen_boxes.add(bbox)
+                results.append((source, crop, list(bbox)))
+        return results
+
     def _extract_bib_fallback_from_athlete(self, frame: np.ndarray, athlete_bbox: List[int]) -> Tuple[Optional[np.ndarray], Optional[List[int]]]:
         """当未检出 bib 框时，从运动员框提取躯干区域作为 OCR 兜底输入。"""
         if frame is None or athlete_bbox is None or len(athlete_bbox) != 4:
@@ -4813,27 +4894,31 @@ class Detector:
                         if center_y < height * 0.36 and bw > int(width * 0.24):
                             continue
 
-                    fallback_crop, fallback_bbox = self._extract_bib_fallback_from_athlete(frame_original, athlete['bbox'])
-                    if fallback_crop is None:
+                    fallback_candidates = self._extract_bib_fallbacks_from_athlete(
+                        frame_original,
+                        athlete['bbox'],
+                    )
+                    if not fallback_candidates:
                         continue
 
-                    quality = self._calculate_image_quality(fallback_crop)
                     frame_ref = frame_original if athlete['bbox'][3] > int(height * 0.45) else None
-                    self._cache_ocr_candidate(
-                        state,
-                        BibEvidenceCandidate(
-                            quality=float(quality),
-                            crop=fallback_crop,
-                            frame=frame_ref,
-                            frame_index=int(self._frame_count),
-                            capture_time_ms=float(current_time) * 1000.0,
-                            athlete_bbox=tuple(int(value) for value in athlete['bbox']),
-                            bib_bbox=tuple(int(value) for value in fallback_bbox),
-                            source="fallback",
-                            owner_validated=False,
-                        ),
-                        detected_bib=False,
-                    )
+                    for source, fallback_crop, fallback_bbox in fallback_candidates:
+                        quality = self._calculate_image_quality(fallback_crop)
+                        self._cache_ocr_candidate(
+                            state,
+                            BibEvidenceCandidate(
+                                quality=float(quality),
+                                crop=fallback_crop,
+                                frame=frame_ref,
+                                frame_index=int(self._frame_count),
+                                capture_time_ms=float(current_time) * 1000.0,
+                                athlete_bbox=tuple(int(value) for value in athlete['bbox']),
+                                bib_bbox=tuple(int(value) for value in fallback_bbox),
+                                source=f"fallback:{source}",
+                                owner_validated=False,
+                            ),
+                            detected_bib=False,
+                        )
 
         # 4. 初始化 TrackState 并进行背景检测
         for athlete in athletes:
@@ -5798,6 +5883,26 @@ class Detector:
                             int(validation_bbox[0]) <= 1
                             or int(validation_bbox[2]) >= frame_width - 1
                         )
+                    if (
+                        validation_frame is not None
+                        and not self._passes_profile_athlete_geometry(
+                            validation_bbox,
+                            validation_frame.shape[:2],
+                        )
+                    ):
+                        state.vlm_is_background = True
+                        state.event_emitted = True
+                        self.last_rejected_candidates.append({
+                            "track_id": int(tid),
+                            "reason": "profile_geometry",
+                            "bbox": list(data['bbox']),
+                            "position": list(data['position']),
+                            "has_bib_box": bool(state.has_bib_box),
+                            "frame": data.get('frame'),
+                            "crop": crop,
+                            "bib_crop": state.best_bib_crop,
+                        })
+                        continue
                     if not self._passes_athlete_event_validation(
                         state,
                         crop,

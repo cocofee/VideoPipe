@@ -1,6 +1,8 @@
 param(
     [ValidateSet("OCR", "YOLO")]
     [string]$Variant = "OCR",
+    [ValidateSet("cycling", "speed_skating")]
+    [string]$SportProfile = "cycling",
     [string]$ModelPath,
     [string]$SourcePath,
     [string]$OcrModelsPath = "$HOME\.paddlex\official_models",
@@ -53,14 +55,17 @@ if ($ResolvedSource) {
     $SourceArg = $SourceName
 }
 
-if ($ModelArg -and $SourceArg) {
+if ($ModelArg) {
     $ModeArg = if ($Variant -eq "YOLO") { " --yolo-only" } else { " --ocr-cpu-threads 1" }
+    $SourceArgText = if ($SourceArg) { " --source `"$SourceArg`" --auto-start" } else { "" }
     $Launcher = @"
 @echo off
 cd /d "%~dp0"
-$AppName.exe --model "$ModelArg" --source "$SourceArg" --output RaceData --auto-start$ModeArg
+set "RACE_DIR=%~1"
+if not defined RACE_DIR set "RACE_DIR=RaceData"
+$AppName.exe --model "$ModelArg"$SourceArgText --output "%RACE_DIR%" --sport-profile $SportProfile$ModeArg
 "@
-    Set-Content -LiteralPath (Join-Path $AppDir "Start-$Variant-Test.cmd") -Value $Launcher -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $AppDir "Start-$Variant-$SportProfile.cmd") -Value $Launcher -Encoding ASCII
 }
 
 Write-Host "Built: $AppDir"

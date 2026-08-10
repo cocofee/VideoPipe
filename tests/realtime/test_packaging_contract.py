@@ -42,6 +42,8 @@ def test_build_script_validates_inputs_before_replacing_package():
     assert script.index("$ResolvedFfmpeg =") < build_index
     assert "$env:VIDEOPIPE_FFMPEG = $ResolvedFfmpeg" in script
     assert "--ocr-cpu-threads 1" in script
+    assert '--sport-profile $SportProfile' in script
+    assert 'Start-$Variant-$SportProfile.cmd' in script
 
 
 def test_main_window_never_constructs_full_paddleocr():

@@ -5,6 +5,26 @@ SUPPORTED_PIPELINES = {"athlete_bib"}
 SUPPORTED_CROSSING_MODES = {"finish_once", "multi_lap"}
 SUPPORTED_EQUIPMENT = {None, "bicycle"}
 
+SPORT_PROFILE_ALIASES = {
+    "road_cycling": "cycling",
+    "road-cycling": "cycling",
+    "roller_skating": "speed_skating",
+    "roller-skating": "speed_skating",
+    "inline_skating": "speed_skating",
+    "inline-skating": "speed_skating",
+}
+
+SPORT_PROFILE_DEFAULTS = {
+    "cycling": {
+        "required_equipment": "bicycle",
+        "bib_regions": ("rear_saddle", "back"),
+    },
+    "speed_skating": {
+        "required_equipment": None,
+        "bib_regions": ("helmet", "left_thigh", "right_thigh"),
+    },
+}
+
 
 @dataclass(frozen=True)
 class EventProfile:
@@ -51,4 +71,24 @@ def build_event_profile(
         pipeline=pipeline,
         crossing_mode=crossing_mode,
         bib_regions=bib_regions,
+    )
+
+
+def normalize_sport_profile(name: str) -> str:
+    normalized = str(name or "cycling").strip().lower().replace(" ", "_") or "cycling"
+    return SPORT_PROFILE_ALIASES.get(normalized, normalized)
+
+
+def build_sport_event_profile(
+    name: str,
+    *,
+    crossing_mode: str = "finish_once",
+) -> EventProfile:
+    normalized = normalize_sport_profile(name)
+    defaults = SPORT_PROFILE_DEFAULTS.get(normalized, {})
+    return build_event_profile(
+        name=normalized,
+        crossing_mode=crossing_mode,
+        required_equipment=defaults.get("required_equipment"),
+        bib_regions=defaults.get("bib_regions", ("torso", "back")),
     )

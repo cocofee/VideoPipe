@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from realtime.event_profile import EventProfile, build_event_profile
+from realtime.event_profile import EventProfile, build_event_profile, build_sport_event_profile
 
 
 def test_default_event_uses_the_common_athlete_bib_pipeline():
@@ -27,6 +27,22 @@ def test_event_profile_accepts_real_competition_differences_as_configuration():
     assert profile.pipeline == "athlete_bib"
     assert profile.required_equipment == "bicycle"
     assert profile.crossing_mode == "multi_lap"
+
+
+def test_speed_skating_profile_uses_helmet_and_thigh_bibs_without_bicycle_gate():
+    profile = build_sport_event_profile("roller_skating")
+
+    assert profile.name == "speed_skating"
+    assert profile.required_equipment is None
+    assert profile.bib_regions == ("helmet", "left_thigh", "right_thigh")
+
+
+def test_road_cycling_profile_keeps_bicycle_gate_and_rear_saddle_bib_region():
+    profile = build_sport_event_profile("road_cycling")
+
+    assert profile.name == "cycling"
+    assert profile.required_equipment == "bicycle"
+    assert profile.bib_regions == ("rear_saddle", "back")
 
 
 def test_unknown_pipeline_fails_instead_of_silently_switching_algorithms():

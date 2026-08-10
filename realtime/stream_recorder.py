@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,6 +102,7 @@ class FfmpegStreamRecorder:
 
         self._process: Optional[subprocess.Popen] = None
         self._output_path: Optional[Path] = None
+        self._output_paths: list[Path] = []
         self._started_at: Optional[datetime] = None
         self._stop_requested = False
         self._last_error: Optional[str] = None
@@ -113,6 +115,10 @@ class FfmpegStreamRecorder:
         return self._output_path
 
     @property
+    def output_paths(self) -> tuple[Path, ...]:
+        return tuple(self._output_paths)
+
+    @property
     def started_at(self) -> Optional[datetime]:
         return self._started_at
 
@@ -122,12 +128,13 @@ class FfmpegStreamRecorder:
 
     @property
     def size_bytes(self) -> int:
-        if self._output_path is None:
-            return 0
-        try:
-            return self._output_path.stat().st_size
-        except OSError:
-            return 0
+        total = 0
+        for output_path in self._output_paths:
+            try:
+                total += output_path.stat().st_size
+            except OSError:
+                continue
+        return total
 
     def _next_output_path(self, started_at: datetime) -> Path:
         stamp = started_at.strftime("%Y%m%d_%H%M%S")
@@ -202,6 +209,7 @@ class FfmpegStreamRecorder:
 
         self._process = process
         self._output_path = output_path
+        self._output_paths.append(output_path)
         self._started_at = started_at
         self._stop_requested = False
         self._last_error = None
@@ -257,6 +265,28 @@ class FfmpegStreamRecorder:
             message = f"{message}: {detail}"
         self._last_error = message
         return message
+
+    def restart(self) -> Path:
+        """Start a new MKV segment after an unexpected FFmpeg exit."""
+        if self.is_running:
+            raise RecordingError("当前录像进程仍在运行，不能自动续录")
+
+        process = self._process
+        stderr_thread = self._stderr_thread
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1.0)
+        if process is not None:
+            for stream_name in ("stdin", "stderr"):
+                stream = getattr(process, stream_name, None)
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+
+        self._process = None
+        self._stderr_thread = None
+        return self.start()
 
     def stop(self) -> Optional[Path]:
         process = self._process
@@ -321,13 +351,21 @@ class ManualRecordingManager:
         *,
         ffmpeg_path: Optional[Path] = None,
         recorder_factory: Callable[..., FfmpegStreamRecorder] = FfmpegStreamRecorder,
+        max_restart_attempts: int = 3,
+        restart_window_seconds: float = 60.0,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         self.sources = list(sources)
         self.output_dir = Path(output_dir)
         self.ffmpeg_path = ffmpeg_path
         self._recorder_factory = recorder_factory
+        self.max_restart_attempts = max(1, int(max_restart_attempts))
+        self.restart_window_seconds = max(1.0, float(restart_window_seconds))
+        self._monotonic = monotonic
         self._recorders: list[FfmpegStreamRecorder] = []
         self._started_at: Optional[datetime] = None
+        self._restart_attempts: dict[int, deque[float]] = {}
+        self._last_recovery_notice: Optional[str] = None
 
     @property
     def is_recording(self) -> bool:
@@ -335,11 +373,14 @@ class ManualRecordingManager:
 
     @property
     def output_paths(self) -> tuple[Path, ...]:
-        return tuple(
-            recorder.output_path
-            for recorder in self._recorders
-            if recorder.output_path is not None
-        )
+        paths: list[Path] = []
+        for recorder in self._recorders:
+            recorder_paths = tuple(getattr(recorder, "output_paths", ()) or ())
+            if recorder_paths:
+                paths.extend(recorder_paths)
+            elif recorder.output_path is not None:
+                paths.append(recorder.output_path)
+        return tuple(paths)
 
     @property
     def total_size_bytes(self) -> int:
@@ -384,6 +425,8 @@ class ManualRecordingManager:
             raise RecordingError(sanitize_recording_message(exc)) from exc
 
         self._recorders = started
+        self._restart_attempts.clear()
+        self._last_recovery_notice = None
         self._started_at = min(
             (recorder.started_at for recorder in started if recorder.started_at is not None),
             default=datetime.now().astimezone(),
@@ -393,9 +436,43 @@ class ManualRecordingManager:
     def check_error(self) -> Optional[str]:
         for recorder in self._recorders:
             error = recorder.check_error()
-            if error:
-                return f"机位 {recorder.camera_index}: {error}"
+            if not error:
+                continue
+
+            now = self._monotonic()
+            attempts = self._restart_attempts.setdefault(
+                recorder.camera_index,
+                deque(),
+            )
+            cutoff = now - self.restart_window_seconds
+            while attempts and attempts[0] < cutoff:
+                attempts.popleft()
+            if len(attempts) >= self.max_restart_attempts:
+                return (
+                    f"机位 {recorder.camera_index}: {error}; "
+                    f"{self.restart_window_seconds:.0f} 秒内自动续录已达 "
+                    f"{self.max_restart_attempts} 次"
+                )
+
+            try:
+                output_path = recorder.restart()
+            except Exception as exc:
+                return (
+                    f"机位 {recorder.camera_index}: {error}; "
+                    f"自动续录失败: {sanitize_recording_message(exc)}"
+                )
+
+            attempts.append(now)
+            self._last_recovery_notice = (
+                f"机位 {recorder.camera_index} RTSP 连接中断，"
+                f"已自动续录到 {output_path.name}"
+            )
         return None
+
+    def consume_recovery_notice(self) -> Optional[str]:
+        notice = self._last_recovery_notice
+        self._last_recovery_notice = None
+        return notice
 
     def stop(self) -> tuple[Path, ...]:
         recorders = list(self._recorders)

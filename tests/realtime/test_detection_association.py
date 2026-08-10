@@ -1007,6 +1007,65 @@ def test_event_evidence_prefers_detected_bib_over_torso_fallback():
     assert np.array_equal(events[0].bib_crop, detected_crop)
 
 
+def test_speed_skating_profile_accepts_helmet_bib_association():
+    athlete = {"bbox": [100, 100, 300, 500], "track_id": 7}
+    helmet_bib = {
+        "bbox": [175, 108, 225, 132],
+        "center_x": 200,
+        "center_y": 120,
+        "conf": 0.9,
+    }
+    speed_skating = Detector(
+        model_path="fake.pt",
+        model=None,
+        ocr=None,
+        sport_profile="speed_skating",
+    )
+    cycling = Detector(model_path="fake.pt", model=None, ocr=None, sport_profile="cycling")
+
+    speed_assignments, _ = speed_skating._assign_bibs_to_athletes([athlete], [helmet_bib])
+    cycling_assignments, _ = cycling._assign_bibs_to_athletes([athlete], [helmet_bib])
+
+    assert speed_assignments == {0: [0]}
+    assert cycling_assignments == {}
+
+
+def test_speed_skating_fallbacks_cover_helmet_and_both_thighs():
+    detector = Detector(
+        model_path="fake.pt",
+        model=None,
+        ocr=None,
+        sport_profile="speed_skating",
+    )
+    frame = np.zeros((600, 800, 3), dtype=np.uint8)
+
+    candidates = detector._extract_bib_fallbacks_from_athlete(
+        frame,
+        [100, 100, 500, 500],
+    )
+    sources = {source for source, _, _ in candidates}
+
+    assert {"helmet_left", "helmet_right", "left_thigh", "right_thigh"} <= sources
+    assert all(crop.size > 0 for _, crop, _ in candidates)
+
+
+def test_speed_skating_profile_rejects_spectator_sized_boxes_only():
+    speed_skating = Detector(
+        model_path="fake.pt",
+        model=None,
+        ocr=None,
+        sport_profile="speed_skating",
+    )
+    cycling = Detector(model_path="fake.pt", model=None, ocr=None, sport_profile="cycling")
+    frame_shape = (1440, 2560)
+    small_spectator = [1218, 451, 1266, 496]
+    finish_skater = [1086, 601, 1345, 954]
+
+    assert speed_skating._passes_profile_athlete_geometry(small_spectator, frame_shape) is False
+    assert speed_skating._passes_profile_athlete_geometry(finish_skater, frame_shape) is True
+    assert cycling._passes_profile_athlete_geometry(small_spectator, frame_shape) is True
+
+
 def test_resolve_athlete_validator_prefers_config_then_default(tmp_path):
     configured = tmp_path / "configured.pt"
     configured.write_bytes(b"configured")

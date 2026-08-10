@@ -77,12 +77,16 @@ class _Manager:
     def check_error(self):
         return None
 
+    def consume_recovery_notice(self):
+        return None
+
 
 class _Harness:
     _format_recording_duration = staticmethod(MainWindow._format_recording_duration)
     _refresh_recording_ui = MainWindow._refresh_recording_ui
     _start_manual_recording = MainWindow._start_manual_recording
     _stop_manual_recording = MainWindow._stop_manual_recording
+    _poll_recording_status = MainWindow._poll_recording_status
 
     def __init__(self, tmp_path):
         self._race_ready = True
@@ -143,3 +147,18 @@ def test_manual_recording_requires_running_detection(monkeypatch, tmp_path):
 
     assert window.recording_manager is None
     assert warnings == [("提示", "请先启动AI检测，再开始录像。")]
+
+
+def test_recording_poll_shows_auto_recovery_notice(tmp_path):
+    window = _Harness(tmp_path)
+    manager = _Manager(tmp_path / "videos")
+    manager.is_recording = True
+    manager.consume_recovery_notice = lambda: "机位 1 RTSP 连接中断，已自动续录"
+    window.recording_manager = manager
+
+    window._poll_recording_status()
+
+    assert window.recording_manager is manager
+    assert window._recording_poll_timer.active is False
+    assert window.statusBar().message == "机位 1 RTSP 连接中断，已自动续录"
+    assert window.record_btn.text == "停止录像"

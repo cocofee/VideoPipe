@@ -149,6 +149,30 @@ def test_recorder_drains_and_redacts_ffmpeg_errors(tmp_path):
     assert "rtsp://admin:***@192.0.2.10/live" in error
 
 
+def test_recorder_restart_keeps_previous_segment(tmp_path):
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffmpeg.write_bytes(b"binary")
+    factory = _ProcessFactory()
+    recorder = FfmpegStreamRecorder(
+        "rtsp://camera/live",
+        tmp_path / "videos",
+        camera_index=1,
+        ffmpeg_path=ffmpeg,
+        popen_factory=factory,
+        clock=lambda: datetime(2026, 8, 10, 22, 0, 0, tzinfo=timezone.utc),
+    )
+
+    first_path = recorder.start()
+    factory.processes[0].returncode = 1
+    second_path = recorder.restart()
+
+    assert first_path.name == "camera_01_20260810_220000.mkv"
+    assert second_path.name == "camera_01_20260810_220000_02.mkv"
+    assert recorder.output_paths == (first_path, second_path)
+    assert recorder.size_bytes == len(b"recorded") * 2
+    assert recorder.stop() == second_path
+
+
 def test_manager_starts_one_recorder_per_rtsp_source(tmp_path):
     created = []
 
@@ -191,6 +215,69 @@ def test_manager_starts_one_recorder_per_rtsp_source(tmp_path):
         tmp_path / "videos" / "camera_03.mkv",
     )
     assert manager.stop() == paths
+
+
+def test_manager_auto_restarts_failed_recorder_and_reports_new_segment(tmp_path):
+    created = []
+
+    class _RecoverableRecorder:
+        def __init__(self, source, output_dir, *, camera_index, ffmpeg_path):
+            self.source = source
+            self.output_dir = output_dir
+            self.camera_index = camera_index
+            self.output_path = None
+            self.output_paths = ()
+            self.started_at = datetime.now().astimezone()
+            self.is_running = False
+            self.size_bytes = 0
+            self.failed = False
+            created.append(self)
+
+        def start(self):
+            self.output_path = self.output_dir / "camera_01_first.mkv"
+            self.output_paths = (self.output_path,)
+            self.is_running = True
+            return self.output_path
+
+        def check_error(self):
+            if self.failed:
+                self.failed = False
+                self.is_running = False
+                return "Error number -10054 occurred"
+            return None
+
+        def restart(self):
+            self.output_path = self.output_dir / "camera_01_second.mkv"
+            self.output_paths = (*self.output_paths, self.output_path)
+            self.is_running = True
+            return self.output_path
+
+        def stop(self):
+            self.is_running = False
+            return self.output_path
+
+    manager = ManualRecordingManager(
+        ["rtsp://camera/live"],
+        tmp_path / "videos",
+        recorder_factory=_RecoverableRecorder,
+    )
+    manager.start()
+    created[0].failed = True
+
+    assert manager.check_error() is None
+    assert manager.is_recording is True
+    assert manager.output_paths == (
+        tmp_path / "videos" / "camera_01_first.mkv",
+        tmp_path / "videos" / "camera_01_second.mkv",
+    )
+    assert manager.consume_recovery_notice() == (
+        "机位 1 RTSP 连接中断，已自动续录到 camera_01_second.mkv"
+    )
+    assert manager.consume_recovery_notice() is None
+    assert manager.stop() == (
+        tmp_path / "videos" / "camera_01_first.mkv",
+        tmp_path / "videos" / "camera_01_second.mkv",
+    )
 
 
 def test_manager_requires_an_rtsp_source(tmp_path):

@@ -94,6 +94,7 @@ try:
     from .ocr_manager import OCRManager
     from .io_utils import read_image_unicode, write_image_unicode
     from .field_issue_log import FIELD_ISSUE_CATEGORIES, FieldIssueLog
+    from .event_profile import normalize_sport_profile
     from .runtime_paths import application_dir, find_model as find_runtime_model, resolve_output_dir, resolve_runtime_path, resolve_source
     from .stream_recorder import ManualRecordingManager, RecordingError, is_rtsp_source
 except ImportError:
@@ -113,6 +114,7 @@ except ImportError:
     from ocr_manager import OCRManager
     from io_utils import read_image_unicode, write_image_unicode
     from field_issue_log import FIELD_ISSUE_CATEGORIES, FieldIssueLog
+    from event_profile import normalize_sport_profile
     from runtime_paths import application_dir, find_model as find_runtime_model, resolve_output_dir, resolve_runtime_path, resolve_source
     from stream_recorder import ManualRecordingManager, RecordingError, is_rtsp_source
 
@@ -2157,6 +2159,8 @@ class MainWindow(QMainWindow):
         self.config = config
         self._yolo_only_mode = bool(config.get("yolo_only_mode", False))
         self.config["yolo_only_mode"] = self._yolo_only_mode
+        self.sport_profile = normalize_sport_profile(config.get("sport_profile", "cycling"))
+        self.config["sport_profile"] = self.sport_profile
 
         # 连接信号
         self.event_saved_signal.connect(self._on_event_saved_ui)
@@ -3206,6 +3210,10 @@ class MainWindow(QMainWindow):
             return
         self._athlete_validator_checked = True
 
+        if self.sport_profile != "cycling":
+            logger.info(f"[Main] {self.sport_profile} profile does not require bicycle validation")
+            return
+
         if not bool(self.config.get("athlete_validator_enabled", True)):
             logger.info("[Main] 运动员二次校验已禁用")
             return
@@ -4134,6 +4142,7 @@ class MainWindow(QMainWindow):
                     gate_guard_enabled=bool(self._gate_guard_enabled),
                     athlete_validator=self.shared_athlete_validator,
                     performance_profile=str(self.config.get("performance_profile") or "auto"),
+                    sport_profile=self.sport_profile,
                     event_settle_seconds=(
                         LOCAL_VIDEO_EVENT_SETTLE_SECONDS
                         if StreamReader.is_video_file_source(source)
@@ -4413,6 +4422,12 @@ class MainWindow(QMainWindow):
             self._refresh_recording_ui()
             QMessageBox.warning(self, "录像中断", error)
             return
+
+        consume_notice = getattr(manager, "consume_recovery_notice", None)
+        notice = consume_notice() if callable(consume_notice) else None
+        if notice:
+            logger.warning(f"[Recording] {notice}")
+            self.statusBar().showMessage(notice)
         self._refresh_recording_ui()
 
     def start_when_race_ready(self):
@@ -4573,6 +4588,7 @@ class MainWindow(QMainWindow):
                     gate_guard_enabled=bool(self._gate_guard_enabled),
                     athlete_validator=self.shared_athlete_validator,
                     performance_profile=str(self.config.get("performance_profile") or "auto"),
+                    sport_profile=self.sport_profile,
                     event_settle_seconds=(
                         LOCAL_VIDEO_EVENT_SETTLE_SECONDS
                         if i < len(self.sources) and StreamReader.is_video_file_source(self.sources[i])
@@ -5472,6 +5488,13 @@ def main():
     parser.add_argument('--ocr-cpu-threads', type=int, default=2,
                        help='本地 OCR 使用的 CPU 线程数（1-4）')
 
+    parser.add_argument(
+        '--sport-profile',
+        choices=('cycling', 'speed_skating'),
+        default=None,
+        help='Event profile: cycling or speed_skating',
+    )
+
     args = parser.parse_args()
     runtime_root = application_dir()
 
@@ -5500,6 +5523,7 @@ def main():
         'runtime_dir': str(runtime_root),
         'yolo_only_mode': bool(args.yolo_only),
         'ocr_cpu_threads': max(1, min(4, int(args.ocr_cpu_threads))),
+        'sport_profile': args.sport_profile or 'cycling',
         'finish_line': {
             'x1': x1, 'y1': y1,
             'x2': x2, 'y2': y2,
@@ -5537,6 +5561,8 @@ def main():
     config['ocr_cpu_threads'] = max(1, min(4, int(args.ocr_cpu_threads)))
     if args.model:
         config['model_path'] = model_path
+    if args.sport_profile:
+        config['sport_profile'] = args.sport_profile
 
     app = QApplication(sys.argv)
     window = MainWindow(config)

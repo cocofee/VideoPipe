@@ -544,6 +544,7 @@ class VideoThread(QThread):
     event_detected = pyqtSignal(object)  # CrossingEvent
     bib_updated = pyqtSignal(int, str, float, object, int, object, object, object)  # track_id, bib, conf, status, source_id, bib_crop, athlete_crop, full_frame
     status_changed = pyqtSignal(object, int)  # StreamStatus, source_id
+    roi_auto_disabled = pyqtSignal(int)  # source_id
 
     def __init__(self, reader: StreamReader, detector: Detector, source_id: int = 0, ui_skip: int = 2):
         super().__init__()
@@ -634,6 +635,9 @@ class VideoThread(QThread):
             except Exception as e:
                 logger.exception(f"[VideoThread-{self.source_id}] process_frame 异常: {e}")
                 events, athletes, bibs = [], [], []
+            detector_metrics = dict(getattr(self.detector, "last_frame_metrics", {}) or {})
+            if detector_metrics.get("roi_auto_disabled"):
+                self.roi_auto_disabled.emit(self.source_id)
             if envelope is not None:
                 processing_time_ms = (time.monotonic() - processing_started) * 1000.0
                 envelope = envelope.with_processing_time(processing_time_ms)
@@ -642,7 +646,6 @@ class VideoThread(QThread):
                 if capture_latency_ms < 0 or capture_latency_ms > 60_000:
                     capture_latency_ms = None
                 queue_latency_ms = max(0.0, processing_started_wall_ms - envelope.arrival_time_ms)
-                detector_metrics = dict(getattr(self.detector, "last_frame_metrics", {}) or {})
                 try:
                     reader_metrics = dict(self.reader.get_info() or {})
                 except Exception:
@@ -3324,8 +3327,11 @@ class MainWindow(QMainWindow):
             label = self.video_labels[source_id]
             label.set_show_roi(is_enabled)
             if is_enabled:
-                try: label.roi_changed.connect(self._on_roi_changed)
-                except: pass
+                try:
+                    label.roi_changed.disconnect(self._on_roi_changed)
+                except Exception:
+                    pass
+                label.roi_changed.connect(self._on_roi_changed)
                 label.set_roi_points(self.roi_points)
             else:
                 try: label.roi_changed.disconnect(self._on_roi_changed)
@@ -4471,6 +4477,7 @@ class MainWindow(QMainWindow):
                 thread.event_detected.connect(self._on_event_detected)
                 thread.bib_updated.connect(self._on_bib_updated)
                 thread.status_changed.connect(self._update_conn_status)
+                thread.roi_auto_disabled.connect(self._on_roi_auto_disabled)
                 self.video_threads[source_id] = thread
                 thread.start()
 
@@ -4966,6 +4973,40 @@ class MainWindow(QMainWindow):
             
         self._save_config()
         self.statusBar().showMessage(f"机位 {source_id} ROI 区域已更新 (共 {len(points)} 个点，已自动保存)")
+
+    def _on_roi_auto_disabled(self, source_id: int):
+        """Keep the UI and persisted config aligned with detector ROI recovery."""
+        if not self.roi_enabled.get(source_id, False):
+            return
+
+        self.roi_enabled[source_id] = False
+        self.config['roi_enabled'] = dict(self.roi_enabled)
+
+        checkbox = getattr(self, 'roi_checkboxes', {}).get(source_id)
+        if checkbox is not None:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
+
+        label = self.video_labels.get(source_id)
+        if label is not None:
+            label.set_show_roi(False)
+            try:
+                label.roi_changed.disconnect(self._on_roi_changed)
+            except Exception:
+                pass
+
+        detector = self.detectors.get(source_id)
+        if detector is not None:
+            detector.set_roi_polygon(None)
+
+        self._save_config()
+        logger.warning(
+            f"[Main] 机位 {source_id} ROI 过滤过强，已自动关闭并保存；终点线过滤仍保持启用"
+        )
+        self.statusBar().showMessage(
+            f"机位 {source_id + 1} ROI 过滤过强，已自动关闭以避免漏拍运动员"
+        )
 
     def _on_event_saved_callback(self, event_id: int):
         """记录器保存完事件后的回调 (在后台线程执行)"""

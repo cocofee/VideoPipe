@@ -24,6 +24,9 @@ class IdentityConfig:
     simultaneous_window_ms: float = 0.0
     min_direction_motion_ratio: float = 0.05
     min_direction_cosine: float = 0.0
+    max_exact_track_jump_ratio: float = 1.0
+    hard_exact_track_jump_ratio: float = 4.0
+    max_exact_track_reverse_cosine: float = -0.25
     bib_layout_weight: float = 0.03
     participant_retention_ms: float = 30_000.0
     raw_track_retention_ms: float = 5_000.0
@@ -85,6 +88,16 @@ class ParticipantIdentityManager:
                     self._raw_track_map.pop(raw_track_key, None)
                     self._raw_track_last_seen_ms.pop(raw_track_key, None)
                 else:
+                    discontinuity_reasons = self._exact_track_discontinuity_reasons(
+                        participant,
+                        observation,
+                    )
+                    if discontinuity_reasons:
+                        return self._create_participant(
+                            observation,
+                            identity_status="ACTIVE",
+                            reasons=discontinuity_reasons,
+                        )
                     self._update_participant(participant, observation)
                     return IdentityResolution(
                         participant=participant,
@@ -136,6 +149,59 @@ class ParticipantIdentityManager:
             identity_status="ACTIVE",
             reasons=("no_matching_participant",),
         )
+
+    def _exact_track_discontinuity_reasons(
+        self,
+        participant: ParticipantIdentity,
+        observation: ParticipantObservation,
+    ) -> tuple[str, ...]:
+        """Detect tracker-ID reuse after an athlete has left the frame."""
+        if participant.last_bbox is None:
+            return ()
+        state = self._states.get(participant.participant_id)
+        if state is None:
+            return ()
+
+        elapsed_ms = observation.capture_time_ms - participant.last_seen_ms
+        if elapsed_ms < 0.0:
+            return ()
+
+        observed_center = _center(observation.participant_bbox)
+        jump_ratio = _center_distance_ratio(
+            state.last_center,
+            observed_center,
+            participant.last_bbox,
+            observation.participant_bbox,
+        )
+        if jump_ratio < self.config.max_exact_track_jump_ratio:
+            return ()
+
+        direction_cosine = None
+        if elapsed_ms > 0.0:
+            direction_cosine = _direction_cosine(
+                state,
+                observed_center,
+                elapsed_ms,
+                participant.last_bbox,
+                observation.participant_bbox,
+                self.config.min_direction_motion_ratio,
+            )
+        hard_jump = jump_ratio >= self.config.hard_exact_track_jump_ratio
+        reversed_jump = (
+            direction_cosine is not None
+            and direction_cosine <= self.config.max_exact_track_reverse_cosine
+        )
+        if not (hard_jump or reversed_jump):
+            return ()
+
+        reasons = [
+            "raw_track_discontinuity",
+            f"elapsed_ms={elapsed_ms:.1f}",
+            f"center_jump_ratio={jump_ratio:.3f}",
+        ]
+        if direction_cosine is not None:
+            reasons.append(f"direction_cosine={direction_cosine:.3f}")
+        return tuple(reasons)
 
     def _match_candidates(
         self, observation: ParticipantObservation

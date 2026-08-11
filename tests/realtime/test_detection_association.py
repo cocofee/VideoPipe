@@ -157,6 +157,65 @@ class _OriginalFrameTrackingModel:
         return [SimpleNamespace(boxes=_Boxes(), names=self.names)]
 
 
+class _VerticalFinishCrossingModel:
+    names = {0: "person"}
+
+    def __init__(self):
+        self._centers = iter((400, 350, 300))
+
+    def track(self, frame, **kwargs):
+        center_x = next(self._centers)
+        boxes = _SimpleBoxes(
+            cls=[0],
+            conf=[0.95],
+            xyxy=[[center_x - 50, 300, center_x + 50, 500]],
+            ids=[11],
+        )
+        return [SimpleNamespace(boxes=boxes, names=self.names)]
+
+
+class _UpperEndpointFinishCrossingModel:
+    names = {0: "person"}
+
+    def __init__(self):
+        self._centers = iter((400, 350, 300))
+
+    def track(self, frame, **kwargs):
+        center_x = next(self._centers)
+        boxes = _SimpleBoxes(
+            cls=[0],
+            conf=[0.95],
+            xyxy=[[center_x - 50, 10, center_x + 50, 90]],
+            ids=[11],
+        )
+        return [SimpleNamespace(boxes=boxes, names=self.names)]
+
+
+class _ApproachingUpperEndpointFinishCrossingModel:
+    names = {0: "person"}
+
+    def __init__(self):
+        self._positions = iter(
+            (
+                (520, 20),
+                (460, 20),
+                (400, 20),
+                (350, 45),
+                (300, 50),
+            )
+        )
+
+    def track(self, frame, **kwargs):
+        center_x, bottom_y = next(self._positions)
+        boxes = _SimpleBoxes(
+            cls=[0],
+            conf=[0.95],
+            xyxy=[[center_x - 50, bottom_y - 80, center_x + 50, bottom_y]],
+            ids=[11],
+        )
+        return [SimpleNamespace(boxes=boxes, names=self.names)]
+
+
 class _BackgroundBibTrackingModel:
     names = {0: "bike", 1: "BIB"}
 
@@ -213,6 +272,86 @@ class _RawBibCaptureTrackingModel:
             ),
             names=self.names,
         )
+        return [tracked_result]
+
+
+class _RawPersonCaptureTrackingModel:
+    names = {0: "person"}
+
+    def __init__(self):
+        self.postprocess_callbacks = []
+
+    def add_callback(self, event, callback):
+        if event == "on_predict_postprocess_end":
+            self.postprocess_callbacks.append(callback)
+
+    def track(self, frame, **kwargs):
+        raw_result = SimpleNamespace(
+            boxes=_SimpleBoxes(
+                cls=[0, 0, 0],
+                conf=[0.95, 0.90, 0.88],
+                xyxy=[
+                    [10, 140, 190, 300],
+                    [200, 140, 280, 300],
+                    [200, 20, 260, 100],
+                ],
+            ),
+            names=self.names,
+        )
+        predictor = SimpleNamespace(results=[raw_result])
+        for callback in self.postprocess_callbacks:
+            callback(predictor)
+
+        tracked_result = SimpleNamespace(
+            boxes=_SimpleBoxes(
+                cls=[0],
+                conf=[0.95],
+                xyxy=[[40, 140, 120, 300]],
+                ids=[11],
+            ),
+            names=self.names,
+        )
+        return [tracked_result]
+
+
+class _RawEdgeEntryTrackingModel:
+    names = {0: "person"}
+
+    def __init__(self):
+        self.frame_index = 0
+        self.postprocess_callbacks = []
+
+    def add_callback(self, event, callback):
+        if event == "on_predict_postprocess_end":
+            self.postprocess_callbacks.append(callback)
+
+    def track(self, frame, **kwargs):
+        self.frame_index += 1
+        if self.frame_index == 1:
+            raw_xyxy = [[608, 220, 639, 430]]
+            tracked_result = SimpleNamespace(
+                boxes=_SimpleBoxes(cls=[], conf=[], xyxy=[]),
+                names=self.names,
+            )
+        else:
+            raw_xyxy = [[575, 230, 639, 440]]
+            tracked_result = SimpleNamespace(
+                boxes=_SimpleBoxes(
+                    cls=[0],
+                    conf=[0.91],
+                    xyxy=[[592, 230, 632, 440]],
+                    ids=[117],
+                ),
+                names=self.names,
+            )
+
+        raw_result = SimpleNamespace(
+            boxes=_SimpleBoxes(cls=[0], conf=[0.91], xyxy=raw_xyxy),
+            names=self.names,
+        )
+        predictor = SimpleNamespace(results=[raw_result])
+        for callback in self.postprocess_callbacks:
+            callback(predictor)
         return [tracked_result]
 
 
@@ -380,6 +519,27 @@ def test_slow_nested_unknown_track_is_deduplicated_without_merging_real_riders()
     assert detector._is_duplicate_unknown_event_bbox(slow_duplicate, first, time_diff=0.87) is True
     assert detector._is_duplicate_unknown_event_bbox(hevc_duplicate, hevc_first, time_diff=0.67) is True
     assert detector._is_duplicate_unknown_event_bbox(second_real_rider, first_real_rider, time_diff=0.0) is False
+
+
+def test_distinct_participants_are_not_deduplicated_by_nested_unknown_boxes():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    first = [1062, 452, 1378, 865]
+    second = [1120, 446, 1401, 852]
+
+    assert detector._is_duplicate_unknown_event_bbox(
+        second,
+        first,
+        time_diff=0.84,
+        current_participant_id="P000110",
+        previous_participant_id="P000111",
+    ) is False
+    assert detector._is_duplicate_unknown_event_bbox(
+        second,
+        first,
+        time_diff=0.84,
+        current_participant_id="P000111",
+        previous_participant_id="P000111",
+    ) is True
 
 
 def test_scale_changed_unknown_track_from_long_video_is_deduplicated():
@@ -601,6 +761,22 @@ def test_explicit_event_profile_overrides_legacy_sport_name():
         crop,
     ) is True
     assert validator.calls == 0
+
+
+def test_speed_skating_profile_keeps_the_full_finish_segment_available():
+    profile = build_event_profile(
+        name="speed_skating",
+        bib_regions=("helmet", "left_thigh", "right_thigh"),
+    )
+    detector = Detector(
+        model_path="fake.pt",
+        model=None,
+        ocr=None,
+        event_profile=profile,
+    )
+
+    assert detector.finish_segment_margin_px == 60.0
+    assert detector.finish_segment_end_shrink_px == 0.0
 
 
 def test_blank_legacy_sport_profile_preserves_cycling_validation():
@@ -982,6 +1158,59 @@ def test_raw_bib_detection_is_kept_when_tracker_returns_only_athlete():
     assert state.bib_crops_cache[0][3] == [120, 140, 160, 170]
 
 
+def test_raw_near_track_person_is_kept_when_tracker_drops_new_athlete():
+    model = _RawPersonCaptureTrackingModel()
+    detector = Detector(model_path="fake.pt", model=model, ocr=None)
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+
+    _, athletes, _ = detector.process_frame(frame, timestamp=0.0)
+
+    assert len(athletes) == 2
+    assert sorted(athlete["bbox"] for athlete in athletes) == [
+        [40, 140, 120, 300],
+        [200, 140, 280, 300],
+    ]
+    assert {athlete["track_id"] for athlete in athletes} == {11, 900000}
+
+
+def test_edge_entry_athlete_keeps_raw_box_when_tracker_clips_it_too_narrow():
+    detector = Detector(
+        model_path="fake.pt",
+        model=_RawEdgeEntryTrackingModel(),
+        ocr=None,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    _, first_athletes, _ = detector.process_frame(frame, timestamp=0.0)
+    _, second_athletes, _ = detector.process_frame(frame, timestamp=0.04)
+
+    assert [athlete["bbox"] for athlete in first_athletes] == [[608, 220, 639, 430]]
+    assert [athlete["bbox"] for athlete in second_athletes] == [[575, 230, 639, 440]]
+    assert first_athletes[0]["track_id"] == second_athletes[0]["track_id"] == 900000
+
+
+def test_edge_aspect_exception_does_not_accept_a_tall_side_pillar():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+
+    assert detector._passes_athlete_aspect_filter(
+        [616, 230, 639, 355],
+        0.68,
+        (640, 640),
+    ) is True
+    assert detector._passes_athlete_aspect_filter(
+        [610, 100, 639, 500],
+        0.95,
+        (640, 640),
+    ) is False
+
+
 def test_event_evidence_prefers_detected_bib_over_torso_fallback():
     frame = np.zeros((320, 320, 3), dtype=np.uint8)
     detected_crop = np.full((24, 28, 3), 180, dtype=np.uint8)
@@ -1064,6 +1293,82 @@ def test_speed_skating_profile_rejects_spectator_sized_boxes_only():
     assert speed_skating._passes_profile_athlete_geometry(small_spectator, frame_shape) is False
     assert speed_skating._passes_profile_athlete_geometry(finish_skater, frame_shape) is True
     assert cycling._passes_profile_athlete_geometry(small_spectator, frame_shape) is True
+
+
+def test_speed_skating_unknown_athlete_crosses_vertical_finish_line():
+    detector = Detector(
+        model_path="fake.pt",
+        model=_VerticalFinishCrossingModel(),
+        ocr=None,
+        event_settle_seconds=0.0,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    detector.set_finish_line((320, 100), (320, 600))
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    try:
+        events = []
+        for timestamp in (0.0, 0.1, 0.2):
+            frame_events, _, _ = detector.process_frame(frame, timestamp=timestamp)
+            events.extend(frame_events)
+
+        assert len(events) == 1
+        assert events[0].track_id == 11
+    finally:
+        detector.stop()
+
+
+def test_speed_skating_finish_segment_margin_accepts_upper_endpoint_crossing():
+    detector = Detector(
+        model_path="fake.pt",
+        model=_UpperEndpointFinishCrossingModel(),
+        ocr=None,
+        event_settle_seconds=0.0,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.adaptive_frame_skip = False
+    detector.set_finish_line((320, 100), (320, 600))
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    try:
+        events = []
+        for timestamp in (0.0, 0.1, 0.2):
+            frame_events, _, _ = detector.process_frame(frame, timestamp=timestamp)
+            events.extend(frame_events)
+
+        assert len(events) == 1
+        assert events[0].track_id == 11
+    finally:
+        detector.stop()
+
+
+def test_speed_skating_keeps_motion_history_before_finish_segment_entry():
+    detector = Detector(
+        model_path="fake.pt",
+        model=_ApproachingUpperEndpointFinishCrossingModel(),
+        ocr=None,
+        event_settle_seconds=0.0,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.adaptive_frame_skip = False
+    detector.set_finish_line((320, 100), (320, 600))
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    try:
+        events = []
+        for timestamp in (0.0, 0.1, 0.2, 0.3, 0.4):
+            frame_events, _, _ = detector.process_frame(frame, timestamp=timestamp)
+            events.extend(frame_events)
+
+        assert len(events) == 1
+        assert events[0].track_id == 11
+    finally:
+        detector.stop()
 
 
 def test_resolve_athlete_validator_prefers_config_then_default(tmp_path):

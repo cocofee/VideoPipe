@@ -68,4 +68,6 @@ $AppName.exe --model "$ModelArg"$SourceArgText --output "%RACE_DIR%" --sport-pro
     Set-Content -LiteralPath (Join-Path $AppDir "Start-$Variant-$SportProfile.cmd") -Value $Launcher -Encoding ASCII
 }
 
+& (Join-Path $PSScriptRoot "assert_clean_distribution.ps1") -AppDir $AppDir
+
 Write-Host "Built: $AppDir"

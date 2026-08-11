@@ -1342,6 +1342,20 @@ def bbox_iou(a: List[int], b: List[int]) -> float:
     return (inter / union) if union > 0 else 0.0
 
 
+def bbox_overlap_over_smaller(a: List[int], b: List[int]) -> float:
+    """Return intersection area divided by the smaller box area."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    smaller = min(area_a, area_b)
+    return (inter / smaller) if smaller > 0 else 0.0
+
+
 def read_image_unicode(path: Path) -> Optional[np.ndarray]:
     """支持 Unicode 路径的图像读取"""
     try:
@@ -1526,8 +1540,9 @@ class Detector:
         # Only active when timing_enabled + finish line is configured.
         self.enable_finish_segment_filter = True
         self.finish_segment_margin_px = 60.0
-        # Shrink both ends of the segment inward to reduce side spectators.
-        self.finish_segment_end_shrink_px = 140.0
+        # Speed-skating finishers can cross just beyond a manually drawn line
+        # endpoint, so keep the endpoint margin instead of cancelling it out.
+        self.finish_segment_end_shrink_px = 0.0 if speed_skating_bibs else 140.0
 
         # ===== 性能优化参数 (关键：解决 0.8 FPS 问题) =====
         self.frame_skip = 1                    # 默认不跳帧
@@ -1541,6 +1556,7 @@ class Detector:
             "participants": 0,
             "track_fragments_merged": 0,
             "identity_ambiguities": 0,
+            "roi_auto_disabled": False,
             "inference_ms": 0.0,
             "postprocess_ms": 0.0,
             "total_ms": 0.0,
@@ -1839,8 +1855,19 @@ class Detector:
         time_diff: float,
         current_bib_evidence_kind: str = "",
         previous_bib_evidence_kind: str = "",
+        current_participant_id: str = "",
+        previous_participant_id: str = "",
     ) -> bool:
         """Match nested detector boxes only at the final event boundary."""
+        current_participant_id = str(current_participant_id or "").strip()
+        previous_participant_id = str(previous_participant_id or "").strip()
+        if (
+            current_participant_id
+            and previous_participant_id
+            and current_participant_id != previous_participant_id
+        ):
+            return False
+
         has_detected_bib_evidence = "detected" in {
             str(current_bib_evidence_kind or "").strip().lower(),
             str(previous_bib_evidence_kind or "").strip().lower(),
@@ -3305,8 +3332,7 @@ class Detector:
             self.bib_driven_detection = False
 
         self.person_class_ids = set(person_ids)
-        if bib_ids:
-            self.bib_class_ids = set(bib_ids)
+        self.bib_class_ids = set(bib_ids)
         return True
 
     # =========================================================================
@@ -3620,6 +3646,38 @@ class Detector:
         return (
             area_ratio >= self.profile_min_athlete_area_ratio
             and height_ratio >= self.profile_min_athlete_height_ratio
+        )
+
+    def _passes_athlete_aspect_filter(
+        self,
+        bbox: List[float],
+        confidence: float,
+        frame_shape: Tuple[int, int],
+    ) -> bool:
+        """Allow a tightly bounded exception for athletes entering at a frame edge."""
+        if bbox is None or len(bbox) != 4:
+            return False
+        height, width = int(frame_shape[0]), int(frame_shape[1])
+        x1, y1, x2, y2 = [float(value) for value in bbox]
+        box_width = x2 - x1
+        box_height = y2 - y1
+        if box_width <= 0 or box_height <= 0:
+            return False
+
+        aspect_ratio = box_height / box_width
+        if self.aspect_min <= aspect_ratio <= self.aspect_max:
+            return True
+
+        touches_edge = x1 <= 1.0 or x2 >= width - 1.0
+        return (
+            aspect_ratio > self.aspect_max
+            and aspect_ratio <= 7.0
+            and touches_edge
+            and float(confidence) >= 0.50
+            and y1 >= height * 0.30
+            and y2 >= height * 0.52
+            and box_height < height * 0.42
+            and box_width >= max(float(self.min_bw), width * 0.02)
         )
 
     def set_crossing_direction(self, direction: Optional[str] = None):
@@ -4429,6 +4487,7 @@ class Detector:
                 "participants": 0,
                 "track_fragments_merged": 0,
                 "identity_ambiguities": 0,
+                "roi_auto_disabled": False,
                 "inference_ms": 0.0,
                 "postprocess_ms": 0.0,
                 "total_ms": 0.0,
@@ -4478,6 +4537,7 @@ class Detector:
                 "participants": 0,
                 "track_fragments_merged": 0,
                 "identity_ambiguities": 0,
+                "roi_auto_disabled": False,
                 "inference_ms": 0.0,
                 "postprocess_ms": total_ms,
                 "total_ms": total_ms,
@@ -4615,10 +4675,13 @@ class Detector:
                 all_boxes.append((cls_i, conf_i, xyxy_i, track_i))
 
         if self._raw_model_boxes:
+            tracked_person_boxes = [
+                (list(xyxy), float(conf_i))
+                for cls_i, conf_i, xyxy, _ in all_boxes
+                if int(cls_i) in self.person_class_ids
+            ]
             all_boxes = [box for box in all_boxes if int(box[0]) not in self.bib_class_ids]
             for cls_i, conf_i, xyxy_i in self._raw_model_boxes:
-                if int(cls_i) not in self.bib_class_ids:
-                    continue
                 raw_xyxy = list(xyxy_i)
                 if infer_offset_x or infer_offset_y:
                     raw_xyxy = [
@@ -4627,7 +4690,39 @@ class Detector:
                         raw_xyxy[2] + infer_offset_x,
                         raw_xyxy[3] + infer_offset_y,
                     ]
-                all_boxes.append((int(cls_i), float(conf_i), raw_xyxy, None))
+                cls_i = int(cls_i)
+                conf_i = float(conf_i)
+                if cls_i in self.bib_class_ids:
+                    all_boxes.append((cls_i, conf_i, raw_xyxy, None))
+                    continue
+
+                # ByteTrack can omit a newly visible fast athlete even when the
+                # detector produced a strong person box. Rescue only near-track
+                # boxes and keep tracked/raw duplicates out of the result.
+                if cls_i not in self.person_class_ids:
+                    continue
+                if conf_i < self.untracked_detection_conf:
+                    continue
+                if raw_xyxy[3] <= int(height * 0.45):
+                    continue
+                if any(
+                    self._passes_athlete_aspect_filter(
+                        existing_bbox,
+                        existing_conf,
+                        (height, width),
+                    )
+                    and (
+                        bbox_iou(raw_xyxy, existing_bbox) >= 0.45
+                        or (
+                            abs(conf_i - existing_conf) <= 0.02
+                            and bbox_overlap_over_smaller(raw_xyxy, existing_bbox) >= 0.85
+                        )
+                    )
+                    for existing_bbox, existing_conf in tracked_person_boxes
+                ):
+                    continue
+                all_boxes.append((cls_i, conf_i, raw_xyxy, None))
+                tracked_person_boxes.append((raw_xyxy, conf_i))
         
         present_class_ids = {int(cls) for cls, _, _, _ in all_boxes}
         runtime_person_class_ids = set(self.person_class_ids)
@@ -4677,29 +4772,7 @@ class Detector:
 
         raw_person_candidates = 0
         roi_rejected_person = 0
-
-        finish_seg_pt1 = None
-        finish_seg_pt2 = None
-        finish_seg_t_min = None
-        finish_seg_t_max = None
-        if getattr(self, "enable_finish_segment_filter", False) and self.timing_enabled:
-            finish_seg_pt1, finish_seg_pt2 = self._line_pt1, self._line_pt2
-            if finish_seg_pt1 is not None and finish_seg_pt2 is not None:
-                try:
-                    seg_len = float(np.hypot(finish_seg_pt2[0] - finish_seg_pt1[0], finish_seg_pt2[1] - finish_seg_pt1[1]))
-                    if seg_len > 1.0:
-                        margin_px = float(getattr(self, "finish_segment_margin_px", 0.0) or 0.0)
-                        margin_t = margin_px / seg_len
-                        shrink_px = float(getattr(self, "finish_segment_end_shrink_px", 0.0) or 0.0)
-                        shrink_t = max(0.0, min(0.49, shrink_px / seg_len))
-                        t_min = 0.0 + shrink_t - margin_t
-                        t_max = 1.0 - shrink_t + margin_t
-                        if t_min < t_max:
-                            finish_seg_t_min = t_min
-                            finish_seg_t_max = t_max
-                except Exception:
-                    finish_seg_t_min = None
-                    finish_seg_t_max = None
+        roi_auto_disabled = False
 
         for cls, conf, xyxy, box_id in all_boxes:
             cls = int(cls)
@@ -4719,13 +4792,6 @@ class Detector:
                         roi_rejected_person += 1
                     continue
             
-            # Finish-line segment filter (projection must be within segment range).
-            if cls in runtime_person_class_ids and finish_seg_t_min is not None and finish_seg_t_max is not None and finish_seg_pt1 is not None and finish_seg_pt2 is not None:
-                cpx, cpy = int((x1 + x2) * 0.5), int((y1 + y2) * 0.5)
-                t = point_line_segment_t(cpx, cpy, finish_seg_pt1[0], finish_seg_pt1[1], finish_seg_pt2[0], finish_seg_pt2[1])
-                if t < finish_seg_t_min or t > finish_seg_t_max:
-                    continue
-
             if cls in runtime_person_class_ids:  # Athlete
                 bw, bh = x2 - x1, y2 - y1
                 aspect_ratio = bh / bw if bw > 0 else 0
@@ -4738,7 +4804,11 @@ class Detector:
                     continue
                 
                 # 体型过滤
-                if aspect_ratio > self.aspect_max or aspect_ratio < self.aspect_min:
+                if not self._passes_athlete_aspect_filter(
+                    [x1, y1, x2, y2],
+                    conf,
+                    (height, width),
+                ):
                     continue
                 if bh > int(height * 0.95) or bw > int(width * 0.45):
                     continue
@@ -5414,6 +5484,46 @@ class Detector:
                     if state.start_line_dist is None:
                         state.start_line_dist = float(line_dist_curr)
 
+                    # Preserve approach motion before applying the finish-segment
+                    # event gate. Fast athletes may enter the endpoint margin only
+                    # on the crossing frame, but still need prior motion evidence.
+                    recent_speed = 0.0
+                    recent_normal_motion = 0.0
+                    recent_tangent_motion = 0.0
+                    line_normal_dominant = False
+                    try:
+                        hist = state.position_history
+                        hist.append((current_time, int(curr_x), int(curr_y)))
+                        window_sec = 0.6
+                        hist = [(t, x, y) for (t, x, y) in hist if (current_time - t) <= window_sec]
+                        state.position_history = hist
+                        if len(hist) >= 3:
+                            total_dist = 0.0
+                            for i in range(1, len(hist)):
+                                total_dist += float(np.hypot(hist[i][1] - hist[i-1][1], hist[i][2] - hist[i-1][2]))
+                            time_span = float(hist[-1][0] - hist[0][0])
+                            if time_span > 1e-4:
+                                recent_speed = total_dist / time_span
+                            line_dx = float(pt2[0] - pt1[0])
+                            line_dy = float(pt2[1] - pt1[1])
+                            line_length = float(np.hypot(line_dx, line_dy))
+                            if line_length > 1.0:
+                                tangent_x = line_dx / line_length
+                                tangent_y = line_dy / line_length
+                                normal_x = -tangent_y
+                                normal_y = tangent_x
+                                tangent_positions = [x * tangent_x + y * tangent_y for _, x, y in hist]
+                                normal_positions = [x * normal_x + y * normal_y for _, x, y in hist]
+                                recent_tangent_motion = float(max(tangent_positions) - min(tangent_positions))
+                                recent_normal_motion = float(max(normal_positions) - min(normal_positions))
+                                min_normal_motion = max(14.0, height * 0.010)
+                                line_normal_dominant = recent_normal_motion >= max(
+                                    min_normal_motion,
+                                    recent_tangent_motion * 0.70,
+                                )
+                    except Exception:
+                        pass
+
                     # 终点线“线段范围”过滤：只允许投影落在 pt1-pt2 线段范围内的目标参与过线判定
                     seg_ok_curr = True
                     seg_ok_prev = True
@@ -5442,29 +5552,6 @@ class Detector:
                     move_from_start = None
                     track_age = float(current_time - state.start_time)
 
-                    # 记录最近轨迹，用于“路人/观众抖动”过滤（不依赖 OCR）
-                    recent_speed = 0.0
-                    recent_dy = 0.0
-                    recent_dx = 0.0
-                    try:
-                        hist = state.position_history
-                        hist.append((current_time, int(curr_x), int(curr_y)))
-                        window_sec = 0.6
-                        hist = [(t, x, y) for (t, x, y) in hist if (current_time - t) <= window_sec]
-                        state.position_history = hist
-                        if len(hist) >= 3:
-                            total_dist = 0.0
-                            ys = [p[2] for p in hist]
-                            xs = [p[1] for p in hist]
-                            for i in range(1, len(hist)):
-                                total_dist += float(np.hypot(hist[i][1] - hist[i-1][1], hist[i][2] - hist[i-1][2]))
-                            time_span = float(hist[-1][0] - hist[0][0])
-                            if time_span > 1e-4:
-                                recent_speed = total_dist / time_span
-                            recent_dy = float(max(ys) - min(ys))
-                            recent_dx = float(max(xs) - min(xs))
-                    except Exception:
-                        pass
                     if not state.best_bib:
                         try:
                             sx, sy = state.start_pos if state.start_pos else (curr_x, curr_y)
@@ -5484,15 +5571,13 @@ class Detector:
                         # UNKNOWN 的“近线兜底”必须更严格：需要“最近一段时间有明显运动证据”，避免路人/观众抖动造成虚高
                         if not state.best_bib and not getattr(state, "has_bib_box", False):
                             try:
-                                min_dy = max(14.0, height * 0.010)
                                 min_speed = 22.0
-                                dy_dominant = (recent_dy >= max(min_dy, recent_dx * 0.70))
-                                allow_force_near = dy_dominant and (recent_speed >= min_speed)
+                                allow_force_near = line_normal_dominant and (recent_speed >= min_speed)
 
                                 # 进一步拦截：起始就贴着终点线的目标（典型路人/观众）禁止兜底触发
                                 start_dist = float(state.start_line_dist or 0.0)
                                 min_start_dist = max(38.0, height * 0.028)
-                                if start_dist < min_start_dist and track_age >= 0.20 and not dy_dominant:
+                                if start_dist < min_start_dist and track_age >= 0.20 and not line_normal_dominant:
                                     allow_force_near = False
                             except Exception:
                                 allow_force_near = False
@@ -5534,21 +5619,19 @@ class Detector:
                                 is_correct_direction = (d_prev < 0 and d_curr > 0)
 
                         if is_correct_direction:
-                            # UNKNOWN 防路人：没有号码牌框证据时，要求最近一段时间有“明显运动证据”且运动方向以 y 为主
+                            # UNKNOWN 防路人：没有号码牌框证据时，要求运动方向以终点线法向为主
                             if not state.best_bib and not getattr(state, "has_bib_box", False):
                                 try:
-                                    min_dy = max(14.0, height * 0.010)
                                     min_speed = 22.0
-                                    dy_dominant = (recent_dy >= max(min_dy, recent_dx * 0.70))
 
                                     # 起始就贴着终点线的目标（典型路人/观众）更严格：没有明显运动证据则直接拦截
                                     start_dist = float(state.start_line_dist or 0.0)
                                     min_start_dist = max(38.0, height * 0.028)
-                                    if start_dist < min_start_dist and track_age >= 0.20 and not dy_dominant:
+                                    if start_dist < min_start_dist and track_age >= 0.20 and not line_normal_dominant:
                                         self._update_crossing_vote(state, current_time, has_cross_signal=False)
                                         continue
 
-                                    if track_age >= 0.18 and (not dy_dominant or recent_speed < min_speed):
+                                    if track_age >= 0.18 and (not line_normal_dominant or recent_speed < min_speed):
                                         self._update_crossing_vote(state, current_time, has_cross_signal=False)
                                         continue
                                 except Exception:
@@ -5665,6 +5748,9 @@ class Detector:
                     curr_x = data['position'][0]
                     curr_bbox = data['bbox']
                     curr_bib = state.best_bib
+                    curr_participant_id = str(
+                        data.get('participant_id') or state.participant_id or ''
+                    ).strip()
                     detected_candidates = self._get_plausible_detected_bib_candidates(state)
                     bib_evidence_kind_for_event = "detected" if detected_candidates else "fallback"
 
@@ -5789,6 +5875,8 @@ class Detector:
                                     time_diff,
                                     current_bib_evidence_kind=bib_evidence_kind_for_event,
                                     previous_bib_evidence_kind=old.get('bib_evidence_kind', ''),
+                                    current_participant_id=curr_participant_id,
+                                    previous_participant_id=old.get('participant_id', ''),
                                 ):
                                     is_dup = True
                                     dup_reason = "unknown_nested_bbox"
@@ -6028,7 +6116,7 @@ class Detector:
                     cross_dt = datetime.fromtimestamp(cross_unix)
                     cross_realtime_dt = datetime.fromtimestamp(cross_realtime_unix)
 
-                    participant_id = str(data.get('participant_id') or '')
+                    participant_id = curr_participant_id
                     event_raw_track_ids = tuple(
                         sorted(
                             {
@@ -6130,6 +6218,8 @@ class Detector:
                         'tid': tid,
                         'bib': state.best_bib,
                         'bib_evidence_kind': bib_evidence_kind_for_event,
+                        'participant_id': participant_id,
+                        'raw_track_ids': list(event_raw_track_ids),
                     })
                     
                     # 记录到已完成名单 (全局去重，记录时间戳)
@@ -6201,7 +6291,8 @@ class Detector:
         if self._roi_overfilter_streak >= 5:
             self.enable_roi_filter = False
             self._roi_overfilter_streak = 0
-            logger.warning(f"[Detector-{self.source_id}] ROI疑似过度过滤(多人候选被裁掉)，已自动临时关闭ROI过滤")
+            roi_auto_disabled = True
+            logger.warning(f"[Detector-{self.source_id}] ROI疑似过度过滤(多人候选被裁掉)，已自动关闭ROI过滤")
 
         if raw_person_candidates > 0 and len(final_athletes) == 0:
             self._empty_athlete_streak += 1
@@ -6209,18 +6300,19 @@ class Detector:
             self._empty_athlete_streak = 0
 
         # 过筛保护：候选很多但最终显示很少时，说明过滤过强，临时降级静态过滤
-        if raw_person_candidates >= 4 and len(final_athletes) <= 1:
-            self._under_detect_streak += 1
-        else:
-            self._under_detect_streak = 0
-
-        if self._under_detect_streak >= 10:
-            self._static_filter_cooldown_frames = 120
-            self._under_detect_streak = 0
-            logger.warning(f"[Detector-{self.source_id}] 检测人数异常偏低，临时放宽静态过滤120帧")
-
         if self._static_filter_cooldown_frames > 0:
             self._static_filter_cooldown_frames -= 1
+            self._under_detect_streak = 0
+        else:
+            if raw_person_candidates >= 4 and len(final_athletes) <= 1:
+                self._under_detect_streak += 1
+            else:
+                self._under_detect_streak = 0
+
+            if self._under_detect_streak >= 10:
+                self._static_filter_cooldown_frames = 120
+                self._under_detect_streak = 0
+                logger.warning(f"[Detector-{self.source_id}] 检测人数异常偏低，临时放宽静态过滤120帧")
 
         if self._empty_athlete_streak >= 8 and athletes:
             rescue_athletes = []
@@ -6290,6 +6382,7 @@ class Detector:
             "participants": len(participant_ids),
             "track_fragments_merged": int(track_fragments_merged),
             "identity_ambiguities": int(identity_ambiguities),
+            "roi_auto_disabled": bool(roi_auto_disabled),
             "inference_ms": float(_infer_ms),
             "postprocess_ms": float(max(0.0, total_ms - _infer_ms)),
             "total_ms": float(total_ms),

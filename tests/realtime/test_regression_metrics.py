@@ -1,10 +1,48 @@
 from types import SimpleNamespace
 from pathlib import Path
+from io import BytesIO
 
 import numpy as np
 import pytest
 
 from realtime.devtools import regression_report
+
+
+def test_parse_frame_rate_supports_ffprobe_fraction_values():
+    assert regression_report._parse_frame_rate("50/1") == 50.0
+    assert regression_report._parse_frame_rate("30000/1001") == pytest.approx(29.97003)
+    assert regression_report._parse_frame_rate("0/0") == 0.0
+    assert regression_report._parse_frame_rate(25) == 25.0
+
+
+def test_read_exact_returns_partial_data_only_at_eof():
+    assert regression_report._read_exact(BytesIO(b"abcdef"), 4) == b"abcd"
+    assert regression_report._read_exact(BytesIO(b"abc"), 5) == b"abc"
+
+
+def test_extract_line_and_roi_respects_disabled_roi_state():
+    line, roi = regression_report._extract_line_and_roi(
+        {
+            "finish_line": {"x1": 1, "y1": 2, "x2": 3, "y2": 4},
+            "roi_points": [[0, 0], [10, 0], [10, 10]],
+            "roi_enabled": {"0": False},
+        }
+    )
+
+    assert line == {"x1": 1, "y1": 2, "x2": 3, "y2": 4}
+    assert roi is None
+
+
+def test_regression_cli_exposes_speed_skating_profile():
+    source = Path(regression_report.__file__).read_text(encoding="utf-8")
+
+    assert '"--sport-profile"' in source
+    assert '("cycling", "speed_skating")' in source
+    assert "build_sport_event_profile(args.sport_profile)" in source
+    assert '"-fps_mode"' in source
+    assert '"passthrough"' in source
+    assert '"nominal_fps"' in source
+    assert '"observed_fps"' in source
 
 
 def test_regression_metrics_reports_detection_layers_and_latency():

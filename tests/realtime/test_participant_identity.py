@@ -66,6 +66,79 @@ def test_same_raw_track_returns_existing_participant():
     assert second.merged_raw_track is False
 
 
+def test_same_raw_track_reuse_after_large_reverse_jump_creates_participant():
+    manager = ParticipantIdentityManager(config=IdentityConfig())
+    first = manager.resolve(
+        observation(track_id=405, time_ms=1000, bbox=(1000, 100, 1100, 300))
+    )
+    manager.resolve(
+        observation(track_id=405, time_ms=1100, bbox=(800, 100, 900, 300))
+    )
+
+    reused = manager.resolve(
+        observation(track_id=405, time_ms=1800, bbox=(1200, 100, 1300, 300))
+    )
+
+    assert reused.participant.participant_id != first.participant.participant_id
+    assert reused.created is True
+    assert reused.merged_raw_track is False
+    assert "raw_track_discontinuity" in reused.reasons
+
+
+def test_same_raw_track_reuse_after_scaled_reverse_jump_creates_participant():
+    manager = ParticipantIdentityManager(config=IdentityConfig())
+    first = manager.resolve(
+        observation(track_id=900016, time_ms=1000, bbox=(1271, 513, 1550, 874))
+    )
+    manager.resolve(
+        observation(track_id=900016, time_ms=1040, bbox=(1106, 525, 1379, 868))
+    )
+
+    reused = manager.resolve(
+        observation(track_id=900016, time_ms=1998, bbox=(1645, 365, 1879, 746))
+    )
+
+    assert reused.participant.participant_id != first.participant.participant_id
+    assert reused.created is True
+    assert "raw_track_discontinuity" in reused.reasons
+
+
+def test_same_raw_track_reuse_on_same_frame_after_hard_jump_creates_participant():
+    manager = ParticipantIdentityManager(config=IdentityConfig())
+    first = manager.resolve(
+        observation(track_id=900012, time_ms=1000, bbox=(100, 500, 300, 900))
+    )
+    merged = manager.resolve(
+        observation(track_id=9298, time_ms=1100, bbox=(80, 500, 280, 900))
+    )
+
+    reused = manager.resolve(
+        observation(track_id=900012, time_ms=1100, bbox=(2100, 300, 2350, 700))
+    )
+
+    assert merged.participant.participant_id == first.participant.participant_id
+    assert reused.participant.participant_id != first.participant.participant_id
+    assert reused.created is True
+    assert "raw_track_discontinuity" in reused.reasons
+
+
+def test_same_raw_track_large_forward_motion_keeps_participant():
+    manager = ParticipantIdentityManager(config=IdentityConfig())
+    first = manager.resolve(
+        observation(track_id=405, time_ms=1000, bbox=(1600, 100, 1800, 500))
+    )
+    manager.resolve(
+        observation(track_id=405, time_ms=1100, bbox=(1400, 100, 1600, 500))
+    )
+
+    continued = manager.resolve(
+        observation(track_id=405, time_ms=1800, bbox=(0, 100, 200, 500))
+    )
+
+    assert continued.participant.participant_id == first.participant.participant_id
+    assert continued.created is False
+
+
 @pytest.mark.parametrize(
     ("source_id", "segment_id"),
     [(1, 1), (0, 2)],

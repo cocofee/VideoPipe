@@ -46,6 +46,18 @@ def test_build_script_validates_inputs_before_replacing_package():
     assert 'Start-$Variant-$SportProfile.cmd' in script
 
 
+def test_build_requires_a_clean_distribution_directory():
+    build_script = (ROOT / "packaging" / "build_realtime.ps1").read_text(encoding="utf-8")
+    clean_check = (ROOT / "packaging" / "assert_clean_distribution.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'assert_clean_distribution.ps1") -AppDir $AppDir' in build_script
+    for runtime_path in ("RaceData", "logs", "config.json", "global_config.json"):
+        assert f'"{runtime_path}"' in clean_check
+    assert "Distribution contains runtime state" in clean_check
+
+
 def test_main_window_never_constructs_full_paddleocr():
     source = (ROOT / "realtime" / "main_window.py").read_text(encoding="utf-8")
 

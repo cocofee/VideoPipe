@@ -1,7 +1,7 @@
 import numpy as np
 
 from realtime.frame_envelope import FrameEnvelope
-from realtime.main_window import PreviewThread, VideoThread
+from realtime.main_window import MainWindow, PreviewThread, VideoThread
 from realtime.stream_reader import StreamStatus
 
 
@@ -102,6 +102,12 @@ class _TimestampDetector:
         return [], [], []
 
 
+class _RoiRecoveryDetector(_TimestampDetector):
+    def process_frame(self, frame, timestamp=None):
+        self.last_frame_metrics = {"roi_auto_disabled": True}
+        return super().process_frame(frame, timestamp=timestamp)
+
+
 def test_video_thread_passes_original_frame_and_capture_timestamp_to_detector():
     frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
     envelope = FrameEnvelope(
@@ -130,6 +136,109 @@ def test_video_thread_passes_original_frame_and_capture_timestamp_to_detector():
     assert thread.last_frame_metrics["capture_latency_ms"] == 5.0
     assert thread.last_frame_metrics["queue_latency_ms"] >= 0.0
     assert thread.last_frame_metrics["processing_time_ms"] >= 0.0
+
+
+def test_video_thread_forwards_roi_auto_disable_to_ui():
+    frame = np.zeros((8, 12, 3), dtype=np.uint8)
+    envelope = FrameEnvelope(
+        original_frame=frame,
+        frame_index=13,
+        capture_time_ms=2_000.0,
+        arrival_time_ms=2_005.0,
+        segment_id=0,
+    )
+    reader = _EnvelopeReader(envelope)
+    detector = _RoiRecoveryDetector()
+    thread = VideoThread(reader, detector, source_id=4, ui_skip=99)
+    reader.thread = thread
+    detector.thread = thread
+    emitted = []
+    thread.roi_auto_disabled.connect(emitted.append)
+
+    thread.run()
+
+    assert emitted == [4]
+
+
+class _Signal:
+    def __init__(self):
+        self.disconnect_calls = 0
+
+    def disconnect(self, callback):
+        self.disconnect_calls += 1
+
+
+class _CheckBox:
+    def __init__(self):
+        self.checked = True
+        self.blocked = []
+
+    def blockSignals(self, blocked):
+        self.blocked.append(blocked)
+
+    def setChecked(self, checked):
+        self.checked = checked
+
+
+class _VideoLabel:
+    def __init__(self):
+        self.show_roi = True
+        self.roi_changed = _Signal()
+
+    def set_show_roi(self, enabled):
+        self.show_roi = enabled
+
+
+class _RoiDetector:
+    def __init__(self):
+        self.points = "unchanged"
+
+    def set_roi_polygon(self, points):
+        self.points = points
+
+
+class _StatusBar:
+    def __init__(self):
+        self.message = ""
+
+    def showMessage(self, message):
+        self.message = message
+
+
+class _MainWindowState:
+    def __init__(self):
+        self.roi_enabled = {0: True}
+        self.config = {"roi_enabled": {0: True}}
+        self.roi_checkboxes = {0: _CheckBox()}
+        self.video_labels = {0: _VideoLabel()}
+        self.detectors = {0: _RoiDetector()}
+        self.saved = 0
+        self._status_bar = _StatusBar()
+
+    def _save_config(self):
+        self.saved += 1
+
+    def _on_roi_changed(self, points):
+        return None
+
+    def statusBar(self):
+        return self._status_bar
+
+
+def test_main_window_persists_roi_auto_disable_state():
+    window = _MainWindowState()
+
+    MainWindow._on_roi_auto_disabled(window, 0)
+
+    assert window.roi_enabled == {0: False}
+    assert window.config["roi_enabled"] == {0: False}
+    assert window.roi_checkboxes[0].checked is False
+    assert window.roi_checkboxes[0].blocked == [True, False]
+    assert window.video_labels[0].show_roi is False
+    assert window.video_labels[0].roi_changed.disconnect_calls == 1
+    assert window.detectors[0].points is None
+    assert window.saved == 1
+    assert "已自动关闭" in window._status_bar.message
 
 
 def test_video_thread_combines_identity_and_reader_metrics():

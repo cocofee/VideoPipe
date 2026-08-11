@@ -6,6 +6,8 @@ import hashlib
 import json
 import logging
 import math
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -562,11 +564,17 @@ def _extract_line_and_roi(config: Dict[str, Any], source_id: int = 0) -> Tuple[O
 
     roi_points = None
     try:
+        roi_enabled = config.get("roi_enabled", {})
+        source_roi_enabled = None
+        if isinstance(roi_enabled, dict):
+            source_roi_enabled = roi_enabled.get(str(source_id), roi_enabled.get(source_id))
         rois = config.get("rois", {})
         if isinstance(rois, dict):
             roi_points = rois.get(str(source_id))
         if not roi_points and source_id == 0:
             roi_points = config.get("roi_points")
+        if source_roi_enabled is False:
+            roi_points = None
     except Exception:
         roi_points = None
 
@@ -575,6 +583,92 @@ def _extract_line_and_roi(config: Dict[str, Any], source_id: int = 0) -> Tuple[O
     if not isinstance(roi_points, list):
         roi_points = None
     return line_cfg, roi_points
+
+
+def _parse_frame_rate(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    if "/" in text:
+        numerator, denominator = text.split("/", 1)
+        try:
+            denominator_value = float(denominator)
+            if denominator_value == 0.0:
+                return 0.0
+            return float(numerator) / denominator_value
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _probe_video_with_ffprobe(video_path: Path) -> Dict[str, Any]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobe is not available")
+
+    completed = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,nb_read_frames:format=duration",
+            "-of",
+            "json",
+            str(video_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    payload = json.loads(completed.stdout or "{}")
+    streams = payload.get("streams") or []
+    if not streams:
+        raise RuntimeError("ffprobe did not return a video stream")
+
+    stream = streams[0]
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    nominal_fps = _parse_frame_rate(stream.get("avg_frame_rate")) or _parse_frame_rate(
+        stream.get("r_frame_rate")
+    )
+    duration = float((payload.get("format") or {}).get("duration") or 0.0)
+    total_frames = int(stream.get("nb_read_frames") or stream.get("nb_frames") or 0)
+    effective_fps = total_frames / duration if total_frames > 0 and duration > 0.0 else 0.0
+    fps = effective_fps or nominal_fps
+    if total_frames <= 0 and fps > 0.0 and duration > 0.0:
+        total_frames = int(round(fps * duration))
+
+    if width <= 0 or height <= 0 or fps <= 0.0:
+        raise RuntimeError("ffprobe returned incomplete video metadata")
+    return {
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "nominal_fps": nominal_fps,
+        "total_frames": total_frames,
+        "duration": duration,
+    }
+
+
+def _read_exact(stream: Any, size: int) -> bytes:
+    chunks = []
+    remaining = int(size)
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def main() -> int:
@@ -591,6 +685,12 @@ def main() -> int:
     parser.add_argument("--frames", type=int, default=1800, help="处理帧数（默认 1800 帧 ≈ 60 秒@30fps）")
     parser.add_argument("--start-frame", type=int, default=0, help="起始帧（默认 0）")
     parser.add_argument("--config", type=str, default="", help="可选：config.json 或 config_preset_*.json（用于复用终点线/ROI）")
+    parser.add_argument(
+        "--sport-profile",
+        choices=("cycling", "speed_skating"),
+        default="cycling",
+        help="赛事检测配置（默认 cycling）",
+    )
     parser.add_argument("--event-profile-json", type=str, default="", help="可选：EventProfile JSON 对象")
     parser.add_argument("--out", type=str, default="", help="输出报告 json 路径（默认放到当前目录）")
     parser.add_argument("--evidence-dir", type=str, default="", help="可选：保存事件原始帧、运动员裁剪和号码牌裁剪")
@@ -602,7 +702,7 @@ def main() -> int:
     from ultralytics import YOLO
 
     from realtime.detector import Detector, LOCAL_VIDEO_EVENT_SETTLE_SECONDS
-    from realtime.event_profile import build_event_profile
+    from realtime.event_profile import build_event_profile, build_sport_event_profile
     if not args.verbose:
         try:
             logging.getLogger().setLevel(logging.ERROR)
@@ -631,17 +731,66 @@ def main() -> int:
             config = _load_json(cfg_path)
 
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        print(f"[FAIL] 无法打开视频: {video_path}")
-        return 2
+    ffmpeg_process = None
+    use_ffmpeg = False
+    if cap.isOpened():
+        if args.start_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
+        can_read, _ = cap.read()
+        if can_read:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
+        else:
+            cap.release()
+            use_ffmpeg = True
+    else:
+        use_ffmpeg = True
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-
-    if args.start_frame > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
+    if use_ffmpeg:
+        try:
+            video_info = _probe_video_with_ffprobe(video_path)
+        except Exception as exc:
+            print(f"[FAIL] 无法读取视频信息: {exc}")
+            return 2
+        width = int(video_info["width"])
+        height = int(video_info["height"])
+        fps = float(video_info["fps"])
+        nominal_fps = float(video_info["nominal_fps"])
+        total_frames = int(video_info["total_frames"])
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            print("[FAIL] OpenCV 无法解码视频，且未找到 ffmpeg")
+            return 2
+        start_seconds = max(0.0, float(args.start_frame) / fps)
+        ffmpeg_process = subprocess.Popen(
+            [
+                ffmpeg,
+                "-loglevel",
+                "error",
+                "-i",
+                str(video_path),
+                "-ss",
+                f"{start_seconds:.6f}",
+                "-an",
+                "-sn",
+                "-dn",
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "bgr24",
+                "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=max(1, width * height * 3 * 2),
+        )
+    else:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        nominal_fps = fps
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     yolo = YOLO(str(model_path))
     dummy = np.zeros((640, 640, 3), dtype=np.uint8)
@@ -658,7 +807,7 @@ def main() -> int:
             device="cpu",
         )
 
-    event_profile = None
+    event_profile = build_sport_event_profile(args.sport_profile)
     if args.event_profile_json:
         try:
             profile_payload = json.loads(args.event_profile_json)
@@ -716,18 +865,29 @@ def main() -> int:
     participant_tracks: Dict[str, set[int]] = {}
     regression_metrics = RegressionMetrics()
     evidence_dir = Path(args.evidence_dir) if args.evidence_dir else None
+    first_video_timestamp = None
+    last_video_timestamp = None
 
     t0 = time.time()
     while frames_done < frames_target:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        video_timestamp = video_timestamp_seconds(
-            cap.get(cv2.CAP_PROP_POS_MSEC),
-            frame_index=int(args.start_frame) + frames_done,
-            fps=fps,
-        )
+        if use_ffmpeg:
+            raw_frame = _read_exact(ffmpeg_process.stdout, width * height * 3)
+            if len(raw_frame) != width * height * 3:
+                break
+            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((height, width, 3))
+            video_timestamp = (int(args.start_frame) + frames_done) / max(fps, 1e-6)
+        else:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            video_timestamp = video_timestamp_seconds(
+                cap.get(cv2.CAP_PROP_POS_MSEC),
+                frame_index=int(args.start_frame) + frames_done,
+                fps=fps,
+            )
+        if first_video_timestamp is None:
+            first_video_timestamp = float(video_timestamp)
+        last_video_timestamp = float(video_timestamp)
         crossing_events, athletes, bibs = detector.process_frame(frame, timestamp=video_timestamp)
         frame_rejections = list(detector.last_rejected_candidates)
         frame_participant_ids = []
@@ -789,8 +949,29 @@ def main() -> int:
 
         frames_done += 1
 
+    if use_ffmpeg and ffmpeg_process is not None:
+        if ffmpeg_process.stdout is not None:
+            ffmpeg_process.stdout.close()
+        if ffmpeg_process.poll() is None:
+            ffmpeg_process.terminate()
+        try:
+            ffmpeg_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            ffmpeg_process.kill()
+            ffmpeg_process.wait(timeout=5)
+    else:
+        cap.release()
+
     elapsed = time.time() - t0
     proc_fps = (frames_done / elapsed) if elapsed > 1e-6 else 0.0
+    observed_video_fps = 0.0
+    if (
+        frames_done > 1
+        and first_video_timestamp is not None
+        and last_video_timestamp is not None
+        and last_video_timestamp > first_video_timestamp
+    ):
+        observed_video_fps = (frames_done - 1) / (last_video_timestamp - first_video_timestamp)
     metric_report = regression_metrics.to_report(processing_fps=proc_fps)
 
     report: Dict[str, Any] = {
@@ -803,7 +984,10 @@ def main() -> int:
             "width": width,
             "height": height,
             "fps": fps,
+            "nominal_fps": nominal_fps,
+            "observed_fps": float(round(observed_video_fps, 3)),
             "total_frames": total_frames,
+            "decoded_frames": frames_done,
         },
         "performance": {
             "elapsed_sec": float(round(elapsed, 3)),

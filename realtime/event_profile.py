@@ -8,6 +8,13 @@ SUPPORTED_EQUIPMENT = {None, "bicycle"}
 SPORT_PROFILE_ALIASES = {
     "road_cycling": "cycling",
     "road-cycling": "cycling",
+    "marathon": "running",
+    "triathlon_run": "running",
+    "triathlon-run": "running",
+    "modern_pentathlon_run": "running",
+    "modern-pentathlon-run": "running",
+    "roller_chest": "running",
+    "roller-chest": "running",
     "roller_skating": "speed_skating",
     "roller-skating": "speed_skating",
     "inline_skating": "speed_skating",
@@ -18,6 +25,10 @@ SPORT_PROFILE_DEFAULTS = {
     "cycling": {
         "required_equipment": "bicycle",
         "bib_regions": ("rear_saddle", "back"),
+    },
+    "running": {
+        "required_equipment": None,
+        "bib_regions": ("torso", "back"),
     },
     "speed_skating": {
         "required_equipment": None,

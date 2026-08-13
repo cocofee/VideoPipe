@@ -1067,7 +1067,16 @@ class EventRecorder:
                 frame_annotated = event.frame.copy()
                 x1, y1, x2, y2 = event.bbox
                 center_x, bottom_y = event.position
-                cv2.rectangle(frame_annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                frame_athletes = getattr(event, 'frame_athletes', ()) or ()
+                for frame_athlete in frame_athletes:
+                    athlete_bbox = frame_athlete.get('bbox') if isinstance(frame_athlete, dict) else None
+                    if not athlete_bbox or len(athlete_bbox) != 4:
+                        continue
+                    ax1, ay1, ax2, ay2 = (int(value) for value in athlete_bbox)
+                    if ax2 <= ax1 or ay2 <= ay1:
+                        continue
+                    cv2.rectangle(frame_annotated, (ax1, ay1), (ax2, ay2), (0, 255, 0), 2)
+                cv2.rectangle(frame_annotated, (x1, y1), (x2, y2), (0, 255, 0), 4)
                 cv2.circle(frame_annotated, (center_x, bottom_y), 10, (0, 255, 0), -1)
                 info_text = f"Rank:{event.rank} ID:{event.track_id} BIB:{bib_text} S:{event.source_id}"
                 cv2.putText(frame_annotated, info_text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)

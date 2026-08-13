@@ -964,6 +964,29 @@ def test_rejected_candidate_does_not_consume_event_id():
     assert [event.event_id for event in accepted_events] == [1]
 
 
+def test_crossing_event_keeps_all_athlete_boxes_from_source_frame():
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+    detector = Detector(
+        model_path="fake.pt",
+        model=_EmptyTrackingModel(),
+        ocr=None,
+        athlete_validator=_ValidatorModel(["bicycle"]),
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    state = _pending_crossing_state(frame, 101)
+    state.pending_event_data["frame_athletes"] = (
+        {"bbox": (100, 120, 180, 280), "track_id": 101, "conf": 0.9},
+        {"bbox": (190, 100, 260, 270), "track_id": 202, "conf": 0.8},
+    )
+    detector._track_states[101] = state
+
+    events, _, _ = detector.process_frame(frame, timestamp=1.0)
+
+    assert len(events) == 1
+    assert events[0].frame_athletes == state.pending_event_data["frame_athletes"]
+
+
 def test_crossing_lifecycle_admits_by_participant_before_allocating_event_id():
     frame = np.zeros((320, 320, 3), dtype=np.uint8)
     detector = Detector(

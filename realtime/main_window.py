@@ -91,6 +91,7 @@ try:
     from .database import Database
     from .event_recorder import EventRecorder
     from .event_list_widget import EventListWidget
+    from .live_event_review import LiveEventReview
     from .ocr_manager import OCRManager
     from .io_utils import read_image_unicode, write_image_unicode
     from .field_issue_log import FIELD_ISSUE_CATEGORIES, FieldIssueLog
@@ -111,6 +112,7 @@ except ImportError:
     from database import Database
     from event_recorder import EventRecorder
     from event_list_widget import EventListWidget
+    from live_event_review import LiveEventReview
     from ocr_manager import OCRManager
     from io_utils import read_image_unicode, write_image_unicode
     from field_issue_log import FIELD_ISSUE_CATEGORIES, FieldIssueLog
@@ -553,6 +555,8 @@ class VideoThread(QThread):
         self.source_id = source_id
         self.ui_skip = ui_skip  # UI刷新间隔（不影响检测，每帧都检测）
         self._running = False
+        self._ui_pending_lock = threading.Lock()
+        self._ui_frame_pending = False
         self.last_processed_envelope: Optional[FrameEnvelope] = None
         self.last_frame_metrics: Dict[str, Any] = {}
         
@@ -578,6 +582,17 @@ class VideoThread(QThread):
     @pyqtSlot(int, str, float, object, int, object, object, object)
     def emit_bib_updated(self, tid, bib, conf, status, sid, b_crop, a_crop, frame):
         self.bib_updated.emit(tid, bib, conf, status, sid, b_crop, a_crop, frame)
+
+    def mark_ui_consumed(self):
+        with self._ui_pending_lock:
+            self._ui_frame_pending = False
+
+    def _reserve_ui_publish_slot(self) -> bool:
+        with self._ui_pending_lock:
+            if self._ui_frame_pending:
+                return False
+            self._ui_frame_pending = True
+            return True
 
     def run(self):
         logger.info(f"[VideoThread-{self.source_id}] 视频处理线程已启动")
@@ -673,11 +688,14 @@ class VideoThread(QThread):
 
             # UI刷新：降低刷新频率减轻GUI负担
             self.detections_ready.emit(athletes, bibs, self.source_id)
+            if frame_count % self.ui_skip == 0 and self._reserve_ui_publish_slot():
+                self.frame_ready.emit(frame, athletes, bibs, self.source_id)
 
         self._running = False
 
     def stop(self):
         self._running = False
+        self.mark_ui_consumed()
         self.wait(2000)
 
 
@@ -2217,7 +2235,8 @@ class MainWindow(QMainWindow):
         self.config['ocr_engine'] = 'paddleocr'
         self._race_ready = False
         self._main_fps_value = 0.0
-        self._gate_guard_enabled = bool(config.get('gate_guard_enabled', True))
+        self._gate_guard_enabled = True
+        self.config['gate_guard_enabled'] = True
 
         # 轻量实时巡检（摄像头版）：只复用现有检测结果做滚动统计，不新增模型推理
         self._live_monitor_enabled = bool(config.get('live_monitor_enabled', True))
@@ -2243,120 +2262,64 @@ class MainWindow(QMainWindow):
         self._recording_poll_timer.setInterval(500)
         self._recording_poll_timer.timeout.connect(self._poll_recording_status)
 
-        # 应用全局样式：统一字体大小为 16px，确保布局不拥挤且清晰
+        self.setObjectName("video_evidence_main_window")
+        # 主窗口外壳保持克制，具体工作区样式由各自组件负责。
         self.setStyleSheet("""
-            QMainWindow {
-                background-color: #f5f5f5;
+            QMainWindow#video_evidence_main_window {
+                background-color: #eef2f5;
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
+                font-size: 13px;
             }
             QMenuBar {
-                background-color: #ffffff;
-                border-bottom: 1px solid #d9d9d9;
-                font-size: 16px;
+                min-height: 30px;
+                background-color: #f8fafb;
+                border-bottom: 1px solid #d8dee6;
+                color: #344054;
+                font-size: 13px;
             }
             QMenuBar::item {
-                padding: 6px 12px;
+                padding: 6px 10px;
+                margin: 1px 2px;
                 background-color: transparent;
-                color: #333333;
+                color: #344054;
             }
             QMenuBar::item:selected {
-                background-color: #e6f7ff;
-                color: #1890ff;
+                background-color: #e8edf2;
+                color: #182230;
             }
             QMenu {
                 background-color: #ffffff;
-                border: 1px solid #d9d9d9;
-                font-size: 16px;
+                border: 1px solid #cfd6df;
+                padding: 4px;
+                color: #253246;
+                font-size: 13px;
             }
             QMenu::item {
-                padding: 8px 25px;
+                min-width: 160px;
+                padding: 7px 28px 7px 12px;
+                margin: 1px;
+                border-radius: 3px;
             }
             QMenu::item:selected {
-                background-color: #e6f7ff;
-                color: #1890ff;
+                background-color: #edf2f6;
+                color: #182230;
             }
-            QGroupBox {
-                font-weight: bold;
-                border: 1px solid #d9d9d9;
-                border-radius: 4px;
-                margin-top: 15px;
-                padding-top: 15px;
-                font-size: 16px;
-                background-color: #ffffff;
-            }
-            /* 基础按钮样式 - 扁平化 */
-            QPushButton {
-                background-color: #f0f0f0;
-                color: #000000;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-size: 16px;
-                font-weight: bold;
-                border: 1px solid #d9d9d9;
-            }
-            QPushButton:hover {
-                background-color: #e6e6e6;
-                border-color: #1890ff;
-            }
-            QPushButton:pressed {
-                background-color: #d9d9d9;
-            }
-            QPushButton:disabled {
-                background-color: #f5f5f5;
-                color: #bfbfbf;
-                border-color: #d9d9d9;
-            }
-            /* 特殊按钮样式 */
-            #start_btn {
-                background-color: #52c41a;
-                color: white;
-                border: none;
-            }
-            #start_btn:hover {
-                background-color: #73d13d;
-            }
-            #stop_btn {
-                background-color: #ff4d4f;
-                color: white;
-                border: none;
-            }
-            #stop_btn:hover {
-                background-color: #ff7875;
-            }
-            #primary_btn {
-                background-color: #1890ff;
-                color: white;
-                border: none;
-            }
-            #primary_btn:hover {
-                background-color: #40a9ff;
-            }
-            #record_btn {
-                background-color: #cf1322;
-                color: white;
-                border: none;
-            }
-            #record_btn:hover {
-                background-color: #f5222d;
-            }
-            #recording_btn {
-                background-color: #820014;
-                color: white;
-                border: none;
-            }
-            #recording_btn:hover {
-                background-color: #a8071a;
-            }
-            QLabel {
-                font-size: 16px;
-            }
-            QCheckBox {
-                font-size: 16px;
-            }
+            QMenu::separator { height: 1px; background: #e4e8ed; margin: 4px 8px; }
             QStatusBar {
-                background-color: #ffffff;
-                border-top: 1px solid #d9d9d9;
-                font-size: 16px;
-                color: #000000;
+                min-height: 22px;
+                max-height: 24px;
+                background-color: #f8fafb;
+                border-top: 1px solid #d8dee6;
+                color: #667085;
+                font-size: 11px;
+            }
+            QStatusBar::item { border: none; }
+            QToolTip {
+                background: #182230;
+                color: #ffffff;
+                border: 1px solid #182230;
+                padding: 5px 7px;
+                font-size: 12px;
             }
         """)
 
@@ -2381,29 +2344,13 @@ class MainWindow(QMainWindow):
     def _load_initial_config(self):
         """从数据库加载持久化配置"""
         if self.database:
-            ranges = self.database.get_config('bib_ranges', '')
-            if hasattr(self, 'bib_ranges_input'):
-                self.bib_ranges_input.setText(ranges)
-                logger.info(f"[Main] 已加载持久化号段配置: {ranges}")
-            
-            # 加载纯数字开关状态
-            is_numeric = self.database.get_config('numeric_only', '1') == '1'
-            if hasattr(self, 'numeric_only_checkbox'):
-                self.numeric_only_checkbox.blockSignals(True)
-                self.numeric_only_checkbox.setChecked(is_numeric)
-                self.numeric_only_checkbox.blockSignals(False)
-                logger.info(f"[Main] 已加载纯数字模式状态: {is_numeric}")
             if self.ocr_manager:
-                self.ocr_manager.only_numeric = bool(is_numeric)
+                self.ocr_manager.only_numeric = False
+                self.ocr_manager._bib_ranges = []
 
-            gate_guard_enabled = self.database.get_config('gate_guard_enabled', '1') == '1'
-            self._gate_guard_enabled = gate_guard_enabled
-            self.config['gate_guard_enabled'] = gate_guard_enabled
-            if hasattr(self, 'gate_guard_checkbox'):
-                self.gate_guard_checkbox.blockSignals(True)
-                self.gate_guard_checkbox.setChecked(gate_guard_enabled)
-                self.gate_guard_checkbox.blockSignals(False)
-                logger.info(f"[Main] 已加载龙门安全模式状态: {gate_guard_enabled}")
+            self._gate_guard_enabled = True
+            self.config['gate_guard_enabled'] = True
+            logger.info("[Main] 已启用自动号码格式与龙门误检保护")
 
             # 启动时同步一次给检测器
             self._update_detector_athletes()
@@ -2433,6 +2380,11 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.warning(f"加载保存配置失败: {e}")
         self.config['output_dir'] = str(race_dir)
+        self.sport_profile = normalize_sport_profile(self.config.get('sport_profile', 'cycling'))
+        self.config['sport_profile'] = self.sport_profile
+        self._gate_guard_enabled = True
+        self.config['gate_guard_enabled'] = True
+        self._sync_sport_profile_combo()
         sources = self.config.get('sources')
         if sources is None:
             sources = self.config.get('source', 'rtsp://localhost:8554/test')
@@ -2471,6 +2423,10 @@ class MainWindow(QMainWindow):
                 logger.info("[Main] 已在赛事切换时绑定并重置事件列表")
             except Exception as e:
                 logger.warning(f"[Main] 事件列表数据库绑定失败: {e}")
+        if hasattr(self, 'live_event_review'):
+            self.live_event_review.set_database(self.database)
+            self.live_event_review.set_output_dir(self.output_dir)
+            self.live_event_review.clear_event()
         if self._yolo_only_mode:
             self.ocr_manager = None
         elif not self.ocr_manager:
@@ -2482,8 +2438,10 @@ class MainWindow(QMainWindow):
         self._race_ready = True
         if self.ocr_manager:
             QTimer.singleShot(0, self._init_ocr_runtime)
-        if hasattr(self, "field_issue_btn"):
-            self.field_issue_btn.setEnabled(True)
+        if hasattr(self, "field_issue_action"):
+            self.field_issue_action.setEnabled(True)
+        if hasattr(self, "race_name_label"):
+            self.race_name_label.setText(race_dir.name)
         self.statusBar().showMessage(f"当前赛事: {race_dir.name}")
 
     def _prompt_race_selection(self):
@@ -2555,289 +2513,399 @@ class MainWindow(QMainWindow):
         self.log_output.appendPlainText(msg)
 
     def _init_ui(self):
-        """初始化界面"""
-        self.setWindowTitle("运动比赛终点辅助计时系统 - 实时版")
-        self.setMinimumSize(1200, 768) # 适配更多笔记本屏幕分辨率
-
-        # 创建菜单栏
+        """初始化现场视频工作台。"""
+        self.setWindowTitle("VideoPipe 视频取证工作台")
+        self.setMinimumSize(1200, 768)
+        self.resize(1600, 960)
         self._setup_menubar()
+        self._init_operator_controls()
 
-        # 中央组件
         central = QWidget()
+        central.setObjectName("live_console")
+        central.setStyleSheet("""
+            QWidget#live_console { background: #eef2f5; }
+            QWidget#workspace_header {
+                background: #fbfcfd;
+                border-bottom: 1px solid #d8dee6;
+            }
+            QWidget#capture_bar {
+                background: #fbfcfd;
+                border-top: 1px solid #d8dee6;
+            }
+            QLabel#workspace_title { color: #182230; font-size: 17px; font-weight: 700; }
+            QLabel#race_name {
+                color: #52606d; font-size: 12px; background: #f0f3f6;
+                border: 1px solid #d8dee6; border-radius: 3px; padding: 3px 8px;
+            }
+            QLabel#section_title { color: #253246; font-size: 14px; font-weight: 700; }
+            QLabel#capture_state {
+                border-radius: 3px; padding: 4px 9px; font-size: 12px; font-weight: 700;
+            }
+            QLabel#capture_detail { color: #667085; font-size: 12px; }
+            QLabel#session_count { color: #344054; font-size: 12px; font-weight: 700; }
+            QComboBox#sport_profile_combo {
+                min-width: 250px; min-height: 32px; padding: 0 8px;
+                background: #ffffff; color: #253246; border: 1px solid #c5ccd6;
+                border-radius: 4px; font-size: 12px;
+            }
+            QComboBox#sport_profile_combo:disabled { background: #eef2f5; color: #7b8794; }
+            QPushButton#start_btn {
+                min-width: 108px; min-height: 36px; padding: 0 16px;
+                background: #247a52; color: white; border: 1px solid #247a52;
+                border-radius: 4px; font-size: 13px; font-weight: 700;
+            }
+            QPushButton#start_btn:hover { background: #1e6846; }
+            QPushButton#start_btn:pressed { background: #18573b; }
+            QPushButton#stop_btn {
+                min-width: 108px; min-height: 36px; padding: 0 16px;
+                background: #b54747; color: white; border: 1px solid #b54747;
+                border-radius: 4px; font-size: 13px; font-weight: 700;
+            }
+            QPushButton#stop_btn:hover { background: #9f3d3d; }
+            QPushButton#stop_btn:pressed { background: #8a3434; }
+            QPushButton#record_btn {
+                min-width: 96px; min-height: 34px; padding: 0 12px;
+                background: #f8fafb; color: #8a3440; border: 1px solid #d6a3aa;
+                border-radius: 4px; font-size: 12px; font-weight: 700;
+            }
+            QPushButton#record_btn:hover { background: #fdf2f3; border-color: #b96c77; }
+            QPushButton#recording_btn {
+                min-width: 96px; min-height: 34px; padding: 0 12px;
+                background: #a33d4b; color: white; border: 1px solid #a33d4b;
+                border-radius: 4px; font-size: 12px; font-weight: 700;
+            }
+            QPushButton#recording_btn:hover { background: #8a3440; }
+            QPushButton#settings_btn {
+                min-height: 34px; padding: 0 12px; background: #f8fafb; color: #344054;
+                border: 1px solid #c5ccd6; border-radius: 4px; font-size: 12px; font-weight: 600;
+            }
+            QPushButton#settings_btn:hover { background: #eef2f5; border-color: #98a2b3; }
+        """)
         self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        # 主布局 - 使用分割器
-        layout = QHBoxLayout(central)
+        workspace_header = QWidget()
+        workspace_header.setObjectName("workspace_header")
+        workspace_header.setFixedHeight(50)
+        header_layout = QHBoxLayout(workspace_header)
+        header_layout.setContentsMargins(14, 0, 14, 0)
+        header_layout.setSpacing(12)
+
+        workspace_title = QLabel("视频取证工作台")
+        workspace_title.setObjectName("workspace_title")
+        header_layout.addWidget(workspace_title)
+        self.race_name_label = QLabel("未选择赛事")
+        self.race_name_label.setObjectName("race_name")
+        header_layout.addWidget(self.race_name_label)
+        header_layout.addStretch()
+
+        self.capture_state_label = QLabel("采集未开始")
+        self.capture_state_label.setObjectName("capture_state")
+        header_layout.addWidget(self.capture_state_label)
+        self.conn_status_indicator = QLabel("● 主相机未连接")
+        self.conn_status_indicator.setStyleSheet("color: #8a3440; font-size: 13px; font-weight: 700;")
+        header_layout.addWidget(self.conn_status_indicator)
+        root_layout.addWidget(workspace_header)
+
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(5)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStyleSheet("QSplitter::handle { background: #e4e9ee; }")
 
-        # 左边 - 视频区域
         video_widget = QWidget()
+        video_widget.setStyleSheet("background: #ffffff;")
         video_layout = QVBoxLayout(video_widget)
-        
-        # 1. 顶部状态指示栏 (转播风格)
-        top_status_bar = QWidget()
-        top_status_bar.setFixedHeight(50)
-        top_status_bar.setStyleSheet("background-color: #1a1a1a; border-radius: 4px;")
-        top_status_layout = QHBoxLayout(top_status_bar)
-        
-        # 实时会话统计
-        self.rank_label = QLabel("RANK --")
-        self.rank_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #ffcc00; margin-left: 10px;")
-        top_status_layout.addWidget(self.rank_label)
-        
-        top_status_layout.addSpacing(30)
-        
-        self.time_label = QLabel("TIME --:--:--.---")
-        self.time_label.setStyleSheet("font-size: 20px; font-family: Consolas; color: white;")
-        top_status_layout.addWidget(self.time_label)
-        
-        top_status_layout.addSpacing(30)
-        
-        self.index_label = QLabel("ID --")
-        self.index_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #00ccff;")
-        top_status_layout.addWidget(self.index_label)
-        
-        top_status_layout.addStretch()
-        
-        # 连接状态灯
-        self.conn_status_indicator = QLabel("● 未连接")
-        self.conn_status_indicator.setStyleSheet("color: #ff4444; font-weight: bold; font-size: 16px; margin-right: 10px;")
-        top_status_layout.addWidget(self.conn_status_indicator)
-        
-        video_layout.addWidget(top_status_bar)
+        video_layout.setContentsMargins(10, 8, 10, 8)
+        video_layout.setSpacing(7)
+        video_header = QHBoxLayout()
+        video_title = QLabel("实时视频")
+        video_title.setObjectName("section_title")
+        video_header.addWidget(video_title)
+        video_header.addStretch()
+        video_layout.addLayout(video_header)
 
-        # 1.5 模型选择工具栏
-        model_bar = QWidget()
-        model_bar.setFixedHeight(45)
-        model_bar.setStyleSheet("background-color: #f0f0f0; border-bottom: 1px solid #d9d9d9;")
-        model_layout = QHBoxLayout(model_bar)
-        model_layout.setContentsMargins(15, 0, 15, 0)
-        
-        model_layout.addWidget(QLabel("当前模型:"))
-        self.model_path_input = QLineEdit(self.model_path or "未选择模型")
-        self.model_path_input.setReadOnly(True)
-        self.model_path_input.setStyleSheet("background-color: #e8e8e8; color: #666; font-size: 14px;")
-        model_layout.addWidget(self.model_path_input, 1)
-        
-        self.btn_browse_model = QPushButton("选择模型...")
-        self.btn_browse_model.setFixedWidth(100)
-        self.btn_browse_model.setStyleSheet("font-size: 14px; padding: 4px;")
-        self.btn_browse_model.clicked.connect(self._browse_model)
-        model_layout.addWidget(self.btn_browse_model)
-        
-        self.btn_reload_model = QPushButton("重载")
-        self.btn_reload_model.setFixedWidth(60)
-        self.btn_reload_model.setStyleSheet("background-color: #1890ff; color: white; font-size: 14px; padding: 4px;")
-        self.btn_reload_model.clicked.connect(self._reload_model)
-        model_layout.addWidget(self.btn_reload_model)
-
-        # 预设：保存/加载“终点线 + ROI + 方向”等关键标定配置（给非程序员一键回滚）
-        self.preset_btn = QPushButton("预设")
-        self.preset_btn.setFixedWidth(60)
-        self.preset_btn.setStyleSheet("font-size: 14px; padding: 4px;")
-        preset_menu = QMenu(self)
-        act_save_default = preset_menu.addAction("保存为默认方案")
-        act_save_default.triggered.connect(lambda: self._save_config_preset("default"))
-        act_save_rescue = preset_menu.addAction("保存为救场方案")
-        act_save_rescue.triggered.connect(lambda: self._save_config_preset("rescue"))
-        preset_menu.addSeparator()
-        act_load_default = preset_menu.addAction("加载默认方案")
-        act_load_default.triggered.connect(lambda: self._load_config_preset("default"))
-        act_load_rescue = preset_menu.addAction("加载救场方案")
-        act_load_rescue.triggered.connect(lambda: self._load_config_preset("rescue"))
-        self.preset_btn.setMenu(preset_menu)
-        model_layout.addWidget(self.preset_btn)
-        
-        video_layout.addWidget(model_bar)
-
-        # 2. 视频显示区域 (支持多机位分屏 2-4 路)
         self.video_container = QWidget()
-        self.video_container.setStyleSheet("background-color: #000;")
+        self.video_container.setStyleSheet("background-color: #0f1216;")
         self.video_grid = QGridLayout(self.video_container)
         self.video_grid.setContentsMargins(2, 2, 2, 2)
         self.video_grid.setSpacing(2)
-        
         self._init_video_labels()
-        
-        video_layout.addWidget(self.video_container, 1) # 占据主要空间
+        video_layout.addWidget(self.video_container, 1)
+        splitter.addWidget(video_widget)
 
-        # 3. 控制按钮区域 - 容器 (使用 ID 选择器，避免影响子组件背景)
-        self.control_bar = QWidget()
-        self.control_bar.setObjectName("control_bar")
-        self.control_bar.setFixedHeight(60)
-        self.control_bar.setStyleSheet("#control_bar { background-color: #ffffff; border-top: 1px solid #d9d9d9; }")
-        btn_layout = QHBoxLayout(self.control_bar)
-        btn_layout.setContentsMargins(15, 0, 15, 0)
-        btn_layout.setSpacing(10)
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.setHandleWidth(5)
+        right_splitter.setChildrenCollapsible(False)
+        right_splitter.setMinimumWidth(410)
+        right_splitter.setStyleSheet("QSplitter::handle { background: #e4e9ee; }")
 
-        # 开始/停止按钮 (精简文字)
-        self.start_btn = QPushButton("开始计时")
+        self.event_list = EventListWidget(self.database)
+        self.event_list.event_selected.connect(self._on_live_event_selected)
+        self.event_list.view_screenshot.connect(self._view_screenshot)
+        self.event_list.set_source_column_visible(len(self.sources) > 1)
+        right_splitter.addWidget(self.event_list)
+
+        self.live_event_review = LiveEventReview(self.database, self.output_dir)
+        self.live_event_review.bib_changed.connect(self._on_bib_changed)
+        self.live_event_review.void_changed.connect(self._on_void_changed)
+        self.live_event_review.next_requested.connect(self._on_review_next_requested)
+        right_splitter.addWidget(self.live_event_review)
+        right_splitter.setSizes([470, 370])
+        splitter.addWidget(right_splitter)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([1050, 550])
+        root_layout.addWidget(splitter, 1)
+        self.splitter = splitter
+        self.right_splitter = right_splitter
+
+        capture_bar = QWidget()
+        capture_bar.setObjectName("capture_bar")
+        capture_bar.setFixedHeight(54)
+        capture_layout = QHBoxLayout(capture_bar)
+        capture_layout.setContentsMargins(12, 0, 12, 0)
+        capture_layout.setSpacing(10)
+
+        self.start_btn = QPushButton("开始采集")
         self.start_btn.setObjectName("start_btn")
-        self.start_btn.setMinimumWidth(120)
-        self.start_btn.setFixedHeight(40)
         self.start_btn.clicked.connect(self._toggle_running)
-        btn_layout.addWidget(self.start_btn)
+        capture_layout.addWidget(self.start_btn)
 
-        # 发枪时间设置按钮
-        self.start_time_btn = QPushButton("发枪时间")
-        self.start_time_btn.setObjectName("primary_btn")
-        self.start_time_btn.setFixedHeight(40)
-        self.start_time_btn.clicked.connect(self._show_start_time_dialog)
-        btn_layout.addWidget(self.start_time_btn)
+        self.capture_detail_label = QLabel("等待开始")
+        self.capture_detail_label.setObjectName("capture_detail")
+        capture_layout.addWidget(self.capture_detail_label)
+        capture_layout.addStretch()
+
+        self.sport_profile_combo = QComboBox()
+        self.sport_profile_combo.setObjectName("sport_profile_combo")
+        self.sport_profile_combo.setToolTip("选择运动员号码位置和检测规则")
+        self.sport_profile_combo.addItem("自行车（车座下 / 背部号码）", "cycling")
+        self.sport_profile_combo.addItem("胸前号码（跑步 / 铁三 / 五项 / 轮滑）", "running")
+        self.sport_profile_combo.addItem("轮滑（头盔 / 大腿号码）", "speed_skating")
+        self._sync_sport_profile_combo()
+        self.sport_profile_combo.currentIndexChanged.connect(self._on_sport_profile_changed)
+        capture_layout.addWidget(self.sport_profile_combo)
 
         self.record_btn = QPushButton("开始录像")
         self.record_btn.setObjectName("record_btn")
-        self.record_btn.setFixedSize(150, 40)
-        self.record_btn.setToolTip("手动保存网络摄像头原始码流；再次点击停止并封装录像文件")
+        self.record_btn.setToolTip("保存网络摄像头原始码流；再次点击停止并封装录像文件")
         self.record_btn.clicked.connect(self._toggle_recording)
         self.record_btn.setEnabled(False)
-        btn_layout.addWidget(self.record_btn)
+        capture_layout.addWidget(self.record_btn)
 
-        self.field_issue_btn = QPushButton("标记问题")
-        self.field_issue_btn.setObjectName("primary_btn")
-        self.field_issue_btn.setFixedHeight(40)
-        self.field_issue_btn.setToolTip("锁定当前原始视频帧，记录现场问题供赛后复现")
-        self.field_issue_btn.clicked.connect(self._mark_field_issue)
-        self.field_issue_btn.setEnabled(False)
-        btn_layout.addWidget(self.field_issue_btn)
+        self.session_count_label = QLabel("本轮新增 0")
+        self.session_count_label.setObjectName("session_count")
+        capture_layout.addWidget(self.session_count_label)
 
-        # 辅助功能按钮
-        self.reset_btn = QPushButton("重置统计")
-        self.reset_btn.setFixedHeight(40)
-        self.reset_btn.clicked.connect(self._reset_stats)
-        self.reset_btn.setEnabled(True)  # 默认开启
-        btn_layout.addWidget(self.reset_btn)
+        self.settings_btn = QPushButton("现场设置")
+        self.settings_btn.setObjectName("settings_btn")
+        self.settings_btn.setMenu(self._create_live_settings_menu())
+        capture_layout.addWidget(self.settings_btn)
+        root_layout.addWidget(capture_bar)
 
-        # 清空记录按钮 (补齐，解决崩溃)
-        self.clear_btn = QPushButton("清空记录")
-        self.clear_btn.setFixedHeight(40)
-        self.clear_btn.clicked.connect(self._clear_all_records)
-        self.clear_btn.setEnabled(True)  # 默认开启
-        btn_layout.addWidget(self.clear_btn)
-
-        btn_layout.addStretch()
-
-        # 模式切换 (更简洁)
-        self.test_mode_checkbox = QCheckBox("模拟测试模式")
-        self.test_mode_checkbox.setChecked(True)
-        self.test_mode_checkbox.setStyleSheet("color: #d46b08; font-weight: bold; font-size: 16px;") # 使用更深的橙色并加粗
-        self.test_mode_checkbox.stateChanged.connect(self._on_mode_changed)
-        btn_layout.addWidget(self.test_mode_checkbox)
-
-        # 号码去重开关
-        self.dedup_checkbox = QCheckBox("号码去重")
-        self.dedup_checkbox.setChecked(True)
-        self.dedup_checkbox.setStyleSheet("color: #0050b3; font-weight: bold; font-size: 16px;")
-        self.dedup_checkbox.stateChanged.connect(self._on_dedup_changed)
-        btn_layout.addWidget(self.dedup_checkbox)
-
-        # 名单校验开关 (马拉松模式)
-        self.athlete_filter_checkbox = QCheckBox("名单过滤")
-        self.athlete_filter_checkbox.setChecked(True)
-        self.athlete_filter_checkbox.setToolTip("开启：仅识别名单内的号码(自行车模式)；关闭：宽泛识别所有号码(马拉松模式)")
-        self.athlete_filter_checkbox.setStyleSheet("color: #096dd9; font-weight: bold; font-size: 16px;")
-        self.athlete_filter_checkbox.stateChanged.connect(self._update_detector_athletes)
-        btn_layout.addWidget(self.athlete_filter_checkbox)
-
-        # 仅限纯数字开关 (自行车模式优化)
-        self.numeric_only_checkbox = QCheckBox("仅限纯数字")
-        self.numeric_only_checkbox.setChecked(True)
-        self.numeric_only_checkbox.setToolTip("针对自行车比赛优化：只识别纯数字号码，过滤掉带字母的干扰项")
-        self.numeric_only_checkbox.setStyleSheet("color: #722ed1; font-weight: bold; font-size: 16px;")
-        self.numeric_only_checkbox.stateChanged.connect(self._on_numeric_only_changed)
-        btn_layout.addWidget(self.numeric_only_checkbox)
-
-        # 龙门安全模式（默认开启，抑制龙门/拱门误检）
-        self.gate_guard_checkbox = QCheckBox("龙门安全模式")
-        self.gate_guard_checkbox.setChecked(bool(self._gate_guard_enabled))
-        self.gate_guard_checkbox.setToolTip("开启：优先抑制龙门/拱门误检；关闭：放宽过滤，适合非龙门赛道")
-        self.gate_guard_checkbox.setStyleSheet("color: #13c2c2; font-weight: bold; font-size: 16px;")
-        self.gate_guard_checkbox.stateChanged.connect(self._on_gate_guard_changed)
-        btn_layout.addWidget(self.gate_guard_checkbox)
-
-        # 号码范围输入
-        btn_layout.addSpacing(10)
-        btn_layout.addWidget(QLabel("号码段:"))
-        self.bib_ranges_input = QLineEdit()
-        self.bib_ranges_input.setPlaceholderText("例如: A1001-A2000, 1-500")
-        self.bib_ranges_input.setToolTip("输入合法号码段，用逗号分隔。符合范围的号码将获得更高识别权重。")
-        self.bib_ranges_input.setFixedWidth(200)
-        self.bib_ranges_input.editingFinished.connect(self._on_bib_ranges_changed)
-        btn_layout.addWidget(self.bib_ranges_input)
-
-        video_layout.addWidget(self.control_bar)
-
-        splitter.addWidget(video_widget)
-
-        # 右边 - 事件列表 + 系统日志
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(5)
-
-        self.event_list = EventListWidget(self.database)
-        self.event_list.view_screenshot.connect(self._view_screenshot)
-        # 单机位适配：如果只有一个机位，隐藏来源列
-        self.event_list.set_source_column_visible(len(self.sources) > 1)
-        right_layout.addWidget(self.event_list, 7) # 占 7/10 高度
-
-        # 系统日志区域
-        log_group = QGroupBox("系统运行状态")
-        log_layout = QVBoxLayout(log_group)
-        self.log_output = QPlainTextEdit()
+        # 日志继续接收后台消息，但不占用现场工作区。
+        self.log_output = QPlainTextEdit(self)
         self.log_output.setReadOnly(True)
-        self.log_output.setMaximumBlockCount(100) # 最多保留100行
-        self.log_output.setStyleSheet("font-family: Consolas; font-size: 14px; background-color: #f0f0f0;")
-        log_layout.addWidget(self.log_output)
-        right_layout.addWidget(log_group, 3) # 占 3/10 高度
+        self.log_output.setMaximumBlockCount(100)
+        self.log_output.hide()
 
-        splitter.addWidget(right_panel)
-
-        # 设置分割比例 (初始 2:1，适合大多数场景)
-        splitter.setSizes([800, 400])
-
-        layout.addWidget(splitter)
-        self.splitter = splitter
-
-        # 状态信息
-        self.conn_status_label = QLabel("连接状态: 未知")
-        self.conn_status_label.setStyleSheet("margin-right: 15px; color: #666; font-weight: bold; font-size: 16px;")
+        self.conn_status_label = QLabel("主相机: 未知")
+        self.conn_status_label.hide()
         self.statusBar().addPermanentWidget(self.conn_status_label)
 
-        self.stats_status_label = QLabel("记录: 0")
-        self.stats_status_label.setStyleSheet("margin-right: 15px; color: #000000; font-weight: bold; font-size: 16px;")
+        self.stats_status_label = QLabel("本轮新增: 0")
+        self.stats_status_label.hide()
         self.statusBar().addPermanentWidget(self.stats_status_label)
 
-        # OCR 引擎常驻标签：让用户一眼看到当前引擎
-        self.ocr_engine_label = QLabel("OCR引擎: Mobile Recognition")
-        self.ocr_engine_label.setStyleSheet("margin-right: 15px; color: #1677ff; font-weight: bold; font-size: 14px;")
-        self.ocr_engine_label.setToolTip("独立低优先级进程，仅加载移动识别模型")
-        self.statusBar().addPermanentWidget(self.ocr_engine_label)
+        self.ocr_engine_label = QLabel("OCR引擎: Mobile Recognition", self)
+        self.ocr_engine_label.hide()
         self._refresh_ocr_engine_badge()
 
-        # OCR 状态标签
         self.ocr_status_label = QPushButton("OCR: 未初始化")
         self.ocr_status_label.setFlat(True)
         self.ocr_status_label.setCursor(Qt.PointingHandCursor)
-        self.ocr_status_label.setStyleSheet("color: #666; font-weight: bold; font-size: 14px; border: none; text-align: left; padding: 0px 10px;")
+        self.ocr_status_label.setStyleSheet("color: #667085; font-size: 11px; border: none; padding: 0 7px;")
         self.ocr_status_label.clicked.connect(self._init_ocr_runtime)
         self.statusBar().addPermanentWidget(self.ocr_status_label)
+        if self._yolo_only_mode:
+            self._ocr_runtime_state = "disabled"
+        self._refresh_ocr_runtime_ui()
 
         self.recording_status_label = QLabel("录像: 待机")
         self.recording_status_label.setStyleSheet(
-            "margin-right: 12px; color: #666; font-weight: bold; font-size: 13px;"
+            "margin-right: 6px; color: #667085; font-size: 11px;"
         )
         self.recording_status_label.setToolTip("手动录像状态、持续时间和当前文件大小")
         self.statusBar().addPermanentWidget(self.recording_status_label)
 
-        # 轻量巡检状态标签（摄像头实时健康）
         self.live_monitor_label = QLabel("巡检: 待机")
-        self.live_monitor_label.setStyleSheet("margin-right: 12px; color: #666; font-weight: bold; font-size: 13px;")
-        self.live_monitor_label.setToolTip("轻量实时巡检：基于现有检测结果做滚动统计，不额外跑模型")
+        self.live_monitor_label.setStyleSheet("margin-right: 6px; color: #667085; font-size: 11px;")
+        self.live_monitor_label.setToolTip("基于现有检测结果的轻量运行健康状态")
         self.statusBar().addPermanentWidget(self.live_monitor_label)
         self._refresh_live_monitor_badge(time.time())
 
+        self.statusBar().setSizeGripEnabled(False)
+        self.statusBar().setContentsMargins(8, 0, 4, 0)
         self.statusBar().showMessage("系统就绪")
+        self._set_capture_state(False)
+
+    def _init_operator_controls(self):
+        """保留运行逻辑依赖的设置控件，但不放入现场主工作区。"""
+        self._operator_control_store = QWidget(self)
+        self._operator_control_store.hide()
+
+        self.model_path_input = QLineEdit(self.model_path or "未选择模型", self._operator_control_store)
+        self.model_path_input.setReadOnly(True)
+
+        self.test_mode_checkbox = QCheckBox("模拟测试模式", self._operator_control_store)
+        self.test_mode_checkbox.setChecked(True)
+        self.test_mode_checkbox.stateChanged.connect(self._on_mode_changed)
+
+        self.dedup_checkbox = QCheckBox("号码去重", self._operator_control_store)
+        self.dedup_checkbox.setChecked(True)
+        self.dedup_checkbox.stateChanged.connect(self._on_dedup_changed)
+
+        self.athlete_filter_checkbox = QCheckBox("名单过滤", self._operator_control_store)
+        self.athlete_filter_checkbox.setChecked(True)
+        self.athlete_filter_checkbox.stateChanged.connect(self._update_detector_athletes)
+
+    def _create_live_settings_menu(self):
+        menu = QMenu(self)
+
+        model_menu = menu.addMenu("检测模型")
+        model_menu.addAction("选择模型...", self._browse_model)
+        model_menu.addAction("重载模型", self._reload_model)
+
+        preset_menu = menu.addMenu("标定预设")
+        preset_menu.addAction("保存为默认方案", lambda: self._save_config_preset("default"))
+        preset_menu.addAction("保存为救场方案", lambda: self._save_config_preset("rescue"))
+        preset_menu.addSeparator()
+        preset_menu.addAction("加载默认方案", lambda: self._load_config_preset("default"))
+        preset_menu.addAction("加载救场方案", lambda: self._load_config_preset("rescue"))
+
+        options_menu = menu.addMenu("识别选项")
+
+        def add_checkbox_action(label, checkbox):
+            action = QAction(label, self, checkable=True)
+            action.setChecked(checkbox.isChecked())
+            action.toggled.connect(checkbox.setChecked)
+            checkbox.toggled.connect(action.setChecked)
+            options_menu.addAction(action)
+            return action
+
+        self.test_mode_action = add_checkbox_action("模拟测试模式", self.test_mode_checkbox)
+        self.dedup_action = add_checkbox_action("号码去重", self.dedup_checkbox)
+        self.athlete_filter_action = add_checkbox_action("名单过滤", self.athlete_filter_checkbox)
+
+        menu.addAction("发枪时间设置...", self._show_start_time_dialog)
+        menu.addSeparator()
+        self.reset_stats_action = menu.addAction("重置检测统计", self._reset_stats)
+        self.clear_records_action = menu.addAction("清空全部事件...", self._clear_all_records)
+        self.field_issue_action = menu.addAction("保存诊断问题标记...", self._mark_field_issue)
+        self.field_issue_action.setEnabled(False)
+        return menu
+
+    def _sync_sport_profile_combo(self):
+        combo = getattr(self, 'sport_profile_combo', None)
+        if combo is None:
+            return
+        index = combo.findData(self.sport_profile)
+        if index < 0:
+            index = combo.findData('cycling')
+        combo.blockSignals(True)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+    def _on_sport_profile_changed(self, index: int):
+        combo = getattr(self, 'sport_profile_combo', None)
+        if combo is None or index < 0:
+            return
+        selected = normalize_sport_profile(combo.itemData(index))
+        if selected == self.sport_profile:
+            return
+        if self._running:
+            self._sync_sport_profile_combo()
+            return
+
+        self.sport_profile = selected
+        self.config['sport_profile'] = selected
+        self._gate_guard_enabled = True
+        self.config['gate_guard_enabled'] = True
+        self._athlete_validator_checked = bool(self.shared_athlete_validator)
+
+        for reader in self.readers.values():
+            reader.stop()
+        self.readers.clear()
+        self.detectors.clear()
+        self._initialized = False
+        self._set_capture_state(False)
+        self._save_config()
+        logger.info(f"[Main] 赛事类型已切换: {selected}")
+        self.statusBar().showMessage(f"赛事类型已切换: {combo.currentText()}")
+
+    def _set_capture_state(self, running: bool):
+        if hasattr(self, 'sport_profile_combo'):
+            self.sport_profile_combo.setEnabled(not running)
+        if running:
+            self.capture_state_label.setText("正在采集")
+            self.capture_state_label.setStyleSheet(
+                "background: #e8f4ed; color: #246144; border: 1px solid #b9d8c6;"
+            )
+            self._update_capture_connection_detail()
+        else:
+            self.capture_state_label.setText("采集已停止" if self._initialized else "采集未开始")
+            self.capture_state_label.setStyleSheet(
+                "background: #f2f4f7; color: #52606d; border: 1px solid #d7dce2;"
+            )
+            self.capture_detail_label.setText("事件队列和证据核对保持可用" if self._initialized else "等待开始")
+            standby_text = "● 主相机待机" if self._initialized else "● 主相机未连接"
+            self.conn_status_indicator.setText(standby_text)
+            self.conn_status_indicator.setStyleSheet(
+                "color: #667085; font-weight: 700; font-size: 13px;"
+            )
+            for source_id, fps_label in getattr(self, 'cam_fps_labels', {}).items():
+                setattr(self, f'_fps_{source_id}', 0.0)
+                fps_label.setText("-- FPS")
+                fps_label.setStyleSheet(
+                    "color: #888; font-size: 12px; border: none; margin-left: 8px;"
+                )
+            for indicator in getattr(self, 'cam_status_indicators', {}).values():
+                indicator.setText("●")
+                indicator.setStyleSheet(
+                    "color: #667085; font-size: 12px; border: none; margin-left: 8px;"
+                )
+                indicator.setToolTip("待机" if self._initialized else "未连接")
+
+    def _connected_source_count(self) -> int:
+        try:
+            from .stream_reader import StreamStatus
+        except ImportError:
+            from stream_reader import StreamStatus
+        return sum(
+            1 for reader in self.readers.values()
+            if getattr(reader, 'status', None) == StreamStatus.CONNECTED
+        )
+
+    def _update_capture_connection_detail(self):
+        if not self._running:
+            return
+        connected = self._connected_source_count()
+        total = max(1, len(self.sources))
+        if connected >= total:
+            self.capture_detail_label.setText(f"已连接 {connected} 路机位")
+        elif connected == 0:
+            self.capture_detail_label.setText("等待机位连接")
+        else:
+            self.capture_detail_label.setText(f"已连接 {connected}/{total} 路机位")
+
+    def _on_live_event_selected(self, event: dict):
+        self.live_event_review.set_event(event)
+
+    def _on_review_next_requested(self, event_id: int):
+        self.event_list.select_next_event(event_id)
 
     def _refresh_ocr_engine_badge(self):
         """刷新状态栏 OCR 引擎显示。"""
@@ -3003,9 +3071,18 @@ class MainWindow(QMainWindow):
         if now_ts is None:
             now_ts = time.time()
 
+        if not self._running:
+            self.live_monitor_label.setText("巡检: 待机")
+            self.live_monitor_label.setStyleSheet(
+                "margin-right: 6px; color: #667085; font-size: 11px;"
+            )
+            self.live_monitor_label.setToolTip("采集开始后显示运行巡检状态")
+            self._live_monitor_last_summary = "待机"
+            return
+
         if not self._live_monitor_enabled:
             self.live_monitor_label.setText("巡检: 已关闭")
-            self.live_monitor_label.setStyleSheet("margin-right: 12px; color: #8c8c8c; font-weight: bold; font-size: 13px;")
+            self.live_monitor_label.setStyleSheet("margin-right: 6px; color: #667085; font-size: 11px;")
             self.live_monitor_label.setToolTip("轻量巡检已关闭")
             self._live_monitor_last_summary = ""
             return
@@ -3016,7 +3093,7 @@ class MainWindow(QMainWindow):
 
         if not ready_evals:
             self.live_monitor_label.setText("巡检: 采样中")
-            self.live_monitor_label.setStyleSheet("margin-right: 12px; color: #595959; font-weight: bold; font-size: 13px;")
+            self.live_monitor_label.setStyleSheet("margin-right: 6px; color: #667085; font-size: 11px;")
             self.live_monitor_label.setToolTip("轻量巡检正在积累样本")
             self._live_monitor_last_summary = "采样中"
             return
@@ -3037,7 +3114,7 @@ class MainWindow(QMainWindow):
         compact = " ".join([item.get('label', '') for item in evaluations])
         self.live_monitor_label.setText(f"{title} | {compact}")
         self.live_monitor_label.setStyleSheet(
-            f"margin-right: 12px; color: {color}; font-weight: bold; font-size: 13px;"
+            f"margin-right: 6px; color: {color}; font-weight: 600; font-size: 11px;"
         )
         self.live_monitor_label.setToolTip(
             "轻量巡检（滚动窗口）\n" + "\n".join([
@@ -3288,17 +3365,21 @@ class MainWindow(QMainWindow):
         elif state == "loading":
             text, color, tooltip = "OCR: 正在启动...", "#faad14", "正在子进程加载移动识别模型"
         elif state == "disabled":
-            text, color, tooltip = "OCR: 已停用", "#666", "YOLO-only 或 OCR 故障降级"
+            text, color, tooltip = "OCR: 已关闭", "#667085", "当前为仅视频检测模式，事件和证据保存不受影响"
         elif state == "failed":
             text, color, tooltip = "OCR: 启动失败 (点击重试)", "#ff4d4f", "OCR失败不影响检测和事件保存"
         else:
             text, color, tooltip = "OCR: 未启动 (点击启动)", "#666", "启动独立轻量识别进程"
         self.ocr_status_label.setText(text)
         self.ocr_status_label.setStyleSheet(
-            f"color: {color}; font-weight: bold; font-size: 14px; border: none; "
-            "text-align: left; padding: 0px 10px;"
+            f"color: {color}; font-weight: 600; font-size: 11px; border: none; "
+            "text-align: left; padding: 0 7px;"
         )
         self.ocr_status_label.setToolTip(tooltip)
+        self.ocr_status_label.setEnabled(state != "disabled")
+        self.ocr_status_label.setCursor(
+            Qt.ArrowCursor if state == "disabled" else Qt.PointingHandCursor
+        )
 
     def _on_ocr_event_done(self, event_id, result):
         """单个 OCR 任务完成回调"""
@@ -3669,10 +3750,7 @@ class MainWindow(QMainWindow):
             "rois": self.config.get("rois", {}),
             "roi_enabled": self.config.get("roi_enabled", {}),
             "crossing_direction": self.config.get("crossing_direction"),
-            "gate_guard_enabled": bool(self.config.get("gate_guard_enabled", True)),
         }
-        if getattr(self, "database", None):
-            payload["bib_ranges"] = self.database.get_config("bib_ranges", "")
         return payload
 
     def _apply_preset_payload(self, payload: Dict[str, Any]) -> None:
@@ -3688,30 +3766,12 @@ class MainWindow(QMainWindow):
             "rois",
             "roi_enabled",
             "crossing_direction",
-            "gate_guard_enabled",
         ):
             if key in payload:
                 self.config[key] = payload[key]
 
-        # 2) 数据库持久化配置（号段）
-        if getattr(self, "database", None) and "bib_ranges" in payload:
-            try:
-                ranges = str(payload.get("bib_ranges") or "").strip()
-                self.database.set_config("bib_ranges", ranges)
-                if hasattr(self, "bib_ranges_input"):
-                    self.bib_ranges_input.setText(ranges)
-            except Exception:
-                pass
-
-        # 3) gate_guard UI 同步（红线：默认开启，预设也只做“同步”）
-        try:
-            self._gate_guard_enabled = bool(self.config.get("gate_guard_enabled", True))
-            if hasattr(self, "gate_guard_checkbox"):
-                self.gate_guard_checkbox.blockSignals(True)
-                self.gate_guard_checkbox.setChecked(bool(self._gate_guard_enabled))
-                self.gate_guard_checkbox.blockSignals(False)
-        except Exception:
-            pass
+        self._gate_guard_enabled = True
+        self.config['gate_guard_enabled'] = True
 
         # 4) 应用到运行中的 detector（不强制重启，下一帧生效）
         try:
@@ -4143,7 +4203,7 @@ class MainWindow(QMainWindow):
                     model=self.shared_model, 
                     ocr=None,
                     ocr_engine=self.ocr_engine,
-                    only_numeric=self.numeric_only_checkbox.isChecked(),
+                    only_numeric=False,
                     realtime_ocr=False,
                     gate_guard_enabled=bool(self._gate_guard_enabled),
                     athlete_validator=self.shared_athlete_validator,
@@ -4204,10 +4264,8 @@ class MainWindow(QMainWindow):
             color = "#ff6600" if is_test else "#00aa00"
             self.test_mode_checkbox.setStyleSheet(f"QCheckBox {{ font-weight: bold; color: {color}; font-size: 16px; }}")
             self.test_mode_checkbox.blockSignals(False)
-
-            # 5. 同步号码段范围
-            bib_ranges = self.database.get_config('bib_ranges', '')
-            self.bib_ranges_input.setText(bib_ranges)
+            if hasattr(self, 'test_mode_action'):
+                self.test_mode_action.setChecked(is_test)
 
             self._initialized = True
             return True
@@ -4217,52 +4275,6 @@ class MainWindow(QMainWindow):
             logger.exception("初始化组件时发生异常")
             return False
 
-    def _on_bib_ranges_changed(self):
-        """当号码段输入框内容变化时保存并同步"""
-        ranges = self.bib_ranges_input.text().strip()
-        self.database.set_config('bib_ranges', ranges)
-        logger.info(f"[Main] 已更新号码段规则并保存到数据库: {ranges}")
-        self._update_detector_athletes()
-
-    def _on_numeric_only_changed(self, state):
-        """处理仅限纯数字开关切换"""
-        is_numeric_only = (state == Qt.Checked)
-        self.database.set_config('numeric_only', '1' if is_numeric_only else '0')
-
-        # 同步到已启动的检测器
-        if hasattr(self, 'detectors') and self.detectors:
-            for detector in self.detectors.values():
-                detector.only_numeric = is_numeric_only
-
-        # Keep event OCR validation aligned with the operator's race rule.
-        if self.ocr_manager:
-            self.ocr_manager.only_numeric = bool(is_numeric_only)
-                
-        status = "开启" if is_numeric_only else "关闭"
-        logger.info(f"[Main] 仅限纯数字模式已{status}")
-        self.statusBar().showMessage(f"仅限纯数字模式已{status}")
-
-    def _on_gate_guard_changed(self, state):
-        """处理龙门安全模式开关切换"""
-        enabled = (state == Qt.Checked)
-        self._gate_guard_enabled = bool(enabled)
-        self.config['gate_guard_enabled'] = bool(enabled)
-
-        if self.database:
-            self.database.set_config('gate_guard_enabled', '1' if enabled else '0')
-
-        if hasattr(self, 'detectors') and self.detectors:
-            for detector in self.detectors.values():
-                if hasattr(detector, 'set_gate_guard_enabled'):
-                    detector.set_gate_guard_enabled(enabled)
-                else:
-                    detector.enable_gate_guard = bool(enabled)
-
-        self._save_config()
-        status = "开启" if enabled else "关闭"
-        logger.info(f"[Main] 龙门安全模式已{status}")
-        self.statusBar().showMessage(f"龙门安全模式已{status}")
-
     def _update_detector_athletes(self):
         """同步数据库中的选手名单特征到所有检测器 (支持多机位)"""
         if not self.detectors or not self.database:
@@ -4271,6 +4283,7 @@ class MainWindow(QMainWindow):
         try:
             # 获取数据库中的选手名单特征 (包含号码段 bib_ranges_str)
             summary = self.database.get_athlete_summary()
+            summary['bib_ranges_str'] = ''
             
             # 根据“名单过滤”开关决定是否加载名单
             if self.athlete_filter_checkbox.isChecked():
@@ -4284,18 +4297,9 @@ class MainWindow(QMainWindow):
                     for detector in self.detectors.values():
                         detector.set_athlete_list({}) # 清空名单
             else:
-                # 马拉松模式：虽然不启用名单严格过滤，但仍然同步号码段规则以提高权重
-                # 我们传一个只含号码段规则的 summary
-                ranges_only_summary = {
-                    'bibs': set(),
-                    'max_numeric': 0,
-                    'allowed_chars': set(),
-                    'has_alpha': False,
-                    'bib_ranges_str': summary.get('bib_ranges_str', '')
-                }
                 for detector in self.detectors.values():
-                    detector.set_athlete_list(ranges_only_summary)
-                logger.info("[Main] 马拉松模式: 已同步号码段规则到所有检测器 (不启用严格名单过滤)")
+                    detector.set_athlete_list({})
+                logger.info("[Main] 名单过滤已关闭，检测器使用自动号码格式")
                 
         except Exception as e:
             logger.error(f"[Main] 同步选手名单失败: {e}")
@@ -4474,37 +4478,31 @@ class MainWindow(QMainWindow):
                 ui_skip = 1 if source_id == 0 else 2
                 thread = VideoThread(reader, detector, source_id=source_id, ui_skip=ui_skip)
                 thread.detections_ready.connect(self._on_detections_ready)
+                thread.frame_ready.connect(self._on_detected_frame)
                 thread.event_detected.connect(self._on_event_detected)
                 thread.bib_updated.connect(self._on_bib_updated)
                 thread.status_changed.connect(self._update_conn_status)
                 thread.roi_auto_disabled.connect(self._on_roi_auto_disabled)
                 self.video_threads[source_id] = thread
                 thread.start()
-
-                preview_thread = PreviewThread(
-                    reader,
-                    source_id=source_id,
-                    target_fps=float(self.config.get("preview_fps", 30.0)),
-                )
-                preview_thread.frame_ready.connect(self._on_preview_frame)
-                self.preview_threads[source_id] = preview_thread
-                preview_thread.start()
                 
                 # 初始状态同步
                 self._update_conn_status(reader.status, source_id)
 
-        self.start_btn.setText("停止")
+        self.start_btn.setText("停止采集")
         self.start_btn.setObjectName("stop_btn")
         self.start_btn.setStyle(self.start_btn.style())  # 刷新样式
-        self.reset_btn.setEnabled(True)
-        self.clear_btn.setEnabled(False)  # 运行中禁止清空记录
+        self.reset_stats_action.setEnabled(True)
+        self.clear_records_action.setEnabled(False)
+        self._set_capture_state(True)
         self._refresh_recording_ui()
         
         # 强制刷新一次列表，确保显示最新状态
         if hasattr(self, 'event_list'):
             self.event_list.refresh_list()
 
-        self.statusBar().showMessage(f"运行中 (已连接 {len(self.video_threads)} 路机位)")
+        connected = self._connected_source_count()
+        self.statusBar().showMessage(f"运行中 (已连接 {connected}/{len(self.sources)} 路机位)")
 
     def _stop(self):
         """停止 (支持多机位)"""
@@ -4522,6 +4520,7 @@ class MainWindow(QMainWindow):
         for source_id, thread in self.video_threads.items():
             try:
                 thread.detections_ready.disconnect()
+                thread.frame_ready.disconnect()
                 thread.event_detected.disconnect()
                 thread.bib_updated.disconnect()
                 thread.status_changed.disconnect()
@@ -4539,11 +4538,12 @@ class MainWindow(QMainWindow):
         if self.recorder:
             self.recorder.stop()
 
-        self.start_btn.setText("开始")
+        self.start_btn.setText("开始采集")
         self.start_btn.setObjectName("start_btn")
         self.start_btn.setStyle(self.start_btn.style())  # 刷新样式
-        self.reset_btn.setEnabled(True)
-        self.clear_btn.setEnabled(True)   # 停止后可以清空
+        self.reset_stats_action.setEnabled(True)
+        self.clear_records_action.setEnabled(True)
+        self._set_capture_state(False)
         self._refresh_recording_ui()
         self._refresh_live_monitor_badge(time.time())
         self.statusBar().showMessage("已停止")
@@ -4566,6 +4566,12 @@ class MainWindow(QMainWindow):
         self._live_monitor_last_warn_ts.clear()
         self._live_monitor_last_render_ts = 0.0
         self._refresh_live_monitor_badge(self._start_time)
+        if hasattr(self, 'session_count_label'):
+            self.session_count_label.setText("本轮新增 0")
+        if hasattr(self, 'video_session_label'):
+            self.video_session_label.setText("本轮新增 0")
+        if hasattr(self, 'stats_status_label'):
+            self.stats_status_label.setText("本轮新增: 0")
         self.statusBar().showMessage("已重置统计 (所有机位追踪状态和记录缓存已清空)")
 
     def _clear_all_records(self):
@@ -4590,7 +4596,7 @@ class MainWindow(QMainWindow):
                     model=self.shared_model, 
                     ocr=None,
                     ocr_engine=self.ocr_engine,
-                    only_numeric=self.numeric_only_checkbox.isChecked(),
+                    only_numeric=False,
                     realtime_ocr=False,
                     gate_guard_enabled=bool(self._gate_guard_enabled),
                     athlete_validator=self.shared_athlete_validator,
@@ -4622,6 +4628,14 @@ class MainWindow(QMainWindow):
             # 强制重置列表 UI
             if hasattr(self, 'event_list'):
                 self.event_list.reset_ui()
+            if hasattr(self, 'live_event_review'):
+                self.live_event_review.clear_event()
+            if hasattr(self, 'session_count_label'):
+                self.session_count_label.setText("本轮新增 0")
+            if hasattr(self, 'video_session_label'):
+                self.video_session_label.setText("本轮新增 0")
+            if hasattr(self, 'stats_status_label'):
+                self.stats_status_label.setText("本轮新增: 0")
 
             self.statusBar().showMessage("已清空所有记录并重置所有引擎状态")
 
@@ -4672,14 +4686,26 @@ class MainWindow(QMainWindow):
                 self.conn_status_label.setStyleSheet(f"{style} color: {color};")
 
             if hasattr(self, 'conn_status_indicator'):
-                self.conn_status_indicator.setText(f"● {text}")
-                self.conn_status_indicator.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 16px; margin-right: 10px;")
+                self.conn_status_indicator.setText(f"● 主相机{text}")
+                self.conn_status_indicator.setStyleSheet(
+                    f"color: {color}; font-weight: 700; font-size: 13px;"
+                )
+
+        self._update_capture_connection_detail()
 
     def _on_detections_ready(self, athletes, bibs, source_id=0):
         self._latest_frame_observations[source_id] = (
             [dict(item) if isinstance(item, dict) else item for item in (athletes or [])],
             [dict(item) if isinstance(item, dict) else item for item in (bibs or [])],
         )
+
+    def _on_detected_frame(self, frame, athletes, bibs, source_id=0):
+        try:
+            self._on_frame_ready(frame, athletes, bibs, source_id)
+        finally:
+            thread = self.video_threads.get(source_id)
+            if thread is not None:
+                thread.mark_ui_consumed()
 
     def _on_preview_frame(self, frame, source_id=0):
         try:
@@ -4707,8 +4733,9 @@ class MainWindow(QMainWindow):
         # 2. 限制界面刷新率 (每个机位独立限制)
         now = time.time()
         last_update_attr = f'_last_ui_update_time_{source_id}'
+        display_fps = max(1.0, float(self.config.get("preview_fps", 30.0)))
         if hasattr(self, last_update_attr):
-            if now - getattr(self, last_update_attr) < 0.04:  # 1/25s
+            if now - getattr(self, last_update_attr) < (1.0 / display_fps):
                 return
         setattr(self, last_update_attr, now)
 
@@ -5234,27 +5261,23 @@ class MainWindow(QMainWindow):
                 self.recorder.start()
             self.recorder.record(event)
             
-        # 3. 更新界面实时面板
-        if hasattr(self, 'rank_label'):
-            self.rank_label.setText(f"RANK {self._session_event_count}")
-        if hasattr(self, 'time_label'):
-            self.time_label.setText(event.cross_time_str)
-        if hasattr(self, 'index_label'):
-            self.index_label.setText(f"ID: {event.track_id}")
-            
-        # 4. 刷新右侧列表
+        # 3. 刷新右侧列表
         # 注意：此处不再直接刷新，而是等待 recorder 保存完后的回调触发，确保数据已落库
         # if hasattr(self, 'event_list'):
         #     self.event_list.refresh_list()
             
-        # 5. 状态栏提示
+        # 4. 状态栏提示
         self.statusBar().showMessage(f"检测到过线: ID {event.track_id} | 号码: {event.bib_number or '未知'}", 3000)
         
-        # 6. 更新统计信息
+        # 5. 更新统计信息
         if hasattr(self, 'stats_status_label'):
             # 不再实时查询数据库总数，避免主线程 IO 阻塞
             # 数据库总数可以通过其他方式异步更新，这里只更新本次会话计数
-            self.stats_status_label.setText(f"本次会话: {self._session_event_count}")
+            self.stats_status_label.setText(f"本轮新增: {self._session_event_count}")
+        if hasattr(self, 'session_count_label'):
+            self.session_count_label.setText(f"本轮新增 {self._session_event_count}")
+        if hasattr(self, 'video_session_label'):
+            self.video_session_label.setText(f"本轮新增 {self._session_event_count}")
 
     def _on_bib_updated(self, track_id: int, bib: str, conf: float, status: Any, source_id: int, 
                         bib_crop: Optional[np.ndarray] = None, athlete_crop: Optional[np.ndarray] = None, 
@@ -5422,6 +5445,8 @@ class MainWindow(QMainWindow):
                         self.test_mode_checkbox.blockSignals(True)
                         self.test_mode_checkbox.setChecked(True)
                         self.test_mode_checkbox.blockSignals(False)
+                        if hasattr(self, 'test_mode_action'):
+                            self.test_mode_action.setChecked(True)
                         return
                     elif reply == QMessageBox.Yes:
                         # 清空测试数据
@@ -5444,6 +5469,8 @@ class MainWindow(QMainWindow):
                         self.test_mode_checkbox.blockSignals(True)
                         self.test_mode_checkbox.setChecked(True)
                         self.test_mode_checkbox.blockSignals(False)
+                        if hasattr(self, 'test_mode_action'):
+                            self.test_mode_action.setChecked(True)
                         QMessageBox.warning(self, "提示", "未设置发枪时间，保持测试模式")
                         return
 
@@ -5459,6 +5486,9 @@ class MainWindow(QMainWindow):
 
     def _show_start_time_dialog(self):
         """显示发枪时间设置对话框"""
+        if not self.database:
+            QMessageBox.information(self, "提示", "请先选择赛事。")
+            return
         dialog = StartTimeDialog(self.database, self)
         dialog.exec_()
 
@@ -5489,10 +5519,16 @@ class MainWindow(QMainWindow):
             # Remove the GUI handler before its Qt target is destroyed.
             import logging
             root_logger = logging.getLogger()
-            if getattr(self, '_gui_log_handler', None):
+            gui_log_handler = getattr(self, '_gui_log_handler', None)
+            if gui_log_handler:
                 try:
-                    root_logger.removeHandler(self._gui_log_handler)
+                    root_logger.removeHandler(gui_log_handler)
                 except Exception:
+                    pass
+                try:
+                    from .logger import logger as custom_logger
+                    custom_logger.removeHandler(gui_log_handler)
+                except (ImportError, ValueError):
                     pass
                 self._gui_log_handler = None
         except Exception as e:
@@ -5531,9 +5567,9 @@ def main():
 
     parser.add_argument(
         '--sport-profile',
-        choices=('cycling', 'speed_skating'),
+        choices=('cycling', 'running', 'speed_skating'),
         default=None,
-        help='Event profile: cycling or speed_skating',
+        help='Event profile: cycling, running, or speed_skating',
     )
 
     args = parser.parse_args()

@@ -7,7 +7,7 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QComboBox, QLabel, QLineEdit, QHeaderView, QMenu,
-    QMessageBox, QAbstractItemView
+    QMessageBox, QAbstractItemView, QButtonGroup
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QThread, QMetaObject, pyqtSlot
 from PyQt5.QtGui import QColor, QBrush, QFont
@@ -49,6 +49,10 @@ class EventListWidget(QWidget):
         self._last_sync_time = datetime.now().isoformat()
         self._is_refreshing = False # 刷新状态锁
         self._db_missing_warned = False
+        self._selection_to_restore = None
+        self._known_events: Dict[int, Dict[str, Any]] = {}
+        self._unseen_new_events = 0
+        self._latest_unseen_event_id: Optional[int] = None
 
         self._init_ui()
         self._connect_signals()
@@ -75,65 +79,107 @@ class EventListWidget(QWidget):
 
     def _init_ui(self):
         """初始化界面"""
+        self.setObjectName("event_queue")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(12, 10, 12, 8)
         layout.setSpacing(8)
 
         # 样式表
         self.setStyleSheet("""
-            QWidget {
+            QWidget#event_queue {
                 background-color: #ffffff;
-                font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
             }
             QTableWidget {
-                border: 1px solid #d9d9d9;
-                gridline-color: #f0f0f0;
+                border: 1px solid #d8dee6;
+                border-radius: 3px;
+                gridline-color: #edf0f3;
                 background-color: #ffffff;
-                selection-background-color: #1890ff;
-                selection-color: #ffffff;
-                font-size: 16px;
+                alternate-background-color: #fafbfc;
+                selection-background-color: #dfeaf3;
+                selection-color: #182230;
+                font-size: 12px;
                 outline: none;
-                color: #000000;
+                color: #253246;
             }
             QTableWidget::item {
-                padding: 10px;
+                padding: 6px;
+                border-bottom: 1px solid #edf0f3;
             }
             QTableWidget::item:selected {
-                background-color: #1890ff;
-                color: #ffffff;
+                background-color: #dfeaf3;
+                color: #182230;
             }
             QHeaderView::section {
-                background-color: #f0f0f0;
-                color: #000000;
-                padding: 12px;
+                background-color: #f5f7f9;
+                color: #52606d;
+                min-height: 34px;
+                padding: 6px;
                 border: none;
-                border-right: 1px solid #d9d9d9;
-                border-bottom: 1px solid #d9d9d9;
-                font-weight: bold;
-                font-size: 16px;
+                border-right: 1px solid #e3e7ec;
+                border-bottom: 1px solid #d8dee6;
+                font-weight: 700;
+                font-size: 11px;
             }
             QComboBox {
-                border: 1px solid #d9d9d9;
+                min-height: 30px;
+                border: 1px solid #c5ccd6;
                 border-radius: 4px;
-                padding: 5px 10px;
-                min-width: 120px;
-                background: white;
-                font-size: 16px;
-                color: #000000;
+                padding: 0 8px;
+                background: #f8fafb;
+                font-size: 12px;
+                color: #253246;
             }
             QComboBox:hover {
-                border-color: #1890ff;
+                border-color: #98a2b3;
             }
             QPushButton {
-                background-color: #1890ff;
-                color: white;
+                min-height: 30px;
+                background-color: #f8fafb;
+                color: #344054;
+                border: 1px solid #c5ccd6;
                 border-radius: 4px;
-                padding: 5px 10px;
-                font-weight: bold;
-                font-size: 16px;
+                padding: 0 10px;
+                font-weight: 600;
+                font-size: 12px;
             }
             QPushButton:hover {
-                background-color: #40a9ff;
+                background-color: #eef2f5;
+                border-color: #98a2b3;
+            }
+            QWidget#queue_filter_group {
+                background: #eef2f5;
+                border: 1px solid #d5dbe3;
+                border-radius: 4px;
+            }
+            QPushButton#queue_filter_button {
+                min-height: 26px;
+                padding: 0 10px;
+                background: transparent;
+                color: #667085;
+                border: 1px solid transparent;
+                border-radius: 3px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QPushButton#queue_filter_button:checked {
+                background: #ffffff;
+                color: #182230;
+                border-color: #c5ccd6;
+            }
+            QPushButton#new_events_button {
+                min-height: 28px;
+                padding: 0 9px;
+                background: #edf5fb;
+                color: #245f8f;
+                border: 1px solid #bfd3e3;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QPushButton#new_events_button:hover {
+                background: #e2eff8;
+                border-color: #8fb4cf;
             }
             QPushButton#action_btn {
                 background-color: #f0f0f0;
@@ -155,19 +201,49 @@ class EventListWidget(QWidget):
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(0, 0, 0, 5)
 
-        # 筛选下拉框
+        title_label = QLabel("事件队列")
+        title_label.setStyleSheet("color: #182230; font-size: 15px; font-weight: 700;")
+        toolbar.addWidget(title_label)
+        toolbar.addSpacing(8)
+
+        # 保留隐藏下拉框作为筛选状态源，现场使用双段按钮操作。
         self.filter_combo = QComboBox()
-        self.filter_combo.setPlaceholderText("所有分组")
+        self.filter_combo.setPlaceholderText("全部")
         self._update_filter_categories()
         self.filter_combo.currentTextChanged.connect(self._on_filter_changed)
-        self.filter_combo.setFixedWidth(150) # 固定宽度更整齐
-        toolbar.addWidget(self.filter_combo)
+        self.filter_combo.hide()
+
+        filter_group = QWidget()
+        filter_group.setObjectName("queue_filter_group")
+        filter_layout = QHBoxLayout(filter_group)
+        filter_layout.setContentsMargins(2, 2, 2, 2)
+        filter_layout.setSpacing(0)
+
+        self.filter_button_group = QButtonGroup(self)
+        self.filter_button_group.setExclusive(True)
+        self.filter_all_btn = QPushButton("全部 0")
+        self.filter_review_btn = QPushButton("需处理 0")
+        for button in (self.filter_all_btn, self.filter_review_btn):
+            button.setObjectName("queue_filter_button")
+            button.setCheckable(True)
+            filter_layout.addWidget(button)
+            self.filter_button_group.addButton(button)
+        self.filter_all_btn.clicked.connect(lambda: self._set_filter_value("全部"))
+        self.filter_review_btn.clicked.connect(lambda: self._set_filter_value("需处理"))
+        self.filter_all_btn.setChecked(True)
+        toolbar.addWidget(filter_group)
 
         toolbar.addStretch()
 
+        self.new_events_btn = QPushButton()
+        self.new_events_btn.setObjectName("new_events_button")
+        self.new_events_btn.clicked.connect(self._jump_to_latest_unseen)
+        self.new_events_btn.hide()
+        toolbar.addWidget(self.new_events_btn)
+
         self.stats_label = QLabel("共 0 条记录")
-        self.stats_label.setStyleSheet("color: #000000; font-size: 16px; font-weight: bold; margin-right: 10px;")
-        toolbar.addWidget(self.stats_label)
+        self.stats_label.setStyleSheet("color: #667085; font-size: 12px; margin-right: 2px;")
+        self.stats_label.hide()
 
         layout.addLayout(toolbar)
 
@@ -175,7 +251,7 @@ class EventListWidget(QWidget):
         self.table = QTableWidget()
         self.table.setColumnCount(12) # 增加一列：组名次 + 来源
         self.table.setHorizontalHeaderLabels([
-            "序号", "号码", "姓名", "分组", "组名次", "状态", "过线时间", "芯片时间", "来源", "备注", "ID", "操作"
+            "视频序号", "号码", "姓名", "分组", "组名次", "状态", "视频时间", "芯片时间", "机位", "备注", "ID", "操作"
         ])
 
         # 表格设置
@@ -185,7 +261,7 @@ class EventListWidget(QWidget):
         self.table.setSortingEnabled(True)
         self.table.setShowGrid(False) # 隐藏网格线，更现代
         self.table.setAlternatingRowColors(True) # 启用交替行颜色，提高可读性
-        self.table.setStyleSheet(self.table.styleSheet() + "QTableWidget { alternate-background-color: #f5f5f5; }")
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         
         # 初始按过线时间倒序排列（最新的在最上面，符合直播/监控逻辑）
         # 注意：现在过线时间是第 6 列 (从0开始)
@@ -197,21 +273,21 @@ class EventListWidget(QWidget):
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.table.cellClicked.connect(self._on_cell_clicked)
         
-        # 增加行高，视觉更清爽，适应更大的字体
-        self.table.verticalHeader().setDefaultSectionSize(50)
+        self.table.verticalHeader().setDefaultSectionSize(44)
         self.table.verticalHeader().setVisible(False)
 
         # 列宽与显示隐藏设置
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        
-        # 重点突出：号码和名次列加宽
-        self.table.setColumnWidth(0, 70)   # 序号
-        self.table.setColumnWidth(1, 100)  # 号码
-        self.table.setColumnWidth(4, 90)   # 组名次
-        self.table.setColumnWidth(6, 180)  # 过线时间
-        self.table.setColumnWidth(5, 140)  # 状态
-        self.table.setColumnWidth(10, 120) # 操作列
+        header.setSectionResizeMode(QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 70)
+        self.table.setColumnWidth(1, 86)
+        self.table.setColumnWidth(5, 82)
+        self.table.setColumnWidth(8, 60)
+
+        # 主工作区只呈现视频证据系统自身的信息。
+        for column in (2, 3, 4, 7, 9, 10, 11):
+            self.table.hideColumn(column)
 
         layout.addWidget(self.table)
 
@@ -281,29 +357,75 @@ class EventListWidget(QWidget):
         threading.Thread(target=fetch_task, daemon=True).start()
 
     def _update_filter_categories(self):
-        """更新筛选下拉框的类别列表"""
+        """更新现场队列筛选项。"""
         current = self.filter_combo.currentText()
         self.filter_combo.blockSignals(True)
         self.filter_combo.clear()
-        
-        # 基础状态筛选
-        base_items = ["全部", "已识别", "需复核", "未识别", "已作废"]
-        self.filter_combo.addItems(base_items)
-        
-        # 从数据库获取的分组
-        try:
-            categories = self.database.get_all_categories()
-            if categories:
-                self.filter_combo.insertSeparator(len(base_items))
-                self.filter_combo.addItems(categories)
-        except Exception:
-            pass
+        self.filter_combo.addItems(["全部", "需处理"])
             
         # 恢复之前的选中项
         index = self.filter_combo.findText(current)
         if index >= 0:
             self.filter_combo.setCurrentIndex(index)
+        elif self.filter_combo.count() > 0:
+            self.filter_combo.setCurrentIndex(0)
         self.filter_combo.blockSignals(False)
+        self._sync_filter_buttons()
+
+    def _set_filter_value(self, value: str):
+        """由双段筛选按钮更新隐藏筛选状态。"""
+        if self.filter_combo.currentText() == value:
+            self._sync_filter_buttons()
+            return
+        self.filter_combo.setCurrentText(value)
+
+    def _sync_filter_buttons(self):
+        if not hasattr(self, 'filter_all_btn'):
+            return
+        current = self.filter_combo.currentText() or "全部"
+        self.filter_all_btn.setChecked(current == "全部")
+        self.filter_review_btn.setChecked(current == "需处理")
+
+    def _active_bib_counts(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for known in self._known_events.values():
+            bib = known.get('bib_number')
+            if bib and not known.get('is_void'):
+                counts[bib] = counts.get(bib, 0) + 1
+        return counts
+
+    def _event_needs_review(
+        self,
+        event: Dict[str, Any],
+        bib_counts: Optional[Dict[str, int]] = None,
+    ) -> bool:
+        if not event or event.get('is_void'):
+            return False
+        bib = event.get('bib_number')
+        if event.get('bib_status') != 'recognized' or not bib:
+            return True
+        counts = bib_counts if bib_counts is not None else self._active_bib_counts()
+        return counts.get(bib, 0) > 1
+
+    def _update_new_event_notice(self):
+        if not hasattr(self, 'new_events_btn'):
+            return
+        if self._unseen_new_events <= 0:
+            self.new_events_btn.hide()
+            return
+        self.new_events_btn.setText(f"新增 {self._unseen_new_events} 条")
+        self.new_events_btn.show()
+
+    def _clear_new_event_notice(self):
+        self._unseen_new_events = 0
+        self._latest_unseen_event_id = None
+        self._update_new_event_notice()
+
+    def _jump_to_latest_unseen(self):
+        event_id = self._latest_unseen_event_id
+        if event_id is not None:
+            self.select_event_by_id(event_id, emit_signal=True, scroll=True)
+        self._clear_new_event_notice()
 
     def _on_new_events_fetched(self, new_events):
         """主线程：处理新获取的事件"""
@@ -332,6 +454,7 @@ class EventListWidget(QWidget):
             if self.table.rowCount() < 200:
                 self._recalculate_ranks()
                 self._refresh_duplicate_highlights()
+            self._update_stats_label()
             
             # 异步更新类别（每隔一段时间更新一次，不要每次新事件都更新）
             if not hasattr(self, '_last_cat_update') or (datetime.now() - self._last_cat_update).total_seconds() > 10:
@@ -348,10 +471,13 @@ class EventListWidget(QWidget):
         try:
             if not modified_events:
                 return
-                
+            selected_event_id = self._selected_event_id()
+
             print(f"[EventList] 收到 {len(modified_events)} 条修改事件")
             for event in modified_events:
                 event_id = event.get('event_id')
+                if event_id is not None:
+                    self._known_events[int(event_id)] = dict(event)
                 # 寻找该事件所在的行
                 found = False
                 for row in range(self.table.rowCount()):
@@ -380,68 +506,30 @@ class EventListWidget(QWidget):
             # 更新完后刷新全局冲突和名次
             self._refresh_duplicate_highlights()
             self._recalculate_ranks()
+            self._update_stats_label()
+            if selected_event_id is not None:
+                self.select_event_by_id(selected_event_id, emit_signal=True, scroll=False)
         finally:
             self._is_refreshing = False # 确保锁释放
 
     def _recalculate_ranks(self):
-        """重新计算当前视图中的序号和组内名次"""
+        """重新计算视频事件顺序，不生成正式或组内名次。"""
         row_count = self.table.rowCount()
         if row_count == 0:
             return
 
-        # 1. 序号 (顺序码)
-        # 获取当前排序状态
-        header = self.table.horizontalHeader()
-        sort_col = header.sortIndicatorSection()
-        sort_order = header.sortIndicatorOrder()
-        
-        # 如果是按过线时间或ID排序
-        if sort_col in [6, 10]:
-            if sort_order == Qt.DescendingOrder:
-                # 最新在顶，序号应该是 N, N-1, ... 1
-                for row in range(row_count):
-                    item = self.table.item(row, 0)
-                    if item: item.setData(Qt.DisplayRole, row_count - row)
-            else:
-                # 最早在顶，序号是 1, 2, ... N
-                for row in range(row_count):
-                    item = self.table.item(row, 0)
-                    if item: item.setData(Qt.DisplayRole, row + 1)
-        else:
-            # 其他排序方式下，序号仅作为行号参考
-            for row in range(row_count):
-                item = self.table.item(row, 0)
-                if item: item.setData(Qt.DisplayRole, row + 1)
-
-        # 2. 组内名次
-        # 收集所有非作废记录
-        group_data = {} # {category: [(row, time)]}
         for row in range(row_count):
-            event = self._get_event_at_row(row)
-            if not event or event.get('is_void'):
-                # 作废记录不计名次
-                rank_item = self.table.item(row, 4)
-                if rank_item: rank_item.setText("-")
-                continue
-                
-            cat = event.get('athlete_category') or "未分组"
-            if cat not in group_data:
-                group_data[cat] = []
-            
-            # 使用 cross_time (float) 进行精确排序
-            group_data[cat].append({
-                'row': row,
-                'time': event.get('cross_time', 0)
-            })
-            
-        # 分组计算名次
-        for cat, items in group_data.items():
-            # 按过线时间升序排列（最早的第1名）
-            items.sort(key=lambda x: x['time'])
-            for i, item in enumerate(items):
-                rank_item = self.table.item(item['row'], 4)
-                if rank_item:
-                    rank_item.setData(Qt.DisplayRole, i + 1)
+            event_item = self.table.item(row, 10)
+            event = event_item.data(Qt.UserRole) if event_item else None
+            sequence_item = self.table.item(row, 0)
+            if sequence_item:
+                sequence_item.setData(
+                    Qt.DisplayRole,
+                    event.get('event_id') if event else row + 1,
+                )
+            rank_item = self.table.item(row, 4)
+            if rank_item:
+                rank_item.setText("-")
 
     def reset_ui(self):
         """强制重置 UI 和所有同步计数器 (同步版，用于彻底解决清空后不刷新的问题)"""
@@ -454,10 +542,13 @@ class EventListWidget(QWidget):
         
         # 3. 清空表格内容
         self.table.setRowCount(0)
+        self._selection_to_restore = None
+        self._known_events.clear()
+        self._clear_new_event_notice()
         
         # 4. 更新统计和类别
-        self.stats_label.setText("共 0 条记录")
         self._update_filter_categories()
+        self._update_stats_label()
         
         print("[EventList] UI 和计数器已强制重置为 0")
 
@@ -509,24 +600,11 @@ class EventListWidget(QWidget):
                 self._db_missing_warned = True
             return
             
-        filter_text = self.filter_combo.currentText()
-        include_void = (filter_text == "已作废" or filter_text == "全部")
+        self._selection_to_restore = self._selected_event_id()
         
         def fetch_task():
             try:
-                events = self.database.get_all_events(include_void=include_void)
-                
-                # 状态筛选
-                if filter_text == "已识别":
-                    events = [e for e in events if e['bib_status'] == 'recognized']
-                elif filter_text == "需复核":
-                    events = [e for e in events if e['bib_status'] == 'needs_review']
-                elif filter_text == "未识别":
-                    events = [e for e in events if e['bib_status'] == 'unrecognized']
-                elif filter_text == "已作废":
-                    events = [e for e in events if e['is_void']]
-                elif filter_text not in ["全部", ""]:
-                    events = [e for e in events if e.get('athlete_category') == filter_text]
+                events = self.database.get_all_events(include_void=True)
                 
                 # 更新最后已知的 ID 和同步时间
                 if events:
@@ -550,20 +628,32 @@ class EventListWidget(QWidget):
 
     def _on_all_events_fetched(self, events):
         """主线程：全量更新列表"""
-        print(f"[EventList] 全量刷新，收到 {len(events)} 条记录")
+        self._known_events = {
+            int(event['event_id']): dict(event)
+            for event in events
+            if event.get('event_id') is not None
+        }
+        display_events = events
+        if self.filter_combo.currentText() == "需处理":
+            bib_counts = self._active_bib_counts()
+            display_events = [
+                event for event in events if self._event_needs_review(event, bib_counts)
+            ]
+
+        print(f"[EventList] 全量刷新，收到 {len(events)} 条记录，显示 {len(display_events)} 条")
         # 暂时关闭排序，避免插入数据时触发重排
         sorting_enabled = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
         
         # 统计号码频率（用于高亮冲突）
         bib_counts = {}
-        for e in events:
+        for e in self._known_events.values():
             bib = e.get('bib_number')
             if bib and not e.get('is_void'):
                 bib_counts[bib] = bib_counts.get(bib, 0) + 1
         
-        self.table.setRowCount(len(events))
-        for row, event in enumerate(events):
+        self.table.setRowCount(len(display_events))
+        for row, event in enumerate(display_events):
             bib = event.get('bib_number')
             is_duplicate = bib and not event.get('is_void') and bib_counts.get(bib, 0) > 1
             self._set_row_data(row, event, is_duplicate)
@@ -576,12 +666,21 @@ class EventListWidget(QWidget):
         # 恢复排序设置
         self.table.setSortingEnabled(sorting_enabled)
         
-        if events:
-            self._last_event_id = max(e['event_id'] for e in events)
+        if self._known_events:
+            self._last_event_id = max(self._known_events)
         else:
             self._last_event_id = 0
             # 如果列表为空，重置同步时间，确保能接收到任何新改动
             self._last_sync_time = datetime.now().isoformat()
+
+        self._recalculate_ranks()
+        self._refresh_duplicate_highlights()
+        restored = self.select_event_by_id(self._selection_to_restore, emit_signal=True, scroll=False)
+        self._selection_to_restore = None
+        if not restored and self.table.rowCount() > 0:
+            self.table.selectRow(0)
+            self._emit_selected_event(0)
+        self._update_stats_label()
 
     def _set_row_data(self, row: int, event: Dict[str, Any], is_duplicate: bool = False):
         """设置行数据 (12列适配版)"""
@@ -591,7 +690,7 @@ class EventListWidget(QWidget):
 
         # 显式设置基础字体
         base_font = QFont()
-        base_font.setPointSize(14)
+        base_font.setPointSize(10)
 
         # 0. 序号 (临时占位，由 _recalculate_ranks 统一计算)
         seq_item = QTableWidgetItem()
@@ -600,31 +699,25 @@ class EventListWidget(QWidget):
         self.table.setItem(row, 0, seq_item)
 
         # 1. 号码
-        bib = event.get('bib_number') or "未识别"
+        bib = str(event.get('bib_number') or "--")
         bib_item = QTableWidgetItem()
-        if bib.isdigit():
-            bib_item.setData(Qt.DisplayRole, int(bib))
-        else:
-            bib_item.setText(bib)
+        bib_item.setText(bib)
             
         bib_item.setTextAlignment(Qt.AlignCenter)
         
         # 显式设置号码字体
         bib_font = QFont()
-        bib_font.setPointSize(15) # 号码字号略大
+        bib_font.setPointSize(11)
         bib_font.setBold(True)     # 号码一律加粗
-        
+
         if event.get('is_void'):
-            bib_item.setForeground(QBrush(QColor("#8c8c8c"))) # 灰色
+            bib_item.setForeground(QBrush(QColor("#98a2b3")))
         elif is_duplicate:
-            # 冲突号码显示红色
-            bib_item.setForeground(QBrush(QColor("#f5222d")))
-        elif event.get('bib_status') == 'recognized':
-            bib_item.setForeground(QBrush(QColor("#52c41a"))) # 绿色
-        elif event.get('bib_status') == 'needs_review':
-            bib_item.setForeground(QBrush(QColor("#faad14"))) # 橙黄色
-        elif bib == "未识别":
-            bib_item.setForeground(QBrush(QColor("#ff4d4f"))) # 红色
+            bib_item.setForeground(QBrush(QColor("#b42318")))
+        elif bib == "--":
+            bib_item.setForeground(QBrush(QColor("#667085")))
+        else:
+            bib_item.setForeground(QBrush(QColor("#182230")))
             
         bib_item.setFont(bib_font)
         self.table.setItem(row, 1, bib_item)
@@ -654,34 +747,34 @@ class EventListWidget(QWidget):
 
         if event.get('is_void'):
             status_text = "已作废"
-            status_color = QColor("#8c8c8c") # 灰色
-            bg_color = QColor("#f5f5f5") # 作废行灰色背景
+            status_color = QColor("#667085")
+            bg_color = QColor("#f3f4f6")
         elif is_duplicate:
             status_text = "号码冲突"
-            status_color = QColor("#f5222d") # 红色
-            bg_color = QColor("#fff1f0") # 冲突行淡红背景
+            status_color = QColor("#b42318")
+            bg_color = QColor("#fef3f2")
         elif event.get('is_ai_correction'):
             status_text = "AI已修正"
-            status_color = QColor("#006644") # 深绿色
-            bg_color = QColor("#e6f7ff") # AI修正行淡蓝背景 (或者淡绿色 #f6ffed)
+            status_color = QColor("#175cd3")
+            bg_color = QColor("#eff8ff")
         elif event.get('bib_status') == 'recognized':
             status_text = "已识别"
-            status_color = QColor("#52c41a") # 绿色
+            status_color = QColor("#067647")
         elif event.get('bib_status') == 'needs_review':
-            status_text = "待复核"
-            status_color = QColor("#faad14") # 橙黄色
-            bg_color = QColor("#fffbe6") # 复核行淡黄背景
+            status_text = "待核对"
+            status_color = QColor("#9a6700")
+            bg_color = QColor("#fffaeb")
         else:
             status_text = "未识别"
-            status_color = QColor("#ff4d4f") # 浅红
-            bg_color = QColor("#fff1f0") # 未识别行淡红背景
+            status_color = QColor("#b42318")
+            bg_color = QColor("#fef6f5")
 
         status_item = QTableWidgetItem(status_text)
         status_item.setTextAlignment(Qt.AlignCenter)
         status_item.setForeground(QBrush(status_color))
         # 加粗文字
         status_font = QFont()
-        status_font.setPointSize(14)
+        status_font.setPointSize(10)
         status_font.setBold(True)
         status_item.setFont(status_font)
         self.table.setItem(row, 5, status_item)
@@ -763,8 +856,9 @@ class EventListWidget(QWidget):
             if item:
                 item.setBackground(QBrush(color))
 
-    def _on_filter_changed(self):
+    def _on_filter_changed(self, *_args):
         """筛选条件改变"""
+        self._sync_filter_buttons()
         self.refresh_list()
 
     def _on_cell_double_clicked(self, row, column):
@@ -775,16 +869,30 @@ class EventListWidget(QWidget):
 
     def _on_cell_clicked(self, row, column):
         """点击单元格（选中行同步）"""
-        event = self._get_event_at_row(row)
-        if event:
-            self.event_selected.emit(event)
+        self._emit_selected_event(row)
 
     def _get_event_at_row(self, row: int) -> Optional[dict]:
         """获取指定行的事件"""
         id_item = self.table.item(row, 10) # ID在第10列
         if id_item:
-            return id_item.data(Qt.UserRole)
+            event = id_item.data(Qt.UserRole)
+            sequence_item = self.table.item(row, 0)
+            if event and sequence_item:
+                event['_video_sequence'] = sequence_item.text()
+            return event
         return None
+
+    def _emit_selected_event(self, row: int):
+        event = self._get_event_at_row(row)
+        if event:
+            self.event_selected.emit(event)
+            if event.get('event_id') == self._latest_unseen_event_id:
+                self._clear_new_event_notice()
+
+    def _selected_event_id(self):
+        row = self.table.currentRow()
+        event = self._get_event_at_row(row) if row >= 0 else None
+        return event.get('event_id') if event else None
 
     def _view_event(self, event: dict):
         """查看事件"""
@@ -802,8 +910,10 @@ class EventListWidget(QWidget):
                 events.append(event)
         return events
 
-    def select_event_by_id(self, event_id: int):
-        """联动功能：根据 ID 选中列表中的行并滚动到视图中心"""
+    def select_event_by_id(self, event_id: int, emit_signal: bool = False, scroll: bool = True):
+        """根据 ID 选中列表中的行，可选发送核对联动信号。"""
+        if event_id is None:
+            return False
         # 取消所有之前的选中
         self.table.clearSelection()
         
@@ -813,21 +923,51 @@ class EventListWidget(QWidget):
                 # 选中该行
                 self.table.selectRow(row)
                 # 确保该行可见
-                self.table.scrollToItem(self.table.item(row, 0), QAbstractItemView.PositionAtCenter)
-                break
+                if scroll:
+                    self.table.scrollToItem(self.table.item(row, 0), QAbstractItemView.PositionAtCenter)
+                if emit_signal:
+                    self._emit_selected_event(row)
+                return True
+        return False
+
+    def select_next_event(self, current_event_id: int):
+        """选择当前事件下方的下一条，供“保存并下一条”使用。"""
+        for row in range(self.table.rowCount()):
+            event = self._get_event_at_row(row)
+            if event and event.get('event_id') == current_event_id:
+                next_row = row + 1
+                if next_row < self.table.rowCount():
+                    self.table.selectRow(next_row)
+                    self.table.scrollToItem(
+                        self.table.item(next_row, 0),
+                        QAbstractItemView.PositionAtCenter,
+                    )
+                    self._emit_selected_event(next_row)
+                    return True
+                return False
+        return False
+
+    def _update_stats_label(self):
+        total = len(self._known_events)
+        bib_counts = self._active_bib_counts()
+        needs_review = sum(
+            1
+            for event in self._known_events.values()
+            if self._event_needs_review(event, bib_counts)
+        )
+        if hasattr(self, 'filter_all_btn'):
+            self.filter_all_btn.setText(f"全部 {total}")
+            self.filter_review_btn.setText(f"需处理 {needs_review}")
+        self.stats_label.setText(f"{total} 条  ·  {needs_review} 待处理")
 
     def _refresh_duplicate_highlights(self):
         """重新扫描并更新所有行的冲突高亮状态"""
         row_count = self.table.rowCount()
         bib_counts = {}
-        
-        # 第一遍：统计
-        for row in range(row_count):
-            event = self._get_event_at_row(row)
-            if event and not event.get('is_void'):
+        for event in self._known_events.values():
+            if not event.get('is_void') and event.get('bib_number'):
                 bib = event.get('bib_number')
-                if bib:
-                    bib_counts[bib] = bib_counts.get(bib, 0) + 1
+                bib_counts[bib] = bib_counts.get(bib, 0) + 1
         
         # 第二遍：更新 UI
         for row in range(row_count):
@@ -841,19 +981,19 @@ class EventListWidget(QWidget):
                 if status_item:
                     if event.get('is_void'):
                         status_text = "已作废"
-                        status_color = QColor("#666666")
+                        status_color = QColor("#667085")
                     elif is_duplicate:
-                        status_text = "逻辑冲突"
-                        status_color = QColor("#DE350B")
+                        status_text = "号码冲突"
+                        status_color = QColor("#B42318")
                     elif event.get('bib_status') == 'recognized':
                         status_text = "已识别"
-                        status_color = QColor("#006644")
+                        status_color = QColor("#067647")
                     elif event.get('bib_status') == 'needs_review':
-                        status_text = "需复核"
-                        status_color = QColor("#826A00")
+                        status_text = "待核对"
+                        status_color = QColor("#9A6700")
                     else:
                         status_text = "未识别"
-                        status_color = QColor("#BF2600")
+                        status_color = QColor("#B42318")
                     
                     status_item.setText(status_text)
                     status_item.setForeground(QBrush(status_color))
@@ -862,30 +1002,31 @@ class EventListWidget(QWidget):
                 bib_item = self.table.item(row, 1)
                 if bib_item:
                     if is_duplicate:
-                        bib_item.setForeground(QBrush(QColor("#DE350B")))
+                        bib_item.setForeground(QBrush(QColor("#B42318")))
                         font = bib_item.font()
                         font.setBold(True)
                         bib_item.setFont(font)
                     else:
-                        # 恢复默认颜色
                         if event.get('is_void'):
-                            bib_item.setForeground(QBrush(Qt.gray))
-                        elif bib == "未识别":
-                            bib_item.setForeground(QBrush(Qt.red))
+                            bib_item.setForeground(QBrush(QColor("#98A2B3")))
+                        elif not bib:
+                            bib_item.setForeground(QBrush(QColor("#667085")))
                         else:
-                            bib_item.setForeground(QBrush(Qt.black))
+                            bib_item.setForeground(QBrush(QColor("#182230")))
                         font = bib_item.font()
-                        font.setBold(False)
+                        font.setBold(True)
                         bib_item.setFont(font)
 
                 # 更新行背景
                 bg_color = QColor("#FFFFFF")
                 if event.get('is_void'):
-                    bg_color = QColor("#F4F5F7")
+                    bg_color = QColor("#F3F4F6")
                 elif is_duplicate:
-                    bg_color = QColor("#FFEBE6")
+                    bg_color = QColor("#FEF3F2")
                 elif event.get('bib_status') == 'needs_review':
-                    bg_color = QColor("#FFF9E6")
+                    bg_color = QColor("#FFFAEB")
+                elif event.get('bib_status') != 'recognized':
+                    bg_color = QColor("#FEF6F5")
                 
                 self._set_row_background(row, bg_color)
 
@@ -893,6 +1034,8 @@ class EventListWidget(QWidget):
         """主线程：更新特定行的数据"""
         # 找到该 event_id 所在的当前行，因为排序可能已经改变了行号
         target_id = event_data.get('event_id')
+        if target_id is not None:
+            self._known_events[int(target_id)] = dict(event_data)
         current_row = -1
         for r in range(self.table.rowCount()):
             item = self.table.item(r, 10) # ID 列 (第10列)
@@ -906,6 +1049,9 @@ class EventListWidget(QWidget):
             self._refresh_duplicate_highlights()
             # 重新计算名次（因为号码变化可能影响分组名次）
             self._recalculate_ranks()
+            self._update_stats_label()
+            if self.filter_combo.currentText() == "需处理" and not self._event_needs_review(event_data):
+                QTimer.singleShot(0, self.refresh_list)
 
     def _edit_bib_number(self, row: int):
         """编辑号码（局部更新版）"""
@@ -953,7 +1099,9 @@ class EventListWidget(QWidget):
             # 1. 立即更新 UI
             event['bib_number'] = new_bib if new_bib else None
             event['bib_status'] = 'recognized' if new_bib else 'unrecognized'
+            self._known_events[int(event['event_id'])] = dict(event)
             self._set_row_data(row, event)
+            self._update_stats_label()
             
             # 2. 后台异步更新数据库并获取完整信息
             def update_db():
@@ -1010,7 +1158,9 @@ class EventListWidget(QWidget):
         
         # 1. 立即更新 UI (UI 先行)
         event['is_void'] = is_void
+        self._known_events[int(event_id)] = dict(event)
         self._set_row_data(row, event)
+        self._update_stats_label()
         
         # 2. 后台异步更新数据库
         def update_db():
@@ -1031,18 +1181,22 @@ class EventListWidget(QWidget):
 
     def add_event(self, event: Dict[str, Any]):
         """添加新事件"""
-        # 1. 检查筛选条件
+        selected_event_id = self._selected_event_id()
+        event_id = int(event['event_id'])
+        is_new_event = event_id not in self._known_events
+        self._known_events[event_id] = dict(event)
+
         filter_text = self.filter_combo.currentText()
-        if filter_text not in ["全部", ""]:
-            # 状态检查
-            if filter_text == "已识别" and event.get('bib_status') != 'recognized': return
-            if filter_text == "需复核" and event.get('bib_status') != 'needs_review': return
-            if filter_text == "未识别" and event.get('bib_status') != 'unrecognized': return
-            if filter_text == "已作废" and not event.get('is_void'): return
-            # 分组检查 (如果 filter_text 是一个分组名)
-            if filter_text not in ["已识别", "需复核", "未识别", "已作废"]:
-                if event.get('athlete_category') != filter_text:
-                    return
+        event_is_visible = filter_text == "全部" or self._event_needs_review(event)
+        if not event_is_visible:
+            self._update_stats_label()
+            self._last_event_id = max(self._last_event_id, event_id)
+            return
+
+        if is_new_event and selected_event_id is not None:
+            self._unseen_new_events += 1
+            self._latest_unseen_event_id = event_id
+            self._update_new_event_notice()
 
         # 2. 插入行
         # 如果是 ASC 排序（按过线顺序），插在末尾
@@ -1062,12 +1216,12 @@ class EventListWidget(QWidget):
         self._recalculate_ranks()
         self._refresh_duplicate_highlights()
         
-        # 4. 自动滚动
-        if row == 0:
-            self.table.scrollToTop()
+        # 4. 保持操作员当前选择。只有尚未选择任何事件时才选中新事件。
+        if selected_event_id is not None:
+            self.select_event_by_id(selected_event_id, emit_signal=False, scroll=False)
         else:
-            self.table.scrollToBottom()
+            self.table.selectRow(row)
+            self._emit_selected_event(row)
             
-        count = self.table.rowCount()
-        self.stats_label.setText(f"共 {count} 条记录")
-        self._last_event_id = max(self._last_event_id, event['event_id'])
+        self._update_stats_label()
+        self._last_event_id = max(self._last_event_id, event_id)

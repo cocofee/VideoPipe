@@ -71,6 +71,41 @@ def test_ocr_duplicate_merge_keeps_one_event_and_moves_evidence(tmp_path):
         db.close()
 
 
+def test_event_recorder_draws_all_athletes_from_crossing_frame(tmp_path):
+    db = Database(str(tmp_path / "event.db"))
+    try:
+        recorder = EventRecorder(str(tmp_path), db)
+        event = CrossingEvent(
+            event_id=1,
+            rank=1,
+            track_id=7,
+            cross_time=10.0,
+            cross_time_str="00:00:10.000",
+            cross_realtime="2026-08-13 10:00:10.000",
+            bib_number=None,
+            bib_confidence=0.0,
+            bib_status=BibStatus.UNRECOGNIZED,
+            detection_confidence=0.9,
+            position=(30, 50),
+            bbox=(10, 10, 30, 50),
+            frame=np.zeros((80, 100, 3), dtype=np.uint8),
+            frame_athletes=(
+                {"bbox": (10, 10, 30, 50), "track_id": 7, "conf": 0.9},
+                {"bbox": (50, 15, 75, 60), "track_id": 8, "conf": 0.8},
+            ),
+        )
+
+        recorder._save_event(event)
+
+        annotated_path = next(recorder.screenshot_full_dir.glob("*_full.jpg"))
+        annotated = cv2.imread(str(annotated_path))
+        assert annotated is not None
+        assert annotated[15, 50, 1] > 180
+        assert annotated[60, 60, 1] > 180
+    finally:
+        db.close()
+
+
 class _MergeDatabase:
     def __init__(self, merge_result=True):
         self.merge_result = merge_result
@@ -256,12 +291,24 @@ def test_pending_ocr_preserves_a_manually_corrected_bib(tmp_path):
         db.close()
 
 
-def test_cycling_ocr_defaults_to_short_numeric_bibs():
+def test_ocr_uses_automatic_numeric_and_prefixed_bib_format():
     manager = OCRManager(_MergeDatabase())
 
-    assert manager.only_numeric is True
+    assert manager.only_numeric is False
+    assert manager._bib_ranges == []
     assert manager._normalize_bib_text("23") == "23"
     assert manager._normalize_bib_text("5") == "5"
+    assert manager._normalize_bib_text("A123") == "A123"
+    assert manager._normalize_bib_text("AB7") == "AB7"
+    assert manager._normalize_bib_text("FINISH") == ""
+
+
+def test_event_vlm_prompt_uses_the_same_automatic_bib_format():
+    manager = OCRManager(_MergeDatabase())
+
+    prompt = manager._build_event_vlm_prompt(2, [])
+
+    assert "1 to 6 digits, optionally prefixed by 1 to 3 letters" in prompt
 
 
 class _ScaleSensitiveOcr:

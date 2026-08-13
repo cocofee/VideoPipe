@@ -102,6 +102,14 @@ class _TimestampDetector:
         return [], [], []
 
 
+class _ObservedDetector(_TimestampDetector):
+    def process_frame(self, frame, timestamp=None):
+        self.received_frame = frame
+        self.received_timestamp = timestamp
+        self.thread._running = False
+        return [], [{"bbox": [1, 2, 3, 4], "track_id": 17}], [{"bbox": [2, 3, 4, 5]}]
+
+
 class _RoiRecoveryDetector(_TimestampDetector):
     def process_frame(self, frame, timestamp=None):
         self.last_frame_metrics = {"roi_auto_disabled": True}
@@ -136,6 +144,48 @@ def test_video_thread_passes_original_frame_and_capture_timestamp_to_detector():
     assert thread.last_frame_metrics["capture_latency_ms"] == 5.0
     assert thread.last_frame_metrics["queue_latency_ms"] >= 0.0
     assert thread.last_frame_metrics["processing_time_ms"] >= 0.0
+
+
+def test_video_thread_publishes_detections_with_the_frame_that_produced_them():
+    frame = np.full((8, 12, 3), 23, dtype=np.uint8)
+    envelope = FrameEnvelope(
+        original_frame=frame,
+        frame_index=21,
+        capture_time_ms=3_000.0,
+        arrival_time_ms=3_005.0,
+        segment_id=1,
+    )
+    reader = _EnvelopeReader(envelope)
+    detector = _ObservedDetector()
+    thread = VideoThread(reader, detector, source_id=2, ui_skip=1)
+    reader.thread = thread
+    detector.thread = thread
+    emitted = []
+    thread.frame_ready.connect(
+        lambda shown_frame, athletes, bibs, source_id: emitted.append(
+            (shown_frame, athletes, bibs, source_id)
+        )
+    )
+
+    thread.run()
+
+    assert len(emitted) == 1
+    shown_frame, athletes, bibs, source_id = emitted[0]
+    assert shown_frame is frame
+    assert athletes == [{"bbox": [1, 2, 3, 4], "track_id": 17}]
+    assert bibs == [{"bbox": [2, 3, 4, 5]}]
+    assert source_id == 2
+
+
+def test_video_thread_limits_pending_ui_frames_to_one():
+    thread = VideoThread(_Reader(), _Detector())
+
+    assert thread._reserve_ui_publish_slot() is True
+    assert thread._reserve_ui_publish_slot() is False
+
+    thread.mark_ui_consumed()
+
+    assert thread._reserve_ui_publish_slot() is True
 
 
 def test_video_thread_forwards_roi_auto_disable_to_ui():

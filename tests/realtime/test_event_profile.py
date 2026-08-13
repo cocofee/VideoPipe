@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from realtime.event_profile import EventProfile, build_event_profile, build_sport_event_profile
+from realtime.event_profile import (
+    EventProfile,
+    build_event_profile,
+    build_sport_event_profile,
+    normalize_sport_profile,
+)
 
 
 def test_default_event_uses_the_common_athlete_bib_pipeline():
@@ -43,6 +48,20 @@ def test_road_cycling_profile_keeps_bicycle_gate_and_rear_saddle_bib_region():
     assert profile.name == "cycling"
     assert profile.required_equipment == "bicycle"
     assert profile.bib_regions == ("rear_saddle", "back")
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["running", "marathon", "triathlon_run", "modern_pentathlon_run", "roller_chest"],
+)
+def test_chest_bib_finish_profiles_share_running_defaults(name):
+    profile = build_sport_event_profile(name)
+
+    assert profile.name == "running"
+    assert profile.required_equipment is None
+    assert profile.bib_regions == ("torso", "back")
+    assert profile.crossing_mode == "finish_once"
+    assert normalize_sport_profile(name) == "running"
 
 
 def test_unknown_pipeline_fails_instead_of_silently_switching_algorithms():

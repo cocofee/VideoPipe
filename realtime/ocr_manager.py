@@ -102,9 +102,8 @@ class OCRManager:
         # - only: 只要有 VLM 就只走 VLM（失败才退回本地，避免全失败）
         self.vlm_mode = "fallback"
 
-        # OCR 号码规则（从 DB 同步）
-        # - 自行车：常见 1~500（可能 1~3 位数字），需要允许短纯数字
-        # - 马拉松：常见 A0001-F9999（字母+4位数字），短数字通常是误识别，应过滤
+        # OCR bib format is automatic: accept short numeric bibs and optional
+        # letter prefixes. Legacy per-race switches are intentionally ignored.
         self.only_numeric = False
         self._bib_ranges = []
         self._refresh_rules_from_db()
@@ -187,7 +186,7 @@ class OCRManager:
 
         import re
 
-        # 自行车“仅限纯数字”模式：允许 1~6 位数字（支持 1~500 这种短号）
+        # Legacy callers may still request numeric-only validation.
         if self.only_numeric:
             if not cleaned.isdigit():
                 return ""
@@ -195,9 +194,9 @@ class OCRManager:
                 return ""
             return cleaned
 
-        # 非纯数字模式：可选字母前缀 + 3~6 位数字（避免把 1~2 位噪声当号码）
-        # 例：A0559, 012849
-        if not re.match(r'^[A-Z]{0,3}[0-9]{3,6}$', cleaned):
+        # Automatic format: 1~6 digits, optionally prefixed by 1~3 letters.
+        # Examples: 5, 23, 012849, A0559.
+        if not re.match(r'^(?:[0-9]{1,6}|[A-Z]{1,3}[0-9]{1,6})$', cleaned):
             return ""
 
         # 号码范围过滤（关键）：如果配置了 bib_ranges，只接受范围内的号码
@@ -225,17 +224,9 @@ class OCRManager:
         return cleaned
 
     def _refresh_rules_from_db(self):
-        """从数据库读取号码规则开关（容错、低成本）。"""
-        try:
-            self.only_numeric = str(self.db.get_config("numeric_only", "1")) == "1"
-        except Exception:
-            pass
-        # 读取号码范围（关键：过滤背景垃圾文字）
-        try:
-            ranges_str = str(self.db.get_config("bib_ranges", "") or "")
-            self._parse_bib_ranges(ranges_str)
-        except Exception:
-            self._bib_ranges = []
+        """Apply the automatic bib policy while ignoring legacy race switches."""
+        self.only_numeric = False
+        self._bib_ranges = []
 
     def _parse_bib_ranges(self, range_str: str):
         """解析号码范围字符串，如 'A0001-A9999, B001-B500, A0001-B9999'
@@ -484,7 +475,7 @@ class OCRManager:
         allowed_format = (
             "1 to 6 digits"
             if self.only_numeric
-            else "an optional letter prefix and 3 to 6 digits"
+            else "1 to 6 digits, optionally prefixed by 1 to 3 letters"
         )
         roster_hint = ""
         if roster_bibs:

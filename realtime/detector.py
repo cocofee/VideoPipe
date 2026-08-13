@@ -420,6 +420,7 @@ class CrossingEvent:
     raw_track_ids: Tuple[int, ...] = ()
     passage_index: int = 1
     sport_profile: str = "cycling"
+    frame_athletes: Tuple[Dict[str, Any], ...] = ()
 
 
 @dataclass
@@ -525,14 +526,14 @@ PROMPT_COUNT_ATHLETES = """你是一个体育赛事计数助手。请数一下�
 左1人穿红衣，中间2人并排"""
 
 
-# ✅ 新版OCR提示词（针对自行车比赛优化）
-PROMPT_BIB_OCR_ENHANCED = """你是专业的自行车比赛号码识别专家。请仔细识别图中运动员身上的参赛号码。
+# ✅ 通用赛事 OCR 提示词
+PROMPT_BIB_OCR_ENHANCED = """你是专业的体育比赛号码识别专家。请仔细识别图中运动员身上的参赛号码。
 
 【本场比赛号码特征】
-- 格式规则: 通常是【1个字母A-Z + 4位数字0000-9999】，例如 A1234, B5678
-- 也可能是【纯数字】，例如 1056, 2350
+- 格式规则: 【1-6位数字】，或【1-3个大写字母前缀 + 1-6位数字】
+- 示例: 5, 23, 1056, A123, AB7
 - 外观特征: 白底黑字或深色底白字，粗体数字，字高通常15-30像素
-- 位置特征: 背部腰际、前胸或自行车横杆上，可能部分被身体/车架遮挡
+- 位置特征: 背部、前胸、头盔、大腿或车座下方，可能部分被身体或器材遮挡
 
 【严格识别规则】
 1. 字符限制: 只允许识别【大写字母A-Z】和【数字0-9】
@@ -548,12 +549,12 @@ PROMPT_BIB_OCR_ENHANCED = """你是专业的自行车比赛号码识别专家。
 - 数字8和字母B易混淆: 号码中通常是数字8
 
 【输出格式】(严格按照以下3行输出)
-第一行: 号码 (如 A1234 或 2350 或 UNREADABLE)
+第一行: 号码 (如 A123、23 或 UNREADABLE)
 第二行: 置信度 (0.0-1.0之间的小数)
 第三行: 说明 (10字内，如"清晰可见"或"部分遮挡推断")
 
 示例输出1:
-A1234
+A123
 0.95
 清晰可见
 
@@ -604,8 +605,8 @@ def build_ocr_prompt_with_list_enhanced(athlete_list: List[str], only_numeric: b
         example = "125"
     else:
         rule_text = "只允许识别【大写字母A-Z】和【数字0-9】。严禁识别汉字、标点。"
-        format_text = "格式: 通常是【1个字母 + 4位数字】或【纯数字】"
-        example = "A1234"
+        format_text = "格式: 1-6位数字，或1-3个大写字母前缀加1-6位数字"
+        example = "A123"
 
     prompt = f"""你是专业的自行车比赛号码识别专家。请仔细识别图中运动员身上的参赛号码。
 
@@ -5650,6 +5651,16 @@ class Detector:
                             if confirmed:
                                 state.crossed = True
                                 state.crossed_time = current_time
+                                frame_athletes = []
+                                for frame_athlete in athletes:
+                                    frame_bbox = frame_athlete.get('bbox')
+                                    if not frame_bbox or len(frame_bbox) != 4:
+                                        continue
+                                    frame_athletes.append({
+                                        'bbox': tuple(int(value) for value in frame_bbox),
+                                        'track_id': int(frame_athlete.get('track_id', -1)),
+                                        'conf': float(frame_athlete.get('conf', 0.0)),
+                                    })
                                 state.pending_event_data = {
                                     'cross_time': current_time if timestamp_provided else time.time(),
                                     'cross_realtime': time.time(),
@@ -5659,6 +5670,7 @@ class Detector:
                                     'frame': frame_original,
                                     'participant_id': athlete.get('participant_id', ''),
                                     'raw_track_ids': tuple(athlete.get('raw_track_ids') or ()),
+                                    'frame_athletes': tuple(frame_athletes),
                                 }
                                 logger.info(f"[Detector-{self.source_id}] ID {tid} 触发过线判定 (方向: {self.crossing_direction or 'any'})")
                             else:
@@ -6151,6 +6163,7 @@ class Detector:
                         participant_id=participant_id,
                         raw_track_ids=event_raw_track_ids,
                         sport_profile=self.sport_profile,
+                        frame_athletes=tuple(data.get('frame_athletes') or ()),
                     )
 
                     # P0：抑制补人虚拟ID的同帧重复事件（不影响真实ID）

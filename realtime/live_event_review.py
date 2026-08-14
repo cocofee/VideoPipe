@@ -16,6 +16,11 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+try:
+    from .io_utils import read_pending_ocr_candidate
+except ImportError:
+    from io_utils import read_pending_ocr_candidate
+
 
 class LiveEventReview(QWidget):
     """Show saved event evidence without leaving the live workspace."""
@@ -186,11 +191,16 @@ class LiveEventReview(QWidget):
             return
 
         self.current_event = dict(event)
+        candidate = read_pending_ocr_candidate(self.current_event, self.output_dir)
+        if candidate:
+            self.current_event["_ocr_candidate"] = candidate["bib"]
+            self.current_event["_ocr_candidate_confidence"] = candidate["confidence"]
         sequence = self.current_event.get("_video_sequence") or self.current_event.get("event_id") or "-"
         time_text = self.current_event.get("cross_time_str") or "时间未知"
         source_id = int(self.current_event.get("source_id", 0) or 0)
         self.event_meta_label.setText(f"视频序号 {sequence}  |  {time_text}  |  机位 {source_id + 1}")
-        self.bib_input.setText(str(self.current_event.get("bib_number") or ""))
+        display_bib = self.current_event.get("bib_number") or self.current_event.get("_ocr_candidate") or ""
+        self.bib_input.setText(str(display_bib))
         self._refresh_void_button()
 
         self.current_evidences = self._collect_evidences(self.current_event)
@@ -204,6 +214,12 @@ class LiveEventReview(QWidget):
             self.image_label.clear()
             self.image_label.setText("该事件尚无可用证据图片")
             self.feedback_label.setText("事件已保留，可继续录入号码或等待证据写入")
+
+        if candidate:
+            confidence = float(candidate.get("confidence") or 0.0)
+            self.feedback_label.setText(
+                f"OCR候选 {candidate['bib']}（置信度 {confidence:.0%}），请核对后保存"
+            )
 
         self.bib_input.setEnabled(True)
         self.save_next_btn.setEnabled(True)

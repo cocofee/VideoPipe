@@ -2090,12 +2090,12 @@ class VLMConfigDialog(QDialog):
         
         form = QFormLayout()
         
-        self.enabled_cb = QCheckBox("启用 VLM 辅助 (通义千问/豆包)")
+        self.enabled_cb = QCheckBox("启用 VLM 辅助 (OpenAI兼容中转/通义千问/豆包)")
         self.enabled_cb.setChecked(self.config.get('enabled', False))
         form.addRow("总开关:", self.enabled_cb)
         
         self.model_type = QComboBox()
-        self.model_type.addItems(["doubao", "qwen"]) # 目前主要支持豆包和通义
+        self.model_type.addItems(["openai", "doubao", "qwen"])
         self.model_type.setCurrentText(self.config.get('model_type', 'qwen'))
         form.addRow("模型类型:", self.model_type)
         
@@ -2105,10 +2105,15 @@ class VLMConfigDialog(QDialog):
         self.api_key.setPlaceholderText("从云端控制台获取的 API Key")
         form.addRow("API Key:", self.api_key)
         
+        self.endpoint_label = QLabel("模型名称:")
         self.endpoint_id = QLineEdit()
         self.endpoint_id.setText(self.config.get('endpoint_id', ''))
-        self.endpoint_id.setPlaceholderText("豆包需提供推理接入点 ID (Endpoint ID)")
-        form.addRow("推理接入点 ID:", self.endpoint_id)
+        form.addRow(self.endpoint_label, self.endpoint_id)
+
+        self.base_url_label = QLabel("中转地址:")
+        self.base_url = QLineEdit()
+        self.base_url.setText(self.config.get('base_url', ''))
+        form.addRow(self.base_url_label, self.base_url)
         
         self.max_rpm = QSpinBox()
         self.max_rpm.setRange(1, 1000)
@@ -2130,10 +2135,22 @@ class VLMConfigDialog(QDialog):
 
         def _refresh_endpoint_placeholder():
             model_type = self.model_type.currentText().strip().lower()
-            if model_type == "qwen":
+            if model_type == "openai":
+                self.endpoint_label.setText("模型名称:")
+                self.endpoint_id.setPlaceholderText("例如：gpt-4.1-mini")
+                self.base_url_label.setVisible(True)
+                self.base_url.setVisible(True)
+                self.base_url.setPlaceholderText("例如：https://你的中转地址/v1")
+            elif model_type == "qwen":
+                self.endpoint_label.setText("模型名称:")
                 self.endpoint_id.setPlaceholderText("通义模型名（可留空）：qwen3.5-ocr")
+                self.base_url_label.setVisible(False)
+                self.base_url.setVisible(False)
             else:
+                self.endpoint_label.setText("推理接入点 ID:")
                 self.endpoint_id.setPlaceholderText("豆包需提供推理接入点 ID (Endpoint ID)")
+                self.base_url_label.setVisible(False)
+                self.base_url.setVisible(False)
 
         self.model_type.currentTextChanged.connect(lambda _t: _refresh_endpoint_placeholder())
         _refresh_endpoint_placeholder()
@@ -2156,6 +2173,7 @@ class VLMConfigDialog(QDialog):
             'model_type': self.model_type.currentText(),
             'api_key': self.api_key.text().strip(),
             'endpoint_id': self.endpoint_id.text().strip(),
+            'base_url': self.base_url.text().strip(),
             'max_calls_per_minute': self.max_rpm.value(),
             'ocr_mode': self.ocr_mode.currentData() or "fallback",
         }
@@ -3511,7 +3529,7 @@ class MainWindow(QMainWindow):
         start_time_action.triggered.connect(self._show_start_time_dialog)
         settings_menu.addAction(start_time_action)
 
-        vlm_config_action = QAction("VLM 辅助配置 (豆包/通义)...", self)
+        vlm_config_action = QAction("VLM 辅助配置 (OpenAI中转/豆包/通义)...", self)
         vlm_config_action.setStatusTip("配置 VLM 大模型辅助号码识别")
         vlm_config_action.triggered.connect(self._config_vlm)
         settings_menu.addAction(vlm_config_action)
@@ -3530,48 +3548,113 @@ class MainWindow(QMainWindow):
             vlm_config = dialog.get_result()
             self.config['vlm_config'] = vlm_config
             self._save_config()
-            
-            # 如果正在运行，立即应用
-            if self._running:
-                self._apply_vlm_settings()
-            
-            self.statusBar().showMessage("VLM 辅助配置已保存")
+
+            # Apply immediately so configuration changes also affect already
+            # saved events; the next capture start will apply it again safely.
+            self._apply_vlm_settings()
+            retried = self._enqueue_pending_ocr_events()
+            if retried:
+                self.statusBar().showMessage(f"VLM 配置已应用，已重试 {retried} 个待识别事件")
+            else:
+                self.statusBar().showMessage("VLM 辅助配置已保存")
+
+    def _enqueue_pending_ocr_events(self) -> int:
+        """Requeue unresolved saved events after OCR/VLM settings change."""
+        if self._yolo_only_mode or not self.ocr_manager or not self.database:
+            return 0
+
+        enqueued = 0
+        try:
+            events = self.database.get_all_events() or []
+        except Exception as exc:
+            logger.warning("[Main] 无法读取待识别事件: %s", exc)
+            return 0
+
+        for event in events:
+            if int(event.get("manual_corrected") or 0) != 0:
+                continue
+            bib = str(event.get("bib_number") or "").strip().upper()
+            ocr_state = str(event.get("ocr_state") or "PENDING").strip().upper()
+            if bib and bib != "UNKNOWN" and ocr_state == "DONE":
+                continue
+            if self.ocr_manager.enqueue_live_event(
+                event_id=int(event.get("event_id") or 0),
+                evidence_dir=event.get("evidence_dir"),
+                cross_time=event.get("cross_time"),
+                participant_id=event.get("participant_id"),
+                raw_track_id=event.get("track_id"),
+            ):
+                enqueued += 1
+
+        if enqueued:
+            logger.info("[Main] VLM 配置更新后重新入队待识别事件: %s", enqueued)
+        return enqueued
+
+    def _disable_vlm_runtime(self):
+        self.shared_vlm = None
+        for detector in self.detectors.values():
+            if hasattr(detector, 'disable_vlm'):
+                detector.disable_vlm()
+        if self.ocr_manager:
+            clear_vlm = getattr(self.ocr_manager, "clear_vlm", None)
+            if callable(clear_vlm):
+                clear_vlm()
+            else:
+                self.ocr_manager.vlm = None
+                self.ocr_manager.vlm_mode = "fallback"
 
     def _apply_vlm_settings(self):
         """应用 VLM 设置到所有检测器及 OCR 管理器"""
         if self._yolo_only_mode:
-            self.shared_vlm = None
-            for detector in self.detectors.values():
-                if hasattr(detector, 'disable_vlm'):
-                    detector.disable_vlm()
+            self._disable_vlm_runtime()
             return
         vlm_config = self.config.get('vlm_config', {})
         if not vlm_config.get('enabled'):
-            self.shared_vlm = None
-            for detector in self.detectors.values():
-                if hasattr(detector, 'disable_vlm'):
-                    detector.disable_vlm()
-            if self.ocr_manager:
-                self.ocr_manager.vlm = None
-                self.ocr_manager.vlm_mode = "fallback"
+            self._disable_vlm_runtime()
             return
 
         api_key = vlm_config.get('api_key')
         if not api_key:
-            self.shared_vlm = None
+            self._disable_vlm_runtime()
             return
 
         endpoint_id = vlm_config.get('endpoint_id')
+        base_url = vlm_config.get('base_url')
         max_rpm = vlm_config.get('max_calls_per_minute', 30)
         model_type = vlm_config.get('model_type', 'qwen')
         
         # 初始化共享 VLM
         try:
             from .detector import DoubaoVLMAssistant, QwenVLMAssistant
+            from .vlm_utils import OpenAIVLMAssistant
             if model_type == "doubao":
                 self.shared_vlm = DoubaoVLMAssistant(api_key, endpoint_id)
-            else:
+            elif model_type == "qwen":
                 self.shared_vlm = QwenVLMAssistant(api_key, endpoint_id or "qwen3.5-ocr")
+            elif model_type == "openai":
+                self.shared_vlm = OpenAIVLMAssistant(
+                    api_key, endpoint_id or "gpt-4.1-mini", base_url=base_url
+                )
+            else:
+                logger.error("[Main] 不支持的 VLM 类型: %s", model_type)
+                self._disable_vlm_runtime()
+                return
+        except ImportError:
+            from detector import DoubaoVLMAssistant, QwenVLMAssistant
+            from vlm_utils import OpenAIVLMAssistant
+            if model_type == "doubao":
+                self.shared_vlm = DoubaoVLMAssistant(api_key, endpoint_id)
+            elif model_type == "qwen":
+                self.shared_vlm = QwenVLMAssistant(api_key, endpoint_id or "qwen3.5-ocr")
+            elif model_type == "openai":
+                self.shared_vlm = OpenAIVLMAssistant(
+                    api_key, endpoint_id or "gpt-4.1-mini", base_url=base_url
+                )
+            else:
+                logger.error("[Main] 不支持的 VLM 类型: %s", model_type)
+                self._disable_vlm_runtime()
+                return
+        try:
             logger.info(f"[Main] 全局 VLM 助手已就绪 ({model_type})")
             
             # 同步到 OCR 管理器
@@ -3581,7 +3664,7 @@ class MainWindow(QMainWindow):
                 self.ocr_manager.vlm_max_calls_per_minute = max(1, int(max_rpm))
         except Exception as e:
             logger.error(f"[Main] 初始化 VLM 失败: {e}")
-            self.shared_vlm = None
+            self._disable_vlm_runtime()
 
         # VLM only runs on saved events so network latency never enters the frame path.
         for detector in self.detectors.values():

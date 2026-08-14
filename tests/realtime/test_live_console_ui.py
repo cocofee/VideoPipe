@@ -1,3 +1,4 @@
+import json
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -8,7 +9,7 @@ from PyQt5.QtWidgets import QApplication, QLabel
 
 from realtime.event_list_widget import EventListWidget
 from realtime.live_event_review import LiveEventReview
-from realtime.main_window import MainWindow
+from realtime.main_window import MainWindow, VLMConfigDialog
 
 
 @pytest.fixture(scope="module")
@@ -63,6 +64,45 @@ def test_live_event_review_uses_saved_evidence_and_emits_actions(qapp, tmp_path)
     assert bib_changes == [(7, "A0123")]
     assert next_requests == [7]
     assert void_changes == [(7, True)]
+    review.close()
+
+
+def test_pending_ocr_candidate_is_visible_but_not_formal(qapp, tmp_path):
+    event_dir = tmp_path / "evidence_photos" / "000007"
+    event_dir.mkdir(parents=True)
+    (event_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "event_id": 7,
+                "bib": "014",
+                "confidence": 0.99,
+                "status": "PENDING",
+                "error": "FALLBACK_ONLY_EVIDENCE",
+                "source": "event_vlm:OpenAIVLMAssistant",
+            }
+        ),
+        encoding="utf-8",
+    )
+    event = _event(7, None, status="unrecognized")
+    event["evidence_dir"] = str(event_dir)
+    event["ocr_state"] = "PENDING"
+
+    widget = EventListWidget(None)
+    widget._on_all_events_fetched([event])
+    qapp.processEvents()
+
+    assert widget.table.item(0, 1).text() == "014"
+    assert widget.table.item(0, 5).text() == "待核对"
+    assert widget._get_event_at_row(0)["bib_number"] is None
+    assert widget._get_event_at_row(0)["_ocr_candidate"] == "014"
+
+    review = LiveEventReview(output_dir=tmp_path)
+    review.set_event(event)
+    qapp.processEvents()
+
+    assert review.bib_input.text() == "014"
+    assert "OCR候选 014" in review.feedback_label.text()
+    widget.close()
     review.close()
 
 
@@ -191,6 +231,22 @@ def test_main_window_uses_live_console_structure(qapp, tmp_path, monkeypatch):
     assert window.live_monitor_label.text() == "巡检: 待机"
     assert window.sport_profile_combo.isEnabled()
     window.close()
+
+
+def test_vlm_config_dialog_restores_openai_option(qapp):
+    dialog = VLMConfigDialog({"vlm_config": {"model_type": "qwen"}})
+
+    assert dialog.model_type.findText("openai") >= 0
+    dialog.model_type.setCurrentText("openai")
+    qapp.processEvents()
+
+    assert dialog.endpoint_label.text() == "模型名称:"
+    assert "gpt-4.1-mini" in dialog.endpoint_id.placeholderText()
+    assert not dialog.base_url_label.isHidden()
+    dialog.base_url.setText("https://proxy.example/v1")
+    assert dialog.get_result()["base_url"] == "https://proxy.example/v1"
+    assert dialog.get_result()["model_type"] == "openai"
+    dialog.close()
 
 
 def test_race_config_updates_sport_profile_and_combo(qapp, tmp_path, monkeypatch):

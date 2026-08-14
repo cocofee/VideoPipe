@@ -33,11 +33,13 @@ if __package__:
     from .event_profile import EventProfile, build_sport_event_profile
     from .participant_identity import IdentityConfig, ParticipantIdentityManager
     from .participant_models import CrossingCandidate, ParticipantObservation
+    from .vlm_utils import OpenAIVLMAssistant, VLMRateLimitError as SharedVLMRateLimitError
 else:
     from crossing_lifecycle import CrossingLifecycle
     from event_profile import EventProfile, build_sport_event_profile
     from participant_identity import IdentityConfig, ParticipantIdentityManager
     from participant_models import CrossingCandidate, ParticipantObservation
+    from vlm_utils import OpenAIVLMAssistant, VLMRateLimitError as SharedVLMRateLimitError
 
 try:
     from ensemble_boxes import weighted_boxes_fusion
@@ -1106,7 +1108,7 @@ class AsyncVLMPipeline:
         """处理 VLM 错误并设置冷却"""
         now = time.time()
         with self._lock:
-            if isinstance(e, VLMRateLimitError):
+            if isinstance(e, (VLMRateLimitError, SharedVLMRateLimitError)):
                 if e.is_quota_exceeded:
                     self.is_quota_exhausted = True
                     self.cooldown_until = now + 300 # 5分钟冷却
@@ -1646,7 +1648,7 @@ class Detector:
         
         # ===== VLM 辅助（新增）=====
         self._vlm_enabled = False
-        self._vlm_assistant: Optional[DoubaoVLMAssistant] = None
+        self._vlm_assistant: Optional[Union[DoubaoVLMAssistant, QwenVLMAssistant, OpenAIVLMAssistant]] = None
         self._vlm_pipeline: Optional[AsyncVLMPipeline] = None
         self._vlm_athlete_list: List[str] = []
         
@@ -1696,12 +1698,17 @@ class Detector:
     # VLM 配置
     # =========================================================================
     
-    def enable_vlm(self, api_key: str, endpoint_id: str = None, max_calls_per_minute: int = 60, model_type: str = "doubao"):
+    def enable_vlm(self, api_key: str, endpoint_id: str = None, max_calls_per_minute: int = 60,
+                   model_type: str = "doubao", base_url: str = None):
         """启用 VLM 辅助"""
         if model_type == "doubao":
             self._vlm_assistant = DoubaoVLMAssistant(api_key, endpoint_id)
         elif model_type == "qwen":
             self._vlm_assistant = QwenVLMAssistant(api_key, endpoint_id or "qwen-vl-max")
+        elif model_type == "openai":
+            self._vlm_assistant = OpenAIVLMAssistant(
+                api_key, endpoint_id or "gpt-4.1-mini", base_url=base_url
+            )
         else:
             logger.error(f"[Detector-{self.source_id}] 不支持的 VLM 类型: {model_type}")
             return
@@ -3975,12 +3982,22 @@ class Detector:
             return True
         return False
 
-    def _try_sync_crossing_ocr(self, track_id: int, state: TrackState, current_time: float) -> None:
+    def _try_sync_crossing_ocr(
+        self,
+        track_id: int,
+        state: TrackState,
+        current_time: float,
+        event_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """过线短窗同步 OCR（轻量兜底，避免事件长期 Bib None）。"""
         if not getattr(self, 'realtime_ocr_enabled', True):
             return
 
-        candidates = self._get_ocr_candidates(state)
+        candidates = (
+            self._get_crossing_ocr_candidates(state, event_data)
+            if event_data
+            else self._get_ocr_candidates(state)
+        )
         if self._ocr is None or not candidates:
             return
 
@@ -4201,6 +4218,41 @@ class Detector:
             ((by1 + by2) * 0.5 - ay1) / athlete_height,
         )
 
+    @staticmethod
+    def _bbox_contains_bbox(
+        outer_bbox: Any,
+        inner_bbox: Any,
+        tolerance: float = 0.0,
+    ) -> bool:
+        if outer_bbox is None or inner_bbox is None:
+            return False
+        try:
+            outer_values = list(outer_bbox)
+            inner_values = list(inner_bbox)
+            if len(outer_values) != 4 or len(inner_values) != 4:
+                return False
+            ox1, oy1, ox2, oy2 = [float(value) for value in outer_values]
+            ix1, iy1, ix2, iy2 = [float(value) for value in inner_values]
+        except (TypeError, ValueError):
+            return False
+        if ox2 <= ox1 or oy2 <= oy1 or ix2 <= ix1 or iy2 <= iy1:
+            return False
+        margin = max(0.0, float(tolerance))
+        return (
+            ox1 - margin <= ix1
+            and oy1 - margin <= iy1
+            and ix2 <= ox2 + margin
+            and iy2 <= oy2 + margin
+        )
+
+    def _candidate_has_valid_owner(self, candidate: Any) -> bool:
+        if not isinstance(candidate, BibEvidenceCandidate):
+            return True
+        return bool(
+            candidate.owner_validated
+            and self._bbox_contains_bbox(candidate.athlete_bbox, candidate.bib_bbox)
+        )
+
     def _get_plausible_detected_bib_candidates(
         self,
         state: TrackState,
@@ -4209,6 +4261,8 @@ class Detector:
         aspects = []
         for candidate in state.bib_crops_cache:
             if len(candidate) < 4:
+                continue
+            if not self._candidate_has_valid_owner(candidate):
                 continue
             _, crop, _, bbox = candidate
             if crop is None or not isinstance(crop, np.ndarray) or crop.size == 0:
@@ -4282,6 +4336,82 @@ class Detector:
                 return detected_candidates
             return [best_detected, state.fallback_bib_crops_cache[0]]
         return state.fallback_bib_crops_cache
+
+    def _get_crossing_detected_bib_candidates(
+        self,
+        state: TrackState,
+        event_data: Dict[str, Any],
+    ) -> List[Any]:
+        event_bbox = event_data.get("bbox") or []
+        candidates = []
+        for candidate in self._get_plausible_detected_bib_candidates(state):
+            if isinstance(candidate, BibEvidenceCandidate):
+                if not self._candidate_has_valid_owner(candidate):
+                    continue
+            else:
+                candidate_bbox = candidate[3] if len(candidate) >= 4 else None
+                if not self._bbox_contains_bbox(event_bbox, candidate_bbox, tolerance=5.0):
+                    continue
+            candidates.append(candidate)
+        return candidates
+
+    def _get_current_event_fallback_candidates(
+        self,
+        event_data: Dict[str, Any],
+    ) -> List[BibEvidenceCandidate]:
+        frame = event_data.get("frame")
+        athlete_bbox = event_data.get("bbox") or []
+        if frame is None or not self._bbox_contains_bbox(athlete_bbox, athlete_bbox):
+            return []
+
+        candidates = []
+        for source, crop, bib_bbox in self._extract_bib_fallbacks_from_athlete(
+            frame,
+            athlete_bbox,
+        ):
+            if not self._bbox_contains_bbox(athlete_bbox, bib_bbox):
+                continue
+            candidates.append(
+                BibEvidenceCandidate(
+                    quality=float(self._calculate_image_quality(crop)),
+                    crop=crop,
+                    frame=frame,
+                    frame_index=int(event_data.get("frame_index", -1)),
+                    capture_time_ms=float(event_data.get("cross_time", 0.0) or 0.0) * 1000.0,
+                    athlete_bbox=tuple(int(value) for value in athlete_bbox),
+                    bib_bbox=tuple(int(value) for value in bib_bbox),
+                    source=f"fallback:{source}",
+                    owner_validated=True,
+                )
+            )
+        candidates.sort(key=lambda item: item.quality, reverse=True)
+        return candidates
+
+    def _get_crossing_ocr_candidates(
+        self,
+        state: TrackState,
+        event_data: Dict[str, Any],
+        detected_candidates: Optional[List[Any]] = None,
+    ) -> List[Any]:
+        if not self.ocr_pipeline_enabled:
+            return []
+        if detected_candidates is None:
+            detected_candidates = self._get_crossing_detected_bib_candidates(state, event_data)
+        fallback_candidates = self._get_current_event_fallback_candidates(event_data)
+        if not detected_candidates:
+            return fallback_candidates
+
+        best_detected = detected_candidates[0]
+        quality, crop = best_detected[0], best_detected[1]
+        crop_height, crop_width = crop.shape[:2] if crop is not None and crop.size > 0 else (0, 0)
+        detected_is_usable = (
+            crop_width >= self.ocr_detected_bib_min_width
+            and crop_height >= self.ocr_detected_bib_min_height
+            and quality >= self.ocr_detected_bib_min_quality
+        )
+        if detected_is_usable or not fallback_candidates:
+            return detected_candidates
+        return [best_detected, fallback_candidates[0]]
 
     def _cache_ocr_candidate(
         self,
@@ -5374,7 +5504,11 @@ class Detector:
                             # 远端，每 3.0s 识别一次
                             should_batch_ocr = (current_time - state.last_ocr_time > 3.0)
                             
-                        candidates = self._get_ocr_candidates(state)
+                        candidates = (
+                            self._get_crossing_ocr_candidates(state, state.pending_event_data)
+                            if state.crossed and state.pending_event_data
+                            else self._get_ocr_candidates(state)
+                        )
                         if should_batch_ocr and candidates:
                             # 从缓存中选出 Top-3 高质量截图提交 (如果队列不拥堵，选 3 张；否则 1 张)
                             num_to_submit = 2 if qsize < 6 else 1
@@ -5664,6 +5798,7 @@ class Detector:
                                 state.pending_event_data = {
                                     'cross_time': current_time if timestamp_provided else time.time(),
                                     'cross_realtime': time.time(),
+                                    'frame_index': int(self._frame_count),
                                     'bbox': athlete['bbox'],
                                     'conf': athlete['conf'],
                                     'position': (curr_x, curr_y),
@@ -5721,7 +5856,12 @@ class Detector:
                     time_passed = current_time - state.crossed_time
                     candidates = self._get_ocr_candidates(state)
                     if self.realtime_ocr_enabled and (not state.best_bib) and candidates and time_passed >= 0.20:
-                        self._try_sync_crossing_ocr(tid, state, current_time)
+                        self._try_sync_crossing_ocr(
+                            tid,
+                            state,
+                            current_time,
+                            state.pending_event_data,
+                        )
                     
                     if not self.ocr_pipeline_enabled:
                         wait_window = 0.0
@@ -5763,7 +5903,12 @@ class Detector:
                     curr_participant_id = str(
                         data.get('participant_id') or state.participant_id or ''
                     ).strip()
-                    detected_candidates = self._get_plausible_detected_bib_candidates(state)
+                    detected_candidates = self._get_crossing_detected_bib_candidates(state, data)
+                    crossing_ocr_candidates = self._get_crossing_ocr_candidates(
+                        state,
+                        data,
+                        detected_candidates,
+                    )
                     bib_evidence_kind_for_event = "detected" if detected_candidates else "fallback"
 
                     if self.enable_gate_guard and self._is_gate_like_bbox(curr_bbox, (height, width)):
@@ -6030,9 +6175,9 @@ class Detector:
                         continue
 
                     # === 选择“最清晰”的 bib 证据截图（不影响检测，只影响保存的 bib.jpg） ===
-                    bib_crop_for_save = state.best_bib_crop
-                    bib_bbox_for_save = state.best_bib_bbox
-                    bib_quality_for_save = float(getattr(state, "best_bib_quality", 0.0) or 0.0)
+                    bib_crop_for_save = None
+                    bib_bbox_for_save = []
+                    bib_quality_for_save = 0.0
 
                     bib_candidates_for_event = []
                     seen_candidate_frames = set()
@@ -6047,6 +6192,12 @@ class Detector:
                             seen_candidate_frames.add(frame_key)
                             bib_candidates_for_event.append(candidate.detached_copy())
                         else:
+                            if not self._bbox_contains_bbox(
+                                data['bbox'],
+                                candidate_bbox,
+                                tolerance=5.0,
+                            ):
+                                continue
                             bib_candidates_for_event.append(
                                 BibEvidenceCandidate(
                                     quality=float(q),
@@ -6057,12 +6208,12 @@ class Detector:
                                     athlete_bbox=tuple(int(value) for value in data['bbox']),
                                     bib_bbox=tuple(int(value) for value in (candidate_bbox or [])),
                                     source="detected",
-                                    owner_validated=False,
+                                    owner_validated=True,
                                 )
                             )
                         if len(bib_candidates_for_event) >= 2:
                             break
-                    candidates = self._get_ocr_candidates(state)
+                    candidates = crossing_ocr_candidates
                     if candidates:
                         try:
                             def _first_valid(cache_items, require_frame: bool):

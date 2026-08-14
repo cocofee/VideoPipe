@@ -16,8 +16,10 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 try:
     from .database import Database
+    from .io_utils import read_pending_ocr_candidate
 except ImportError:
     from database import Database
+    from io_utils import read_pending_ocr_candidate
 
 
 class EventListWidget(QWidget):
@@ -684,6 +686,12 @@ class EventListWidget(QWidget):
 
     def _set_row_data(self, row: int, event: Dict[str, Any], is_duplicate: bool = False):
         """设置行数据 (12列适配版)"""
+        event = dict(event)
+        candidate = read_pending_ocr_candidate(event)
+        if candidate:
+            event["_ocr_candidate"] = candidate["bib"]
+            event["_ocr_candidate_confidence"] = candidate["confidence"]
+            event["_ocr_candidate_error"] = candidate["error"]
         # 暂时关闭排序，避免插入数据时触发重排
         sorting_enabled = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
@@ -699,7 +707,10 @@ class EventListWidget(QWidget):
         self.table.setItem(row, 0, seq_item)
 
         # 1. 号码
-        bib = str(event.get('bib_number') or "--")
+        formal_bib = str(event.get('bib_number') or "").strip()
+        candidate_bib = str(event.get('_ocr_candidate') or "").strip()
+        has_candidate = bool(candidate_bib and not formal_bib)
+        bib = formal_bib or candidate_bib or "--"
         bib_item = QTableWidgetItem()
         bib_item.setText(bib)
             
@@ -714,6 +725,10 @@ class EventListWidget(QWidget):
             bib_item.setForeground(QBrush(QColor("#98a2b3")))
         elif is_duplicate:
             bib_item.setForeground(QBrush(QColor("#b42318")))
+        elif has_candidate:
+            bib_item.setForeground(QBrush(QColor("#9a6700")))
+            confidence = float(event.get('_ocr_candidate_confidence') or 0.0)
+            bib_item.setToolTip(f"OCR候选，置信度 {confidence:.0%}；请核对后保存")
         elif bib == "--":
             bib_item.setForeground(QBrush(QColor("#667085")))
         else:
@@ -757,6 +772,10 @@ class EventListWidget(QWidget):
             status_text = "AI已修正"
             status_color = QColor("#175cd3")
             bg_color = QColor("#eff8ff")
+        elif has_candidate:
+            status_text = "待核对"
+            status_color = QColor("#9a6700")
+            bg_color = QColor("#fffaeb")
         elif event.get('bib_status') == 'recognized':
             status_text = "已识别"
             status_color = QColor("#067647")
@@ -974,6 +993,8 @@ class EventListWidget(QWidget):
             event = self._get_event_at_row(row)
             if event:
                 bib = event.get('bib_number')
+                candidate_bib = str(event.get('_ocr_candidate') or "").strip()
+                has_candidate = bool(candidate_bib and not bib)
                 is_duplicate = bib and not event.get('is_void') and bib_counts.get(bib, 0) > 1
                 
                 # 更新状态列 (第5列)
@@ -985,6 +1006,9 @@ class EventListWidget(QWidget):
                     elif is_duplicate:
                         status_text = "号码冲突"
                         status_color = QColor("#B42318")
+                    elif has_candidate:
+                        status_text = "待核对"
+                        status_color = QColor("#9A6700")
                     elif event.get('bib_status') == 'recognized':
                         status_text = "已识别"
                         status_color = QColor("#067647")
@@ -1009,6 +1033,8 @@ class EventListWidget(QWidget):
                     else:
                         if event.get('is_void'):
                             bib_item.setForeground(QBrush(QColor("#98A2B3")))
+                        elif has_candidate:
+                            bib_item.setForeground(QBrush(QColor("#9A6700")))
                         elif not bib:
                             bib_item.setForeground(QBrush(QColor("#667085")))
                         else:
@@ -1023,6 +1049,8 @@ class EventListWidget(QWidget):
                     bg_color = QColor("#F3F4F6")
                 elif is_duplicate:
                     bg_color = QColor("#FEF3F2")
+                elif has_candidate:
+                    bg_color = QColor("#FFFAEB")
                 elif event.get('bib_status') == 'needs_review':
                     bg_color = QColor("#FFFAEB")
                 elif event.get('bib_status') != 'recognized':

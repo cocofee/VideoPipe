@@ -1627,6 +1627,130 @@ def test_event_marks_implausible_detected_bib_history_as_fallback_evidence():
     assert events[0].bib_candidates == []
 
 
+def test_event_fallback_is_recropped_from_the_crossing_athlete():
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+    stale_crop = np.full((96, 80, 3), 251, dtype=np.uint8)
+    detector = Detector(
+        model_path="fake.pt",
+        model=_EmptyTrackingModel(),
+        ocr=None,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    state = _pending_crossing_state(frame, 205)
+    state.fallback_bib_crops_cache = [
+        BibEvidenceCandidate(
+            quality=0.99,
+            crop=stale_crop,
+            frame=np.full_like(frame, 251),
+            frame_index=10,
+            capture_time_ms=100.0,
+            athlete_bbox=(210, 100, 300, 290),
+            bib_bbox=(220, 130, 290, 226),
+            source="fallback:left_thigh",
+            owner_validated=False,
+        )
+    ]
+    detector._track_states[205] = state
+
+    events, _, _ = detector.process_frame(frame, timestamp=2.0)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.bib_evidence_kind == "fallback"
+    assert detector._bbox_contains_bbox(event.bbox, event.bib_bbox)
+    x1, y1, x2, y2 = event.bib_bbox
+    assert np.array_equal(event.bib_crop, frame[y1:y2, x1:x2])
+    assert not np.array_equal(event.bib_crop, stale_crop)
+
+
+def test_sync_crossing_ocr_uses_current_event_fallback():
+    class RecordingOCR:
+        def __init__(self):
+            self.minimum_values = []
+
+        def __call__(self, image):
+            self.minimum_values.append(int(image.min()))
+            return [([0, 0, 1, 1], "137", 0.99)], 0.0
+
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+    ocr = RecordingOCR()
+    detector = Detector(
+        model_path="fake.pt",
+        model=None,
+        ocr=ocr,
+        realtime_ocr=True,
+        sport_profile="speed_skating",
+    )
+    state = _pending_crossing_state(frame, 207)
+    state.fallback_bib_crops_cache = [
+        BibEvidenceCandidate(
+            quality=0.99,
+            crop=np.full((96, 80, 3), 251, dtype=np.uint8),
+            frame=np.full_like(frame, 251),
+            frame_index=10,
+            capture_time_ms=100.0,
+            athlete_bbox=(210, 100, 300, 290),
+            bib_bbox=(220, 130, 290, 226),
+            source="fallback:left_thigh",
+            owner_validated=False,
+        )
+    ]
+
+    try:
+        detector._try_sync_crossing_ocr(
+            207,
+            state,
+            current_time=2.0,
+            event_data=state.pending_event_data,
+        )
+    finally:
+        detector.stop()
+
+    assert ocr.minimum_values and ocr.minimum_values[0] < 100
+    assert state.best_bib == "137"
+    assert detector._bbox_contains_bbox(
+        state.pending_event_data["bbox"],
+        state.best_bib_bbox,
+    )
+
+
+def test_event_rejects_detected_candidate_without_valid_owner_geometry():
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+    detector = Detector(
+        model_path="fake.pt",
+        model=_EmptyTrackingModel(),
+        ocr=None,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    state = _pending_crossing_state(frame, 206)
+    state.has_bib_box = True
+    state.bib_crops_cache = [
+        BibEvidenceCandidate(
+            quality=0.95,
+            crop=np.full((48, 64, 3), 200, dtype=np.uint8),
+            frame=frame,
+            frame_index=20,
+            capture_time_ms=200.0,
+            athlete_bbox=(100, 120, 180, 280),
+            bib_bbox=(220, 130, 284, 178),
+            source="detected",
+            owner_validated=True,
+        )
+    ]
+    detector._track_states[206] = state
+
+    events, _, _ = detector.process_frame(frame, timestamp=2.0)
+
+    assert len(events) == 1
+    assert events[0].bib_evidence_kind == "fallback"
+    assert events[0].bib_candidates == []
+    assert detector._bbox_contains_bbox(events[0].bbox, events[0].bib_bbox)
+
+
 def test_local_video_mode_uses_a_bounded_settle_delay():
     frame = np.zeros((320, 320, 3), dtype=np.uint8)
     detector = Detector(

@@ -450,12 +450,18 @@ def test_ocr_manager_keeps_low_confidence_vlm_result_pending(tmp_path):
     manager.stop()
 
 
-def test_ocr_manager_does_not_send_unowned_legacy_crop_to_vlm(tmp_path):
+def test_ocr_manager_sends_persisted_legacy_crop_to_enabled_vlm(tmp_path):
     event_dir = tmp_path / "000007"
     event_dir.mkdir()
     _write_image(event_dir / "bib.jpg", 7)
     (event_dir / "meta.json").write_text(
-        json.dumps({"event_id": 7, "paths": {"bib": "bib.jpg"}}),
+        json.dumps(
+            {
+                "event_id": 7,
+                "bib_evidence_kind": "fallback",
+                "paths": {"bib": "bib.jpg"},
+            }
+        ),
         encoding="utf-8",
     )
     database = _Database(
@@ -475,11 +481,66 @@ def test_ocr_manager_does_not_send_unowned_legacy_crop_to_vlm(tmp_path):
     )
 
     manager.poll_process_results()
-    time.sleep(0.05)
-    manager.poll_process_results()
+    _poll_until(lambda: not manager._vlm_pending_event_ids, manager)
 
-    assert calls == []
-    assert database.updates[-1][0][:4] == (7, "", 0.4, "PENDING")
+    assert len(calls) == 1
+    assert database.updates[-1][0][:4] == (7, "", 0.99, "PENDING")
+    result = json.loads((event_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["bib"] == "66"
+    assert result["error"] == "FALLBACK_ONLY_EVIDENCE"
+    manager.stop()
+
+
+def test_ocr_manager_clear_vlm_discards_pending_state(tmp_path):
+    manager = OCRManager(
+        _Database({"event_id": 7, "evidence_dir": str(tmp_path), "manual_corrected": 0}),
+        vlm_engine=object(),
+    )
+    manager._vlm_pending_event_ids.add(7)
+    manager.stats["vlm_pending"] = 1
+
+    manager.clear_vlm()
+
+    assert manager.vlm is None
+    assert manager._vlm_pending_event_ids == set()
+    assert manager.stats["vlm_pending"] == 0
+    manager.stop()
+
+
+def test_ocr_manager_vlm_only_mode_uses_persisted_bib_crop_without_candidates(tmp_path):
+    event_dir = tmp_path / "000007"
+    event_dir.mkdir()
+    _write_image(event_dir / "bib.jpg", 7)
+    (event_dir / "meta.json").write_text(
+        json.dumps({"event_id": 7, "paths": {"bib": "bib.jpg"}}),
+        encoding="utf-8",
+    )
+    database = _Database(
+        {"event_id": 7, "evidence_dir": str(event_dir), "manual_corrected": 0}
+    )
+    controller = _ProcessController()
+    calls = []
+
+    class _Vlm:
+        def ocr_bib(self, images, **kwargs):
+            calls.append(images)
+            return "66", 0.99, "clear"
+
+    manager = OCRManager(database, vlm_engine=_Vlm(), process_controller=controller)
+    manager.vlm_mode = "only"
+    controller.results.append(
+        OcrResult(event_id=7, status="PENDING", error="OCR_FAILED")
+    )
+
+    manager.poll_process_results()
+    _poll_until(lambda: not manager._vlm_pending_event_ids, manager)
+
+    assert len(calls) == 1
+    assert len(calls[0]) == 1
+    assert database.updates[-1][0][:4] == (7, "", 0.99, "PENDING")
+    result = json.loads((event_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["bib"] == "66"
+    assert result["error"] == "FALLBACK_ONLY_EVIDENCE"
     manager.stop()
 
 

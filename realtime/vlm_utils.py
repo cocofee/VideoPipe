@@ -70,6 +70,13 @@ PROMPT_COUNT_ATHLETES = """你是一个体育赛事计数助手。请数一下�
 3
 左1人穿红衣，中间2人并排"""
 
+PROMPT_PERSON_MATCH = """你是体育赛事视频中的运动员身份比对助手。请判断两张图片中的运动员是否为同一个人。
+
+输出严格三行：
+第一行：SAME、DIFFERENT 或 UNCERTAIN
+第二行：置信度（0.0-1.0）
+第三行：简短理由"""
+
 PROMPT_BIB_OCR_ENHANCED = """你是专业的体育比赛号码识别专家。请仔细识别图中运动员身上的参赛号码。
 
 【本场比赛号码特征】
@@ -182,18 +189,32 @@ def parse_count_result(response: str) -> Tuple[int, str]:
 
 def parse_ocr_result(response: str) -> Tuple[Optional[str], float, str]:
     """解析 VLM OCR 结果"""
-    lines = [l.strip() for l in response.strip().split('\n') if l.strip()]
+    cleaned_response = re.sub(
+        r"<think>.*?</think>",
+        "",
+        str(response or ""),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    lines = [l.strip() for l in cleaned_response.strip().split('\n') if l.strip()]
     if not lines:
         return None, 0.0, "Empty response"
         
-    raw = lines[0].upper()
+    raw = lines[0].strip().strip("`*_ ").upper()
     if any(word in raw for word in ["UNREADABLE", "NO_BIB", "无法识别", "NONE"]):
         return None, 0.0, raw
         
     # 提取号码：大写字母(可选) + 2-6位数字
-    clean = ''.join(c for c in raw if c.isalnum())
-    match = re.search(r'[A-Z]?\d{1,6}', clean)
-    bib_number = match.group() if match else None
+    bib_number = None
+    strict_match = re.fullmatch(r"(?:[A-Z]{1,3})?\d{1,6}", raw)
+    if strict_match:
+        bib_number = strict_match.group()
+    else:
+        labeled_match = re.fullmatch(
+            r"(?:BIB(?:\s+NUMBER)?|NUMBER)\s*[:#-]\s*([A-Z]{0,3}\d{1,6})",
+            raw,
+        )
+        if labeled_match:
+            bib_number = labeled_match.group(1)
     
     confidence = 0.0
     if len(lines) >= 2:
@@ -369,6 +390,151 @@ class QwenVLMAssistant:
 
         result = self._call_api(bib_crop, prompt, max_tokens=120)
         return parse_ocr_result(result)
+
+
+class OpenAIVLMAssistant:
+    """OpenAI-compatible vision assistant for direct or proxy endpoints."""
+
+    def __init__(self, api_key: str, model: str = "gpt-4.1-mini", base_url: str = None):
+        self.api_key = api_key
+        self.model = model or "gpt-4.1-mini"
+        self.base_url = (base_url or "https://api.openai.com/v1").strip().rstrip("/")
+        self.api_url = self._resolve_chat_url(self.base_url)
+        self.timeout = 30
+
+    @staticmethod
+    def _resolve_chat_url(base_url: str) -> str:
+        """Accept either a /v1 base URL or a full chat/completions URL."""
+        if base_url.endswith("/chat/completions"):
+            return base_url
+        if base_url.endswith("/v1"):
+            return f"{base_url}/chat/completions"
+        return f"{base_url}/v1/chat/completions"
+
+    def call(self, images: Union[np.ndarray, List[np.ndarray]], prompt: str,
+             max_tokens: int = 120) -> str:
+        """Send one or more images and return the model's text response."""
+        if isinstance(images, np.ndarray):
+            images = [images]
+
+        content = []
+        for image in images:
+            if image is None or image.size == 0:
+                continue
+            ok, buffer = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                continue
+            image_b64 = base64.b64encode(buffer).decode('utf-8')
+            content.append({
+                "type": "input_image",
+                "image_url": f"data:image/jpeg;base64,{image_b64}",
+            })
+
+        if not content:
+            return ""
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                *[
+                    {"type": "image_url", "image_url": {"url": item["image_url"]}}
+                    for item in content
+                    if item["type"] == "input_image"
+                ],
+            ]}],
+            "max_tokens": max_tokens,
+            "temperature": 0.1,
+        }
+
+        try:
+            response = requests.post(
+                self.api_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=self.timeout,
+            )
+            if response.status_code == 429:
+                raise VLMRateLimitError(
+                    "OpenAI API rate limit (HTTP 429)",
+                    status_code=429,
+                )
+            if response.status_code != 200:
+                logger.error("[VLM-OpenAI] API error: status=%s", response.status_code)
+                return ""
+
+            data = response.json()
+            choices = data.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {}) or {}
+                message_content = message.get("content", "")
+                if isinstance(message_content, str) and message_content.strip():
+                    return message_content
+                if isinstance(message_content, list):
+                    visible_text = "".join(
+                        item.get("text", "") if isinstance(item, dict) else str(item)
+                        for item in message_content
+                    )
+                    if visible_text.strip():
+                        return visible_text
+            # Some OpenAI-compatible relays return the visible answer in a
+            # reasoning field when the selected model emits a thinking block.
+            # Preserve that text as a last-resort parser input instead of
+            # treating a successful HTTP response as an empty OCR result.
+            if choices:
+                message = choices[0].get("message", {}) or {}
+                reasoning = message.get("reasoning_content") or message.get("reasoning")
+                if isinstance(reasoning, str):
+                    return reasoning
+            return ""
+        except VLMRateLimitError:
+            raise
+        except Exception as exc:
+            logger.error("[VLM-OpenAI] request failed: %s", exc)
+            return ""
+
+    def check_background(self, crop: np.ndarray) -> Tuple[bool, float, str]:
+        result = self.call(crop, PROMPT_BACKGROUND_CHECK, max_tokens=50)
+        category, confidence, reason = parse_background_result(result)
+        return category == "ATHLETE", confidence, reason
+
+    def count_athletes(self, region: np.ndarray) -> Tuple[int, str]:
+        result = self.call(region, PROMPT_COUNT_ATHLETES, max_tokens=80)
+        return parse_count_result(result)
+
+    def ocr_bib(self, bib_crop: np.ndarray, athlete_list: List[str] = None,
+                only_numeric: bool = False, prompt: str = None) -> Tuple[Optional[str], float, str]:
+        if not prompt:
+            prompt = (
+                build_ocr_prompt_with_list_enhanced(athlete_list, only_numeric)
+                if athlete_list else PROMPT_BIB_OCR_ENHANCED
+            )
+        result = self.call(bib_crop, prompt, max_tokens=120)
+        return parse_ocr_result(result)
+
+    def compare_persons(self, crops: List[np.ndarray]) -> Tuple[str, float, str]:
+        result = self.call(crops, PROMPT_PERSON_MATCH, max_tokens=80)
+        lines = [line.strip() for line in result.splitlines() if line.strip()]
+        conclusion = "UNCERTAIN"
+        if lines:
+            raw = lines[0].upper()
+            if "SAME" in raw:
+                conclusion = "SAME"
+            elif "DIFFERENT" in raw:
+                conclusion = "DIFFERENT"
+        confidence = 0.0
+        if len(lines) >= 2:
+            match = re.search(r"\d+\.?\d*", lines[1])
+            if match:
+                confidence = float(match.group())
+                if confidence > 1.0:
+                    confidence /= 100.0
+                confidence = max(0.0, min(1.0, confidence))
+        reason = lines[2] if len(lines) >= 3 else ""
+        return conclusion, confidence, reason
 
 
 class AsyncVLMPipeline:

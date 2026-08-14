@@ -343,6 +343,18 @@ class OCRManager:
         if vlm_engine:
             self.vlm = vlm_engine
 
+    def clear_vlm(self) -> None:
+        """Disable future VLM work and discard queued result callbacks."""
+        self.vlm = None
+        self.vlm_mode = "fallback"
+        with self._vlm_lock:
+            self._vlm_call_times.clear()
+        for future in list(self._vlm_futures):
+            future.cancel()
+        self._vlm_futures.clear()
+        self._vlm_pending_event_ids.clear()
+        self.stats["vlm_pending"] = 0
+
     def start_process_runtime(
         self,
         *,
@@ -576,6 +588,24 @@ class OCRManager:
         if event_id <= 0 or event_id in self._vlm_pending_event_ids:
             return False
         candidate_paths, athlete_path = self._collect_owned_vlm_paths(event_dir, meta)
+        used_persisted_bib = False
+        # When VLM is explicitly enabled, use the persisted bib crop for older
+        # events that predate owner-validated multi-frame metadata. The request
+        # remains asynchronous and rate-limited.
+        if not candidate_paths and str(getattr(self, "vlm_mode", "fallback") or "fallback").lower() in {
+            "fallback",
+            "first",
+            "only",
+        }:
+            paths = meta.get("paths") if isinstance(meta, dict) else None
+            paths = paths if isinstance(paths, dict) else {}
+            bib_value = paths.get("bib") or "bib.jpg"
+            bib_path = Path(str(bib_value))
+            if not bib_path.is_absolute():
+                bib_path = event_dir / bib_path
+            if bib_path.is_file():
+                candidate_paths = (bib_path.resolve(),)
+                used_persisted_bib = True
         if not candidate_paths:
             return False
 
@@ -604,6 +634,7 @@ class OCRManager:
             "local_text": str(local_text or "").strip(),
             "local_confidence": float(local_confidence or 0.0),
             "local_error": str(local_error or ""),
+            "fallback_only_evidence": used_persisted_bib,
         }
         future = self._vlm_executor.submit(
             self._run_event_vlm_job,
@@ -616,6 +647,12 @@ class OCRManager:
         self._vlm_futures[future] = context
         self._vlm_pending_event_ids.add(event_id)
         self.stats["vlm_pending"] = int(self.stats.get("vlm_pending", 0)) + 1
+        logger.info(
+            "[OCRManager] Event VLM scheduled: event_id=%s, candidates=%s, mode=%s",
+            event_id,
+            len(candidate_paths),
+            str(getattr(self, "vlm_mode", "fallback") or "fallback").lower(),
+        )
         return True
 
     def _poll_event_vlm_results(self) -> None:
@@ -650,6 +687,7 @@ class OCRManager:
             return
         meta = dict(context["meta"])
         meta["event_id"] = event_id
+        fallback_only_evidence = bool(context.get("fallback_only_evidence"))
 
         normalized = self._normalize_bib_text(result.text)
         local_text = self._normalize_bib_text(context.get("local_text"))
@@ -688,6 +726,7 @@ class OCRManager:
         )
         accepted = bool(
             normalized
+            and not fallback_only_evidence
             and not result.error
             and confidence >= required_confidence
             and not participant_conflict
@@ -695,6 +734,8 @@ class OCRManager:
         status = "DONE" if accepted else "PENDING"
         if accepted:
             error = ""
+        elif fallback_only_evidence and normalized:
+            error = "FALLBACK_ONLY_EVIDENCE"
         elif participant_conflict:
             error = "PARTICIPANT_OCR_CONFLICT"
         elif result.error:
@@ -715,7 +756,11 @@ class OCRManager:
             status,
             error=error,
             source=source,
-            image_source="owned_bib_candidates+athlete",
+            image_source=(
+                "persisted_bib_fallback"
+                if fallback_only_evidence
+                else "owned_bib_candidates+athlete"
+            ),
             participant_id=event.get("participant_id"),
             raw_track_id=event.get("track_id"),
             participant_status=(participant_state.status if participant_state else "PENDING"),
@@ -737,6 +782,14 @@ class OCRManager:
             self.stats["resolved_done"] = int(self.stats.get("resolved_done", 0)) + 1
         else:
             self.stats["pending_result"] = int(self.stats.get("pending_result", 0)) + 1
+        logger.info(
+            "[OCRManager] Event VLM result: event_id=%s, status=%s, bib=%s, confidence=%.2f, error=%s",
+            event_id,
+            status,
+            normalized or "",
+            output_confidence,
+            error or "",
+        )
         if self.on_event_done:
             self.on_event_done(event_id, result_data)
 

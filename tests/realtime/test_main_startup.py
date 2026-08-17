@@ -46,6 +46,97 @@ def test_auto_start_waits_without_opening_race_dialog_again(monkeypatch):
     assert scheduled == [(100, harness.start_when_race_ready)]
 
 
+def test_releasing_current_race_stops_workers_and_closes_database():
+    class _Stoppable:
+        def __init__(self):
+            self.stopped = 0
+
+        def stop(self):
+            self.stopped += 1
+
+    class _Database:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    class _Timer:
+        def __init__(self):
+            self.active = True
+            self.stopped = 0
+
+        def isActive(self):
+            return self.active
+
+        def stop(self):
+            self.active = False
+            self.stopped += 1
+
+    class _Harness:
+        _release_current_race = MainWindow._release_current_race
+
+        def __init__(self):
+            self.recording_manager = None
+            self.preview_threads = {0: _Stoppable()}
+            self.video_threads = {0: _Stoppable()}
+            self.readers = {0: _Stoppable()}
+            self.detectors = {0: object()}
+            self.recorder = _Stoppable()
+            self.ocr_manager = _Stoppable()
+            self.database = _Database()
+            self._ocr_poll_timer = _Timer()
+            self.shared_model = object()
+            self.shared_athlete_validator = object()
+            self._athlete_validator_checked = True
+            self.shared_vlm = object()
+            self.field_issue_log = object()
+            self._initialized = True
+            self._race_ready = True
+            self._session_event_count = 5
+            self._latest_frame_observations = {0: ([], [])}
+            self._live_monitor_samples = {0: object()}
+            self._live_monitor_last_warn_ts = {0: 1.0}
+            self._yolo_only_mode = False
+            self._ocr_runtime_state = "ready"
+
+        def _refresh_ocr_runtime_ui(self):
+            pass
+
+        def _stop_manual_recording(self, *, show_message):
+            raise AssertionError("manual recorder should not be stopped when absent")
+
+    harness = _Harness()
+    preview = harness.preview_threads[0]
+    video = harness.video_threads[0]
+    reader = harness.readers[0]
+    recorder = harness.recorder
+    ocr_manager = harness.ocr_manager
+    database = harness.database
+    timer = harness._ocr_poll_timer
+
+    harness._release_current_race()
+
+    assert preview.stopped == 1
+    assert video.stopped == 1
+    assert reader.stopped == 1
+    assert recorder.stopped == 1
+    assert ocr_manager.stopped == 1
+    assert database.closed == 1
+    assert timer.stopped == 1
+    assert harness.preview_threads == {}
+    assert harness.video_threads == {}
+    assert harness.readers == {}
+    assert harness.detectors == {}
+    assert harness.recorder is None
+    assert harness.ocr_manager is None
+    assert harness.database is None
+    assert harness.shared_model is None
+    assert harness._race_ready is False
+    assert harness._initialized is False
+    assert harness._ocr_runtime_state == "idle"
+
+
 def test_vlm_settings_keep_cloud_ocr_out_of_detector_frame_path(monkeypatch):
     class _Vlm:
         def __init__(self, api_key, model):

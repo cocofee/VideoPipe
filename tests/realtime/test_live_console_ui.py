@@ -5,11 +5,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt5.QtGui import QColor, QPixmap
-from PyQt5.QtWidgets import QApplication, QLabel
+from PyQt5.QtWidgets import QApplication, QDialog, QFileDialog, QLabel
 
 from realtime.event_list_widget import EventListWidget
 from realtime.live_event_review import LiveEventReview
-from realtime.main_window import MainWindow, VLMConfigDialog
+from realtime.main_window import MainWindow, NewRaceDialog, VLMConfigDialog
 
 
 @pytest.fixture(scope="module")
@@ -208,6 +208,15 @@ def test_main_window_uses_live_console_structure(qapp, tmp_path, monkeypatch):
     assert window.ocr_status_label.text() == "OCR: 已关闭"
     assert not window.ocr_status_label.isEnabled()
 
+    data_menu = next(
+        action.menu()
+        for action in window.menuBar().actions()
+        if action.text().startswith("数据管理")
+    )
+    data_actions = [action.text() for action in data_menu.actions()]
+    assert "打开已有赛事..." in data_actions
+    assert "录像回放..." in data_actions
+
     visible_text = [label.text() for label in window.findChildren(QLabel)]
     assert not any(text.startswith("RANK ") for text in visible_text)
     assert not any(text.startswith("TIME ") for text in visible_text)
@@ -249,18 +258,45 @@ def test_vlm_config_dialog_restores_openai_option(qapp):
     dialog.close()
 
 
+def test_startup_race_dialog_can_browse_existing_race(qapp, tmp_path, monkeypatch):
+    race_root = tmp_path / "RaceData"
+    race_dir = race_root / "20260810_旧赛事"
+    race_dir.mkdir(parents=True)
+    (race_dir / "timing.db").touch()
+    monkeypatch.setattr(
+        QFileDialog,
+        "getExistingDirectory",
+        lambda *args, **kwargs: str(race_dir),
+    )
+
+    dialog = NewRaceDialog(base_path=str(race_root), allow_existing=True)
+    dialog._open_existing()
+
+    assert dialog.result() == QDialog.Accepted
+    assert dialog.selected_race_dir == race_dir.absolute()
+    assert dialog.result_name == race_dir.name
+    assert dialog.result_path == str(race_root)
+
+
 def test_race_config_updates_sport_profile_and_combo(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(MainWindow, "_prompt_race_selection", lambda self: None)
     monkeypatch.setattr(MainWindow, "_init_ocr_runtime", lambda self: None)
     race_dir = tmp_path / "race"
     race_dir.mkdir()
     (race_dir / "config.json").write_text(
-        '{"sport_profile": "triathlon_run", "gate_guard_enabled": false}',
+        json.dumps(
+            {
+                "sport_profile": "triathlon_run",
+                "gate_guard_enabled": False,
+                "model_path": "D:/old-computer/best.pt",
+            }
+        ),
         encoding="utf-8",
     )
+    current_model = str(tmp_path / "unused.pt")
     window = MainWindow({
         "source": "unused.mp4",
-        "model_path": str(tmp_path / "unused.pt"),
+        "model_path": current_model,
         "output_dir": str(tmp_path),
         "yolo_only_mode": True,
         "live_monitor_enabled": False,
@@ -273,4 +309,6 @@ def test_race_config_updates_sport_profile_and_combo(qapp, tmp_path, monkeypatch
     assert window.config["gate_guard_enabled"] is True
     assert window.sport_profile_combo.currentData() == "running"
     assert window._gate_guard_enabled is True
+    assert window.model_path == current_model
+    assert window.config["model_path"] == current_model
     window.close()

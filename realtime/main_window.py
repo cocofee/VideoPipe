@@ -98,6 +98,7 @@ try:
     from .event_profile import normalize_sport_profile
     from .runtime_paths import application_dir, find_model as find_runtime_model, resolve_output_dir, resolve_runtime_path, resolve_source
     from .stream_recorder import ManualRecordingManager, RecordingError, is_rtsp_source
+    from .video_playback import VideoPlaybackDialog, find_recordings
 except ImportError:
     import sys
     import os
@@ -119,6 +120,7 @@ except ImportError:
     from event_profile import normalize_sport_profile
     from runtime_paths import application_dir, find_model as find_runtime_model, resolve_output_dir, resolve_runtime_path, resolve_source
     from stream_recorder import ManualRecordingManager, RecordingError, is_rtsp_source
+    from video_playback import VideoPlaybackDialog, find_recordings
 
 
 class InteractiveVideoLabel(QLabel):
@@ -1982,12 +1984,19 @@ class StartTimeDialog(QDialog):
 
 class NewRaceDialog(QDialog):
     """新建赛事对话框：指定新赛事的文件夹名称和位置"""
-    def __init__(self, parent=None, base_path: Optional[str] = None):
+    def __init__(
+        self,
+        parent=None,
+        base_path: Optional[str] = None,
+        allow_existing: bool = False,
+    ):
         super().__init__(parent)
-        self.setWindowTitle("新建赛事")
-        self.setFixedSize(550, 300)
+        self.allow_existing = allow_existing
+        self.setWindowTitle("选择赛事" if allow_existing else "新建赛事")
+        self.setFixedSize(620, 300)
         self.result_name = ""
         self.result_path = ""
+        self.selected_race_dir: Optional[Path] = None
         self.base_path = base_path
         self._init_ui()
 
@@ -1995,7 +2004,12 @@ class NewRaceDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(20)
         
-        tip_label = QLabel("创建一个全新的赛事文件夹，所有数据（数据库、照片）将独立存储。")
+        tip_text = (
+            "打开已有赛事，或创建一个全新的赛事文件夹。"
+            if self.allow_existing
+            else "创建一个全新的赛事文件夹，所有数据（数据库、照片）将独立存储。"
+        )
+        tip_label = QLabel(tip_text)
         tip_label.setStyleSheet("color: #666; font-size: 16px;")
         layout.addWidget(tip_label)
         
@@ -2033,6 +2047,13 @@ class NewRaceDialog(QDialog):
         self.cancel_btn = QPushButton("取消")
         self.cancel_btn.setFixedHeight(45)
         self.cancel_btn.clicked.connect(self.reject)
+
+        if self.allow_existing:
+            self.open_btn = QPushButton("打开已有赛事...")
+            self.open_btn.setFixedHeight(45)
+            self.open_btn.clicked.connect(self._open_existing)
+            btn_layout.addWidget(self.open_btn)
+            btn_layout.addStretch()
         
         self.ok_btn = QPushButton("创建并进入新赛事")
         self.ok_btn.setStyleSheet("""
@@ -2056,12 +2077,38 @@ class NewRaceDialog(QDialog):
         if self.base_path:
             browse_btn.setEnabled(False)
 
+    def _open_existing(self):
+        start_path = self.base_path or self.path_input.text() or str(Path.cwd())
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "打开已有赛事",
+            start_path,
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks,
+        )
+        if not selected:
+            return
+
+        race_dir = Path(selected).expanduser().absolute()
+        if not (race_dir / "timing.db").is_file():
+            QMessageBox.warning(
+                self,
+                "不是赛事目录",
+                "请选择包含 timing.db 的具体赛事文件夹，不要选择 RaceData 根目录。",
+            )
+            return
+
+        self.selected_race_dir = race_dir
+        self.result_name = race_dir.name
+        self.result_path = str(race_dir.parent)
+        self.accept()
+
     def _browse_path(self):
         path = QFileDialog.getExistingDirectory(self, "选择赛事存储根目录", self.path_input.text())
         if path:
             self.path_input.setText(path)
 
     def _on_ok(self):
+        self.selected_race_dir = None
         self.result_name = self.name_input.text().strip()
         self.result_path = self.path_input.text().strip()
         
@@ -2386,17 +2433,28 @@ class MainWindow(QMainWindow):
         self.roi_enabled = {int(k): bool(v) for k, v in self.roi_enabled.items()}
 
     def _apply_race_config(self, race_dir: Path):
+        runtime_config = {
+            key: self.config.get(key)
+            for key in (
+                'runtime_dir',
+                'model_path',
+                'yolo_only_mode',
+                'ocr_cpu_threads',
+            )
+            if key in self.config
+        }
         config_file = race_dir / "config.json"
         if config_file.exists():
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     saved_config = json.load(f)
                 for k, v in saved_config.items():
-                    if k == 'ai_config':
+                    if k == 'ai_config' or k in runtime_config:
                         continue
                     self.config[k] = v
             except Exception as e:
                 logger.warning(f"加载保存配置失败: {e}")
+        self.config.update(runtime_config)
         self.config['output_dir'] = str(race_dir)
         self.sport_profile = normalize_sport_profile(self.config.get('sport_profile', 'cycling'))
         self.config['sport_profile'] = self.sport_profile
@@ -2466,13 +2524,19 @@ class MainWindow(QMainWindow):
         if self._race_ready:
             return
         self.race_root.mkdir(parents=True, exist_ok=True)
-        dialog = NewRaceDialog(self, base_path=str(self.race_root))
+        dialog = NewRaceDialog(
+            self,
+            base_path=str(self.race_root),
+            allow_existing=True,
+        )
         if dialog.exec_() != QDialog.Accepted:
             QMessageBox.warning(self, "提示", "必须先选择或创建赛事，系统将退出。")
             self.close()
             return
-        race_name = dialog.result_name
-        race_dir = self.race_root / race_name
+        race_dir = dialog.selected_race_dir or (
+            Path(dialog.result_path) / dialog.result_name
+        )
+        race_name = race_dir.name
         is_existing = race_dir.exists()
         try:
             race_dir.mkdir(parents=True, exist_ok=True)
@@ -3536,6 +3600,18 @@ class MainWindow(QMainWindow):
         
         settings_menu.addSeparator()
         
+        data_menu.addSeparator()
+
+        open_race_action = QAction("打开已有赛事...", self)
+        open_race_action.setStatusTip("打开包含 timing.db 的已有赛事文件夹")
+        open_race_action.triggered.connect(self._on_open_race_clicked)
+        data_menu.addAction(open_race_action)
+
+        playback_action = QAction("录像回放...", self)
+        playback_action.setStatusTip("打开当前赛事 videos 目录中的录像")
+        playback_action.triggered.connect(self._on_playback_clicked)
+        data_menu.addAction(playback_action)
+
         init_race_action = QAction("新建赛事 (创建独立文件夹)...", self)
         init_race_action.setStatusTip("创建一个全新的赛事文件夹，所有数据独立存储")
         init_race_action.triggered.connect(self._on_new_race_clicked)
@@ -4120,6 +4196,145 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "导出错误", f"保存Excel失败: {e}\n请确保文件未被其他程序占用。")
             return False
 
+    def _release_current_race(self):
+        """Stop race-bound workers and close the current database before switching."""
+        if self.recording_manager is not None:
+            self._stop_manual_recording(show_message=False)
+
+        for thread_group in (self.preview_threads, self.video_threads):
+            for thread in list(thread_group.values()):
+                try:
+                    thread.stop()
+                except Exception as exc:
+                    logger.warning(f"[Main] 停止赛事线程失败: {exc}")
+            thread_group.clear()
+
+        for reader in list(self.readers.values()):
+            try:
+                reader.stop()
+            except Exception as exc:
+                logger.warning(f"[Main] 停止视频读取器失败: {exc}")
+        self.readers.clear()
+        self.detectors.clear()
+
+        if self.recorder is not None:
+            try:
+                self.recorder.stop()
+            except Exception as exc:
+                logger.warning(f"[Main] 停止事件记录器失败: {exc}")
+            self.recorder = None
+
+        if self.ocr_manager is not None:
+            try:
+                self.ocr_manager.stop()
+            except Exception as exc:
+                logger.warning(f"[Main] 停止 OCR 管理器失败: {exc}")
+            self.ocr_manager = None
+        if self._ocr_poll_timer.isActive():
+            self._ocr_poll_timer.stop()
+
+        if self.database is not None:
+            try:
+                self.database.close()
+            except Exception as exc:
+                logger.warning(f"[Main] 关闭赛事数据库失败: {exc}")
+            self.database = None
+
+        self.shared_model = None
+        self.shared_athlete_validator = None
+        self._athlete_validator_checked = False
+        self.shared_vlm = None
+        self.field_issue_log = None
+        self._initialized = False
+        self._race_ready = False
+        self._session_event_count = 0
+        self._latest_frame_observations.clear()
+        self._live_monitor_samples.clear()
+        self._live_monitor_last_warn_ts.clear()
+        self._ocr_runtime_state = "disabled" if self._yolo_only_mode else "idle"
+        self._refresh_ocr_runtime_ui()
+
+    def _switch_race_dir(self, race_dir: Path) -> bool:
+        race_dir = race_dir.expanduser().absolute()
+        try:
+            self._release_current_race()
+            self._apply_race_config(race_dir)
+            self._activate_race_dir(race_dir)
+            if not self._init_components():
+                raise RuntimeError("重新初始化组件失败，请检查日志。")
+            self.event_list.refresh_data()
+            if hasattr(self, 'session_count_label'):
+                self.session_count_label.setText("本轮新增 0")
+            if hasattr(self, 'video_session_label'):
+                self.video_session_label.setText("本轮新增 0")
+            return True
+        except Exception as exc:
+            logger.exception(f"[Main] 切换赛事失败: {exc}")
+            QMessageBox.critical(self, "切换赛事失败", str(exc))
+            return False
+
+    def _on_open_race_clicked(self):
+        """Open an existing race directory without creating a new database."""
+        if self._running:
+            QMessageBox.warning(self, "警告", "请先停止当前计时任务，再打开其他赛事。")
+            return
+
+        start_path = self.output_dir if self.output_dir.exists() else self.race_root
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "打开已有赛事",
+            str(start_path),
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks,
+        )
+        if not selected:
+            return
+
+        race_dir = Path(selected).expanduser().absolute()
+        if not (race_dir / "timing.db").is_file():
+            QMessageBox.warning(
+                self,
+                "不是赛事目录",
+                "请选择包含 timing.db 的具体赛事文件夹，不要选择 RaceData 根目录。",
+            )
+            return
+        if race_dir == self.output_dir:
+            self.statusBar().showMessage(f"当前已经是赛事: {race_dir.name}")
+            return
+
+        if self._switch_race_dir(race_dir):
+            QMessageBox.information(self, "成功", f"已打开赛事：{race_dir.name}")
+
+    def _on_playback_clicked(self):
+        """Open a recording from the current race with responsive review controls."""
+        if self._running:
+            QMessageBox.warning(self, "提示", "请先停止当前采集，再打开录像回放。")
+            return
+        if not self._race_ready:
+            QMessageBox.warning(self, "提示", "请先打开赛事。")
+            return
+
+        recordings = find_recordings(self.output_dir)
+        if not recordings:
+            QMessageBox.information(
+                self,
+                "没有录像",
+                f"当前赛事没有可回放录像：\n{self.output_dir / 'videos'}",
+            )
+            return
+
+        latest = recordings[0]
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择赛事录像",
+            str(latest),
+            "Video (*.mkv *.mp4 *.avi *.mov *.m4v);;All (*.*)",
+        )
+        if not selected:
+            return
+
+        playback = VideoPlaybackDialog(Path(selected), self)
+        playback.exec_()
+
     def _on_new_race_clicked(self):
         """新建赛事逻辑：创建新文件夹并切换"""
         if self._running:
@@ -4131,7 +4346,7 @@ class MainWindow(QMainWindow):
             return
             
         race_name = dialog.result_name
-        new_race_dir = self.race_root / race_name
+        new_race_dir = Path(dialog.result_path) / race_name
         
         try:
             # 1. 创建目录结构
@@ -4142,30 +4357,14 @@ class MainWindow(QMainWindow):
             # 2. 迁移配置：将当前的 config.json 复制过去（保留摄像头等设置）
             old_config = self.output_dir / "config.json"
             new_config = new_race_dir / "config.json"
-            if old_config.exists():
+            if old_config.exists() and old_config.absolute() != new_config.absolute():
                 import shutil
                 shutil.copy2(old_config, new_config)
             
-            # 3. 停止当前所有组件
-            if hasattr(self, 'recorder') and self.recorder:
-                self.recorder.stop()
-                self.recorder = None
-            
-            if self.database:
-                self.database = None
-
-            # 4. 更新工作目录
-            self._activate_race_dir(new_race_dir)
-            logger.info(f"[Main] 切换到新赛事目录: {self.output_dir}")
-
-            if not self._init_components():
-                QMessageBox.critical(self, "错误", "重新初始化组件失败，请检查日志。")
+            if not self._switch_race_dir(new_race_dir):
                 return
-            
-            # 7. 刷新 UI
-            self.event_list.refresh_data()
-            self._session_event_count = 0
-            self.statusBar().showMessage(f"当前赛事: {race_name}")
+
+            logger.info(f"[Main] 切换到新赛事目录: {self.output_dir}")
             QMessageBox.information(self, "成功", f"已成功切换至新赛事：{race_name}")
             
         except Exception as e:

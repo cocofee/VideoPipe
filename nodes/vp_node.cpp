@@ -19,8 +19,16 @@ namespace vp_nodes {
             // wait for producer, make sure in_queue is not empty.
             this->in_queue_semaphore.wait();
 
-            VP_DEBUG(vp_utils::string_format("[%s] before handling meta, in_queue.size()==>%d", node_name.c_str(), in_queue.size()));
-            auto in_meta = this->in_queue.front();
+            std::shared_ptr<vp_objects::vp_meta> in_meta;
+            {
+                std::lock_guard<std::mutex> guard(this->in_queue_lock);
+                if (this->in_queue.empty()) {
+                    continue;
+                }
+                VP_DEBUG(vp_utils::string_format("[%s] before handling meta, in_queue.size()==>%d", node_name.c_str(), in_queue.size()));
+                in_meta = this->in_queue.front();
+                this->in_queue.pop();
+            }
             
             // dead flag
             if (in_meta == nullptr) {
@@ -61,7 +69,6 @@ namespace vp_nodes {
             else {
                 throw "invalid meta type!";
             }
-            this->in_queue.pop();
             VP_DEBUG(vp_utils::string_format("[%s] after handling meta, in_queue.size()==>%d", node_name.c_str(), in_queue.size()));
 
             // one by one mode
@@ -142,6 +149,20 @@ namespace vp_nodes {
         }
 
         std::lock_guard<std::mutex> guard(this->in_queue_lock);
+        auto frame_meta = std::dynamic_pointer_cast<vp_objects::vp_frame_meta>(meta);
+        if (frame_meta != nullptr && frame_meta->live) {
+            // Keep at most one queued live frame. The consumer may already be
+            // processing another frame; dropping older queued frames prevents
+            // latency from growing without changing file-video semantics.
+            while (this->in_queue.size() >= 2) {
+                auto queued_frame = std::dynamic_pointer_cast<vp_objects::vp_frame_meta>(this->in_queue.front());
+                if (queued_frame == nullptr || !queued_frame->live) {
+                    break;
+                }
+                this->in_queue.pop();
+                this->in_queue_semaphore.try_wait();
+            }
+        }
         VP_DEBUG(vp_utils::string_format("[%s] before meta flow, in_queue.size()==>%d", node_name.c_str(), in_queue.size()));
         this->in_queue.push(meta);
 

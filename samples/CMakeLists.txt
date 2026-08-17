@@ -186,9 +186,6 @@ if(VP_WITH_TRT)
     add_executable(1-N-1_sample3 "1-N-1_sample3.cpp")
     target_link_libraries(1-N-1_sample3 ${PROJECT_NAME})
 
-    add_executable(trt_yolov8_sample "trt_yolov8_sample.cpp")
-    target_link_libraries(trt_yolov8_sample ${PROJECT_NAME})
-
     add_executable(trt_yolov8_sample2 "trt_yolov8_sample2.cpp")
     target_link_libraries(trt_yolov8_sample2 ${PROJECT_NAME})
 
@@ -235,3 +232,6 @@ if(VP_BUILD_COMPLEX_SAMPLES)
     endif()
     
 endif()
+
+add_executable(yolo11_sample "yolo11_sample.cpp")
+target_link_libraries(yolo11_sample ${PROJECT_NAME})

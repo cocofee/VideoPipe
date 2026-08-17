@@ -6,6 +6,39 @@
 #include "../objects/vp_video_record_control_meta.h"
 
 namespace vp_nodes {
+
+    bool vp_src_node::normalize_frame(const cv::Mat& input, cv::Mat& output) {
+        if (input.empty()) {
+            return false;
+        }
+
+        cv::Mat frame = input;
+        if (frame.depth() != CV_8U) {
+            double min_value = 0.0;
+            double max_value = 0.0;
+            cv::minMaxLoc(frame.reshape(1), &min_value, &max_value);
+            const double scale = max_value > 1.0 && max_value <= 255.0
+                ? 1.0
+                : (max_value > 255.0 ? 255.0 / max_value : 255.0);
+            frame.convertTo(frame, CV_MAKETYPE(CV_8U, frame.channels()), scale);
+        }
+
+        switch (frame.channels()) {
+        case 1:
+            cv::cvtColor(frame, output, cv::COLOR_GRAY2BGR);
+            break;
+        case 3:
+            output = frame.clone();
+            break;
+        case 4:
+            cv::cvtColor(frame, output, cv::COLOR_BGRA2BGR);
+            break;
+        default:
+            return false;
+        }
+
+        return !output.empty();
+    }
     
     vp_src_node::vp_src_node(std::string node_name, 
                             int channel_index, 

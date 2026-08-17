@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vp_node.h"
+#include <opencv2/imgproc.hpp>
 #include "vp_stream_info_hookable.h"
 #include "../excepts/vp_not_implemented_error.h"
 #include "../excepts/vp_invalid_calling_error.h"
@@ -38,6 +39,10 @@ namespace vp_nodes {
         // control to work or not
         // all derived class need depend on the value to check if work or not (start/stop)
         vp_utils::vp_gate gate;
+
+        // Normalize host/camera frames before they enter the pipeline. Camera
+        // SDKs commonly return gray, BGRA, or non-8-bit matrices.
+        static bool normalize_frame(const cv::Mat& input, cv::Mat& output);
 
         // new logic for sending dead flag
         virtual void deinitialized() override;

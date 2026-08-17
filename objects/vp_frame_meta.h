@@ -34,7 +34,7 @@ namespace vp_objects {
     private:
         /* data */
     public:
-        vp_frame_meta(cv::Mat frame, int frame_index = -1, int channel_index = -1, int original_width = 0, int original_height = 0, int fps = 0);
+        vp_frame_meta(cv::Mat frame, int frame_index = -1, int channel_index = -1, int original_width = 0, int original_height = 0, int fps = 0, bool live = false);
         ~vp_frame_meta();
 
         // define copy constructor since we need deep copy operation.
@@ -45,6 +45,9 @@ namespace vp_objects {
 
         // fps for current video.
         int fps;
+
+        // Live sources should prefer the newest frame when downstream work is slower.
+        bool live;
 
         // orignal frame width, fiiled by src nodes.
         int original_width;

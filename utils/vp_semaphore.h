@@ -25,6 +25,15 @@ namespace vp_utils {
             cv_.wait(lock, [=] { return count_ > 0; });
             --count_;
         }
+
+        bool try_wait() {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (count_ <= 0) {
+                return false;
+            }
+            --count_;
+            return true;
+        }
         
         void reset() {
             std::unique_lock<std::mutex> lock(mutex_);

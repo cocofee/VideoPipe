@@ -4,12 +4,13 @@
 
 namespace vp_objects {
         
-    vp_frame_meta::vp_frame_meta(cv::Mat frame, int frame_index, int channel_index, int original_width, int original_height, int fps): 
+    vp_frame_meta::vp_frame_meta(cv::Mat frame, int frame_index, int channel_index, int original_width, int original_height, int fps, bool live):
         vp_meta(vp_meta_type::FRAME, channel_index), 
         frame_index(frame_index), 
         original_width(original_width),
         original_height(original_height),
         fps(fps),
+        live(live),
         frame(frame) {
             assert(!frame.empty());
     }
@@ -23,7 +24,8 @@ namespace vp_objects {
         original_width(meta.original_width),
         original_height(meta.original_height),
         description(meta.description),
-        fps(meta.fps) {
+        fps(meta.fps),
+        live(meta.live) {
             // deep copy frame data
             this->frame = meta.frame.clone();
             this->osd_frame = meta.osd_frame.clone();

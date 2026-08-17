@@ -1,6 +1,9 @@
 
 
 #include "vp_udp_src_node.h"
+#include <algorithm>
+#include <chrono>
+#include <thread>
 #include "../utils/vp_utils.h"
 
 namespace vp_nodes {
@@ -31,6 +34,7 @@ namespace vp_nodes {
         int video_height = 0;
         int fps = 0;
         int skip = 0;
+        bool stream_info_sent = false;
         while(alive) {
             // check if need work
             gate.knock();
@@ -39,8 +43,10 @@ namespace vp_nodes {
             if (!udp_capture.isOpened()) {
                 video_width = video_height = fps = 0;
                 original_width = original_height = original_fps = 0;
+                stream_info_sent = false;
                 if (!udp_capture.open(this->gst_template, cv::CAP_GSTREAMER)) {
                     VP_WARN(vp_utils::string_format("[%s] open udp failed, try again...", node_name.c_str()));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     continue;
                 }
             }
@@ -49,23 +55,38 @@ namespace vp_nodes {
             if (video_width == 0 || video_height == 0 || fps == 0) {
                 video_width = udp_capture.get(cv::CAP_PROP_FRAME_WIDTH);
                 video_height = udp_capture.get(cv::CAP_PROP_FRAME_HEIGHT);
-                fps = udp_capture.get(cv::CAP_PROP_FPS);
+                const auto stream_fps = udp_capture.get(cv::CAP_PROP_FPS);
+                fps = stream_fps > 1.0 ? static_cast<int>(stream_fps + 0.5) : 30;
 
                 original_fps = fps;
                 original_width = video_width;
                 original_height = video_height;
 
                 // set true fps because skip some frames
-                fps = fps / (skip_interval + 1);
+                fps = std::max(1, fps / (skip_interval + 1));
             }
-            // stream_info_hooker activated if need
-            vp_stream_info stream_info {channel_index, original_fps, original_width, original_height, to_string()};
-            invoke_stream_info_hooker(node_name, stream_info);
 
             udp_capture >> frame;
             if(frame.empty()) {
                 VP_WARN(vp_utils::string_format("[%s] reading frame empty, total frame==>%d", node_name.c_str(), frame_index));
+                udp_capture.release();
+                video_width = video_height = fps = 0;
+                original_width = original_height = original_fps = 0;
+                stream_info_sent = false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
+            }
+
+            if (video_width <= 0 || video_height <= 0) {
+                video_width = frame.cols;
+                video_height = frame.rows;
+                original_width = video_width;
+                original_height = video_height;
+            }
+            if (!stream_info_sent) {
+                vp_stream_info stream_info {channel_index, original_fps, original_width, original_height, to_string()};
+                invoke_stream_info_hooker(node_name, stream_info);
+                stream_info_sent = true;
             }
 
             // need skip
@@ -90,7 +111,7 @@ namespace vp_nodes {
             this->frame_index++;
             // create frame meta
             auto out_meta = 
-                std::make_shared<vp_objects::vp_frame_meta>(resize_frame, this->frame_index, this->channel_index, video_width, video_height, fps);
+                std::make_shared<vp_objects::vp_frame_meta>(resize_frame, this->frame_index, this->channel_index, video_width, video_height, fps, true);
 
             if (out_meta != nullptr) {
                 this->out_queue.push(out_meta);

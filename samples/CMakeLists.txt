@@ -235,3 +235,6 @@ endif()
 
 add_executable(yolo11_sample "yolo11_sample.cpp")
 target_link_libraries(yolo11_sample ${PROJECT_NAME})
+if(WIN32)
+    vp_deploy_windows_runtime(yolo11_sample)
+endif()

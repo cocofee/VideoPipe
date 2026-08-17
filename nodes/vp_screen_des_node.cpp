@@ -17,6 +17,15 @@ namespace vp_nodes {
     
     vp_screen_des_node::~vp_screen_des_node() {
         deinitialized();
+        screen_writer.release();
+        if (opencv_window_enabled) {
+            try {
+                cv::destroyWindow(node_name);
+            }
+            catch (const cv::Exception&) {
+                // GUI teardown is best effort.
+            }
+        }
     }
 
     // re-implementation, return nullptr.
@@ -32,10 +41,66 @@ namespace vp_nodes {
                 resize_frame = (osd && !meta->osd_frame.empty()) ? meta->osd_frame : meta->frame;
             }
 
-            if (!screen_writer.isOpened()) {
-                assert(screen_writer.open(this->gst_template, cv::CAP_GSTREAMER, 0, meta->fps, {resize_frame.cols, resize_frame.rows}));
+            if (resize_frame.empty()) {
+                VP_WARN(vp_utils::string_format("[%s] received an empty frame, skipping display", node_name.c_str()));
+                return vp_des_node::handle_frame_meta(meta);
             }
-            screen_writer.write(resize_frame);
+
+            if (!output_initialized && !output_disabled) {
+                output_initialized = true;
+                bool opened = false;
+#if defined(_WIN32)
+                // The default ximagesink pipeline is Linux-specific. On Windows,
+                // bypass it instead of allowing an asynchronous GStreamer error.
+                VP_INFO(vp_utils::string_format("[%s] using OpenCV window output on Windows",
+                                                node_name.c_str()));
+#else
+                try {
+                    opened = screen_writer.open(this->gst_template,
+                                                cv::CAP_GSTREAMER,
+                                                0,
+                                                meta->fps,
+                                                {resize_frame.cols, resize_frame.rows});
+                }
+                catch (const cv::Exception& e) {
+                    VP_WARN(vp_utils::string_format("[%s] GStreamer display initialization failed: %s",
+                                                    node_name.c_str(),
+                                                    e.what()));
+                }
+#endif
+
+                if (!opened) {
+                    try {
+                        cv::namedWindow(node_name, cv::WINDOW_NORMAL);
+                        opencv_window_enabled = true;
+                        VP_WARN(vp_utils::string_format("[%s] GStreamer display unavailable; using OpenCV window fallback",
+                                                        node_name.c_str()));
+                    }
+                    catch (const cv::Exception& e) {
+                        output_disabled = true;
+                        VP_WARN(vp_utils::string_format("[%s] display disabled: %s",
+                                                        node_name.c_str(),
+                                                        e.what()));
+                    }
+                }
+            }
+
+            if (screen_writer.isOpened()) {
+                screen_writer.write(resize_frame);
+            }
+            else if (opencv_window_enabled) {
+                try {
+                    cv::imshow(node_name, resize_frame);
+                    cv::waitKey(1);
+                }
+                catch (const cv::Exception& e) {
+                    opencv_window_enabled = false;
+                    output_disabled = true;
+                    VP_WARN(vp_utils::string_format("[%s] OpenCV display failed, disabling output: %s",
+                                                    node_name.c_str(),
+                                                    e.what()));
+                }
+            }
 
             // for general works defined in base class
             return vp_des_node::handle_frame_meta(meta);

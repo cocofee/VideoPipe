@@ -10,7 +10,12 @@ project(video_pipe VERSION 1.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE Debug)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -fPIC -w -fdiagnostics-color=always -pthread")
+if(MSVC)
+    add_compile_options(/EHsc /utf-8)
+    add_compile_definitions(_SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING)
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -fPIC -w -fdiagnostics-color=always -pthread")
+endif()
 # save all libs(including third_party's) to 'libs'
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/libs)
 
@@ -31,6 +36,12 @@ message(STATUS "    libraries: ${OpenCV_LIBS}")
 message(STATUS "    include path: ${OpenCV_INCLUDE_DIRS}")
 include_directories(${OpenCV_INCLUDE_DIRS})
 
+find_path(VP_OPENCV_FREETYPE_HEADER opencv2/freetype.hpp PATHS ${OpenCV_INCLUDE_DIRS} NO_DEFAULT_PATH)
+if(NOT VP_OPENCV_FREETYPE_HEADER)
+    message(WARNING "OpenCV freetype module is unavailable; using the built-in putText compatibility layer")
+    include_directories(BEFORE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opencv_compat")
+endif()
+
 # Gstreamer required
 include(FindPkgConfig)
 pkg_check_modules(GST   REQUIRED gstreamer-1.0)
@@ -42,9 +53,13 @@ message(STATUS "    libraries: ${GST_LIBRARIES} ${GSTAPP_LIBRARIES} ${GST_RTSP_L
 message(STATUS "    include path: ${GST_INCLUDE_DIRS}")
 include_directories(${GST_INCLUDE_DIRS})
 set (GST_DEPEND_LIBS ${GST_LIBRARIES} ${GSTAPP_LIBRARIES} ${GST_RTSP_LIBRARIES})
+link_directories(${GST_LIBRARY_DIRS} ${GSTAPP_LIBRARY_DIRS} ${GST_RTSP_LIBRARY_DIRS})
 
 # collect dependent libs for videopipe
-list(APPEND VP_DEPEND_LIBS ${OpenCV_LIBS} ${GST_DEPEND_LIBS} stdc++fs)
+list(APPEND VP_DEPEND_LIBS ${OpenCV_LIBS} ${GST_DEPEND_LIBS})
+if(NOT WIN32)
+    list(APPEND VP_DEPEND_LIBS stdc++fs)
+endif()
 
 # optional for CUDA
 if(VP_WITH_CUDA) # CUDA enabled
@@ -165,6 +180,30 @@ list(APPEND VP_CPPS_SOURCES ${NODES} ${OBJECTS} ${UTILS})
 
 # build for videopipe
 add_library(${PROJECT_NAME} SHARED ${VP_CPPS_SOURCES})
+if(WIN32)
+    set_target_properties(${PROJECT_NAME} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+
+    # Keep the Windows sample runnable without requiring a manually configured PATH.
+    function(vp_deploy_windows_runtime target)
+        list(GET GST_LIBRARY_DIRS 0 VP_GST_LIB_DIR)
+        get_filename_component(VP_GST_ROOT "${VP_GST_LIB_DIR}" DIRECTORY)
+        file(GLOB VP_GST_RUNTIME_DLLS "${VP_GST_ROOT}/bin/*.dll")
+
+        get_filename_component(VP_OPENCV_ROOT "${OpenCV_DIR}" DIRECTORY)
+        file(GLOB VP_OPENCV_RUNTIME_DLLS "${VP_OPENCV_ROOT}/bin/*.dll")
+
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:${PROJECT_NAME}>"
+                    "$<TARGET_FILE_DIR:${target}>")
+        foreach(runtime_dll IN LISTS VP_GST_RUNTIME_DLLS VP_OPENCV_RUNTIME_DLLS)
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${runtime_dll}"
+                        "$<TARGET_FILE_DIR:${target}>")
+        endforeach()
+    endfunction()
+endif()
 target_link_libraries(${PROJECT_NAME} ${VP_DEPEND_LIBS})
 
 # build for samples

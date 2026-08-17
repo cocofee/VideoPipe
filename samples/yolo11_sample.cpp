@@ -15,9 +15,15 @@ int main(int argc, char** argv) {
     const auto model_path = argc > 1 ? argv[1] : "./vp_data/models/yolo11n.onnx";
     const auto labels_path = argc > 2 ? argv[2] : "./vp_data/models/coco_80classes.txt";
     const auto device_index = argc > 3 ? std::atoi(argv[3]) : 0;
+#if defined(_WIN32)
+    const auto default_backend = cv::CAP_DSHOW;
+#else
+    const auto default_backend = cv::CAP_ANY;
+#endif
+    const auto backend = argc > 4 ? std::atoi(argv[4]) : default_backend;
 
     auto camera = std::make_shared<vp_nodes::vp_camera_src_node>(
-        "camera_0", 0, device_index, 0.5f, 1920, 1080, 30, 1);
+        "camera_0", 0, device_index, 1.0f, 1920, 1080, 30, 0, backend);
     auto detector = std::make_shared<vp_nodes::vp_yolo11_detector_node>(
         "yolo11_detector", model_path, labels_path);
     auto osd = std::make_shared<vp_nodes::vp_osd_node_v3>("osd_0");

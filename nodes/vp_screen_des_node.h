@@ -15,6 +15,9 @@ namespace vp_nodes {
         /* data */
         std::string gst_template = "appsrc ! videoconvert ! videoscale ! textoverlay text=%s halignment=left valignment=top font-desc='Sans,16' shaded-background=true ! timeoverlay halignment=right valignment=top font-desc='Sans,16' shaded-background=true ! queue ! fpsdisplaysink video-sink=ximagesink sync=false";
         cv::VideoWriter screen_writer;
+        bool output_initialized = false;
+        bool opencv_window_enabled = false;
+        bool output_disabled = false;
     protected:
         // re-implementation, return nullptr.
         virtual std::shared_ptr<vp_objects::vp_meta> handle_frame_meta(std::shared_ptr<vp_objects::vp_frame_meta> meta) override; 

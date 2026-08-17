@@ -78,7 +78,9 @@ namespace vp_nodes {
         }
         validate_thresholds(confidence_threshold, nms_threshold);
         if (net.empty()) {
-            throw std::runtime_error("failed to load YOLO11 model: " + model_path);
+            throw std::runtime_error(
+                "failed to load YOLO11 ONNX model: " + model_path +
+                ". Export a fixed-shape model with imgsz=640 and dynamic=false for OpenCV DNN.");
         }
         this->initialized();
     }

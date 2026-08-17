@@ -6,6 +6,11 @@ namespace vp_utils {
     vp_logger::vp_logger(/* args */)
     {
     }
+
+    vp_logger& vp_logger::get_logger() {
+        static vp_logger logger;
+        return logger;
+    }
     
     vp_logger::~vp_logger() {
         die();

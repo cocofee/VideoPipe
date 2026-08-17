@@ -31,12 +31,12 @@ namespace vp_nodes {
                                 double theta, int rand_seed, bool skip_random_init, 
                                 int stop_lying_iter, int mom_switch_iter) {
         assert(cache_high_features.size() != 0);
-        auto N = cache_high_features.size();
-        auto D = cache_high_features[0].second.size();  // all the same as the first feature's dims
+        const auto N = static_cast<int>(cache_high_features.size());
+        const auto D = static_cast<int>(cache_high_features[0].second.size());  // all the same as the first feature's dims
 
         // prepare input
-        double data[N * D];
-        double Y[N * no_dims];
+        std::vector<double> data(static_cast<size_t>(N) * D);
+        std::vector<double> Y(static_cast<size_t>(N) * no_dims);
         for (int i = 0; i < N; i++) {
             for (int j = 0; j < D; j++) {
                 data[i * D + j] = cache_high_features[i].second[j];
@@ -44,7 +44,7 @@ namespace vp_nodes {
         }
         
         // call t-SNE
-        TSNE::run(data, N, D, Y, no_dims, perplexity, theta, rand_seed, skip_random_init, max_iter, stop_lying_iter, mom_switch_iter);
+        TSNE::run(data.data(), N, D, Y.data(), no_dims, perplexity, theta, rand_seed, skip_random_init, max_iter, stop_lying_iter, mom_switch_iter);
 
         // prepare output
         for (int i = 0; i < N; i++) {

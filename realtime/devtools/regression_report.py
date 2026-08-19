@@ -544,7 +544,7 @@ def _force_utf8_stdout() -> None:
 
 def _load_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else None
     except Exception:
@@ -687,7 +687,7 @@ def main() -> int:
     parser.add_argument("--config", type=str, default="", help="可选：config.json 或 config_preset_*.json（用于复用终点线/ROI）")
     parser.add_argument(
         "--sport-profile",
-        choices=("cycling", "speed_skating"),
+        choices=("cycling", "running", "speed_skating"),
         default="cycling",
         help="赛事检测配置（默认 cycling）",
     )

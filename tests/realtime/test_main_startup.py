@@ -46,6 +46,36 @@ def test_auto_start_waits_without_opening_race_dialog_again(monkeypatch):
     assert scheduled == [(100, harness.start_when_race_ready)]
 
 
+def test_primary_bicycle_model_skips_duplicate_secondary_validator(monkeypatch):
+    class _Harness:
+        _init_shared_athlete_validator = MainWindow._init_shared_athlete_validator
+
+        def __init__(self):
+            self._athlete_validator_checked = False
+            self.shared_athlete_validator = None
+            self.shared_model = type(
+                "PrimaryModel",
+                (),
+                {"names": {0: "person", 1: "bicycle"}},
+            )()
+            self.sport_profile = "cycling"
+            self.config = {}
+
+    monkeypatch.setattr(
+        main_window,
+        "resolve_athlete_validator_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("secondary validator lookup should be skipped")
+        ),
+    )
+    harness = _Harness()
+
+    harness._init_shared_athlete_validator()
+
+    assert harness._athlete_validator_checked is True
+    assert harness.shared_athlete_validator is None
+
+
 def test_releasing_current_race_stops_workers_and_closes_database():
     class _Stoppable:
         def __init__(self):

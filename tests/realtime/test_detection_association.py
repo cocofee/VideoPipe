@@ -210,6 +210,96 @@ class _VerticalFinishCrossingModel:
         return [SimpleNamespace(boxes=boxes, names=self.names)]
 
 
+class _NearLineApproachModel:
+    names = {0: "person"}
+
+    def __init__(self, centers):
+        self._centers = iter(centers)
+
+    def track(self, frame, **kwargs):
+        center_x = next(self._centers)
+        boxes = _SimpleBoxes(
+            cls=[0],
+            conf=[0.95],
+            xyxy=[[center_x - 50, 300, center_x + 50, 500]],
+            ids=[11],
+        )
+        return [SimpleNamespace(boxes=boxes, names=self.names)]
+
+
+class _ObliqueFinishCrossingModel:
+    names = {0: "person"}
+
+    def __init__(self):
+        self._positions = iter(((500, 280), (400, 310), (300, 340)))
+
+    def track(self, frame, **kwargs):
+        center_x, bottom_y = next(self._positions)
+        boxes = _SimpleBoxes(
+            cls=[0],
+            conf=[0.95],
+            xyxy=[[center_x - 50, bottom_y - 200, center_x + 50, bottom_y]],
+            ids=[11],
+        )
+        return [SimpleNamespace(boxes=boxes, names=self.names)]
+
+
+class _CyclingEquipmentCrossingModel:
+    names = {0: "person", 1: "bicycle"}
+
+    def __init__(self):
+        self._positions = iter(
+            (
+                (500, 280),
+                (400, 310),
+                (300, 340),
+            )
+        )
+        self.kwargs = []
+
+    def track(self, frame, **kwargs):
+        center_x, bicycle_bottom_y = next(self._positions)
+        self.kwargs.append(kwargs)
+        boxes = _SimpleBoxes(
+            cls=[0, 1],
+            conf=[0.95, 0.92],
+            xyxy=[
+                [center_x - 45, 100, center_x + 45, 300],
+                [center_x - 65, bicycle_bottom_y - 100, center_x + 65, bicycle_bottom_y],
+            ],
+            ids=[11, 21],
+        )
+        return [SimpleNamespace(boxes=boxes, names=self.names)]
+
+
+class _CyclingEquipmentDropoutModel:
+    names = {0: "person", 1: "bicycle"}
+
+    def __init__(self):
+        self._frame_index = 0
+
+    def track(self, frame, **kwargs):
+        self._frame_index += 1
+        if self._frame_index == 1:
+            boxes = _SimpleBoxes(
+                cls=[0, 1],
+                conf=[0.95, 0.92],
+                xyxy=[
+                    [250, 100, 350, 300],
+                    [235, 240, 365, 340],
+                ],
+                ids=[11, 21],
+            )
+        else:
+            boxes = _SimpleBoxes(
+                cls=[0],
+                conf=[0.95],
+                xyxy=[[250, 100, 350, 300]],
+                ids=[11],
+            )
+        return [SimpleNamespace(boxes=boxes, names=self.names)]
+
+
 class _FragmentedVerticalFinishCrossingModel:
     names = {0: "person"}
 
@@ -952,6 +1042,42 @@ def test_missing_secondary_validator_fails_open():
     assert detector._passes_athlete_event_validation(state, crop) is True
 
 
+def test_primary_equipment_aware_model_rejects_track_without_bicycle_association():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None, athlete_validator=None)
+    detector.equipment_class_ids = {1}
+    state = TrackState(prev_x=0, prev_y=0, crossed_time=2.0, last_seen_time=2.0)
+    state.pending_event_data = {"bbox": [100, 100, 160, 280]}
+    crop = np.zeros((160, 100, 3), dtype=np.uint8)
+
+    assert detector._passes_athlete_event_validation(state, crop) is False
+
+
+def test_primary_equipment_aware_model_keeps_crouched_rider_when_bicycle_is_occluded():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None, athlete_validator=None)
+    detector.equipment_class_ids = {1}
+    state = TrackState(prev_x=0, prev_y=0, crossed_time=2.0, last_seen_time=2.0)
+    state.pending_event_data = {"bbox": [100, 100, 260, 300]}
+    crop = np.zeros((160, 100, 3), dtype=np.uint8)
+
+    assert detector._passes_athlete_event_validation(state, crop) is True
+
+
+def test_recent_primary_bicycle_association_keeps_event_without_secondary_validator():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None, athlete_validator=None)
+    detector.equipment_class_ids = {1}
+    state = TrackState(
+        prev_x=0,
+        prev_y=0,
+        crossed_time=2.0,
+        last_seen_time=2.0,
+        last_equipment_time=1.6,
+        equipment_observation_count=2,
+    )
+    crop = np.zeros((160, 100, 3), dtype=np.uint8)
+
+    assert detector._passes_athlete_event_validation(state, crop) is True
+
+
 def test_failed_secondary_validator_fails_open():
     detector = Detector(
         model_path="fake.pt",
@@ -1418,6 +1544,17 @@ def test_event_evidence_prefers_detected_bib_over_torso_fallback():
     assert np.array_equal(events[0].bib_crop, detected_crop)
 
 
+def _equipment(bbox, conf=0.9):
+    x1, y1, x2, y2 = bbox
+    return {
+        "bbox": list(bbox),
+        "conf": conf,
+        "center_x": (x1 + x2) // 2,
+        "center_y": (y1 + y2) // 2,
+        "bottom_y": y2,
+    }
+
+
 def test_speed_skating_profile_accepts_helmet_bib_association():
     athlete = {"bbox": [100, 100, 300, 500], "track_id": 7}
     helmet_bib = {
@@ -1499,6 +1636,276 @@ def test_speed_skating_unknown_athlete_crosses_vertical_finish_line():
 
         assert len(events) == 1
         assert events[0].track_id == 11
+    finally:
+        detector.stop()
+
+
+@pytest.mark.parametrize(
+    ("centers", "crossing_direction", "expected_events"),
+    (
+        ((350, 340, 330), None, 1),
+        ((350, 340, 330), "neg_to_pos", 1),
+        ((350, 340, 330), "pos_to_neg", 0),
+        ((290, 300, 310), "pos_to_neg", 1),
+        ((290, 300, 310), "neg_to_pos", 0),
+    ),
+)
+def test_speed_skating_near_line_fallback_respects_crossing_direction(
+    centers,
+    crossing_direction,
+    expected_events,
+):
+    detector = Detector(
+        model_path="fake.pt",
+        model=_NearLineApproachModel(centers),
+        ocr=None,
+        event_settle_seconds=0.0,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    detector.set_finish_line((320, 100), (320, 600))
+    detector.set_crossing_direction(crossing_direction)
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    try:
+        events = []
+        for timestamp in (0.0, 0.1, 0.2):
+            frame_events, _, _ = detector.process_frame(frame, timestamp=timestamp)
+            events.extend(frame_events)
+
+        assert len(events) == expected_events
+    finally:
+        detector.stop()
+
+
+@pytest.mark.parametrize("sport_profile", ("cycling", "running", "speed_skating"))
+def test_unknown_oblique_geometric_crossing_is_kept_for_all_sport_profiles(
+    sport_profile,
+):
+    detector = Detector(
+        model_path="fake.pt",
+        model=_ObliqueFinishCrossingModel(),
+        ocr=None,
+        event_settle_seconds=0.0,
+        sport_profile=sport_profile,
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    detector.set_finish_line((0, 320), (640, 320))
+    detector.set_crossing_direction("neg_to_pos")
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    try:
+        events = []
+        for timestamp in (0.0, 0.1, 0.2):
+            frame_events, _, _ = detector.process_frame(frame, timestamp=timestamp)
+            events.extend(frame_events)
+
+        assert len(events) == 1
+        assert events[0].track_id == 11
+    finally:
+        detector.stop()
+
+
+@pytest.mark.parametrize(
+    ("sport_profile", "expected_events", "expected_classes"),
+    (
+        ("cycling", 1, [0, 1]),
+        ("running", 0, [0]),
+        ("speed_skating", 0, [0]),
+    ),
+)
+def test_bicycle_crossing_point_is_used_only_by_cycling_profile(
+    sport_profile,
+    expected_events,
+    expected_classes,
+):
+    model = _CyclingEquipmentCrossingModel()
+    detector = Detector(
+        model_path="fake.pt",
+        model=model,
+        ocr=None,
+        event_settle_seconds=0.0,
+        sport_profile=sport_profile,
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    detector.set_finish_line((0, 320), (640, 320))
+    detector.set_crossing_direction("neg_to_pos")
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    try:
+        events = []
+        final_athletes = []
+        for timestamp in (0.0, 0.1, 0.2):
+            frame_events, final_athletes, _ = detector.process_frame(
+                frame,
+                timestamp=timestamp,
+            )
+            events.extend(frame_events)
+
+        assert len(events) == expected_events
+        assert model.kwargs[0]["classes"] == expected_classes
+        if sport_profile == "cycling":
+            assert final_athletes[0]["equipment_bbox"] == [235, 240, 365, 340]
+            assert final_athletes[0]["crossing_y"] == 340
+        else:
+            assert "equipment_bbox" not in final_athletes[0]
+    finally:
+        detector.stop()
+
+
+def test_cycling_equipment_anchor_survives_temporary_bicycle_dropout():
+    detector = Detector(
+        model_path="fake.pt",
+        model=_CyclingEquipmentDropoutModel(),
+        ocr=None,
+        event_settle_seconds=0.0,
+        sport_profile="cycling",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    detector.set_finish_line((0, 320), (640, 320))
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    try:
+        events = []
+        final_athletes = []
+        for timestamp in (0.0, 0.1, 0.2):
+            frame_events, final_athletes, _ = detector.process_frame(
+                frame,
+                timestamp=timestamp,
+            )
+            events.extend(frame_events)
+
+        assert events == []
+        assert final_athletes[0]["crossing_y"] == 340
+        assert detector._track_states[11].crossing_anchor_kind == "equipment"
+    finally:
+        detector.stop()
+
+
+def test_cycling_equipment_association_rejects_low_confidence_and_oversized_boxes():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None, sport_profile="cycling")
+    athletes = [
+        _athlete(11, [200, 100, 300, 320]),
+        _athlete(22, [310, 100, 410, 320]),
+    ]
+    equipment = [
+        _equipment([180, 230, 315, 350], conf=0.92),
+        _equipment([295, 225, 425, 352], conf=0.08),
+        _equipment([50, 120, 590, 390], conf=0.95),
+    ]
+
+    detector._associate_profile_equipment(athletes, equipment)
+
+    assert athletes[0]["equipment_bbox"] == [180, 230, 315, 350]
+    assert "equipment_bbox" not in athletes[1]
+
+
+def test_untracked_virtual_ids_are_unique_within_dense_frame_and_reused_by_motion():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    first_claimed = set()
+    left_id = detector._assign_untracked_track_id(
+        [100, 100, 200, 320],
+        current_time=1.0,
+        claimed_track_ids=first_claimed,
+    )
+    right_id = detector._assign_untracked_track_id(
+        [170, 100, 270, 320],
+        current_time=1.0,
+        claimed_track_ids=first_claimed,
+    )
+
+    assert left_id != right_id
+
+    second_claimed = set()
+    moved_right_id = detector._assign_untracked_track_id(
+        [140, 100, 240, 320],
+        current_time=1.1,
+        claimed_track_ids=second_claimed,
+    )
+    moved_left_id = detector._assign_untracked_track_id(
+        [70, 100, 170, 320],
+        current_time=1.1,
+        claimed_track_ids=second_claimed,
+    )
+
+    assert {moved_left_id, moved_right_id} == {left_id, right_id}
+    assert moved_left_id == left_id
+    assert moved_right_id == right_id
+
+
+def test_detector_reset_clears_temporary_identity_pools():
+    detector = Detector(model_path="fake.pt", model=None, ocr=None)
+    first_id = detector._assign_untracked_track_id(
+        [100, 100, 200, 320],
+        current_time=1.0,
+        claimed_track_ids=set(),
+    )
+    detector._split_track_pool[970000] = (150, 200, 1.0)
+    detector._split_next_track_id = 970001
+    detector._athlete_detector_track_pool[920000] = {
+        "bbox": [100, 100, 200, 320],
+        "last_time": 1.0,
+    }
+    detector._athlete_detector_next_track_id = 920001
+
+    detector.reset()
+
+    reset_id = detector._assign_untracked_track_id(
+        [400, 100, 500, 320],
+        current_time=0.0,
+        claimed_track_ids=set(),
+    )
+    assert first_id == 900000
+    assert reset_id == 900000
+    assert list(detector._noid_track_pool) == [900000]
+    assert detector._split_track_pool == {}
+    assert detector._split_next_track_id == 970000
+    assert detector._athlete_detector_track_pool == {}
+    assert detector._athlete_detector_next_track_id == 920000
+
+
+@pytest.mark.parametrize(
+    ("finish_line", "crossing_direction"),
+    (
+        (((320, 100), (320, 600)), "pos_to_neg"),
+        (((320, 600), (320, 100)), "neg_to_pos"),
+    ),
+)
+def test_speed_skating_preserves_finish_line_endpoint_direction_semantics(
+    finish_line,
+    crossing_direction,
+):
+    detector = Detector(
+        model_path="fake.pt",
+        model=_NearLineApproachModel((290, 300, 310)),
+        ocr=None,
+        event_settle_seconds=0.0,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    detector.set_finish_line(*finish_line)
+    detector.set_crossing_direction(crossing_direction)
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    try:
+        events = []
+        for timestamp in (0.0, 0.1, 0.2):
+            frame_events, _, _ = detector.process_frame(frame, timestamp=timestamp)
+            events.extend(frame_events)
+
+        assert len(events) == 1
+        assert detector._line_pt1 == finish_line[0]
+        assert detector._line_pt2 == finish_line[1]
     finally:
         detector.stop()
 
@@ -1589,7 +1996,7 @@ def test_resolve_athlete_validator_prefers_config_then_default(tmp_path):
     configured.write_bytes(b"configured")
     fallback_root = tmp_path / "fallback"
     fallback_root.mkdir()
-    fallback = fallback_root / "yolov8s.pt"
+    fallback = fallback_root / "yolo11s.pt"
     fallback.write_bytes(b"fallback")
 
     assert resolve_athlete_validator_model(str(configured), [fallback_root]) == configured.resolve()

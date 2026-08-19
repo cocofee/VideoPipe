@@ -33,11 +33,24 @@ def test_extract_line_and_roi_respects_disabled_roi_state():
     assert roi is None
 
 
-def test_regression_cli_exposes_speed_skating_profile():
+def test_load_json_accepts_windows_utf8_bom(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_bytes(
+        b"\xef\xbb\xbf"
+        + b'{"crossing_direction":"pos_to_neg","finish_line":{"x1":1}}'
+    )
+
+    assert regression_report._load_json(config_path) == {
+        "crossing_direction": "pos_to_neg",
+        "finish_line": {"x1": 1},
+    }
+
+
+def test_regression_cli_exposes_all_builtin_sport_profiles():
     source = Path(regression_report.__file__).read_text(encoding="utf-8")
 
     assert '"--sport-profile"' in source
-    assert '("cycling", "speed_skating")' in source
+    assert '("cycling", "running", "speed_skating")' in source
     assert "build_sport_event_profile(args.sport_profile)" in source
     assert '"-fps_mode"' in source
     assert '"passthrough"' in source

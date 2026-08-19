@@ -606,13 +606,10 @@ class VideoThread(QThread):
         while self._running:
             envelope = None
             try:
-                source = getattr(self.reader, "source", None)
-                if StreamReader.is_video_file_source(source):
-                    get_frame_envelope = getattr(self.reader, "get_frame_envelope", None)
-                else:
-                    get_frame_envelope = getattr(self.reader, "get_latest_frame_envelope", None)
-                    if not callable(get_frame_envelope):
-                        get_frame_envelope = getattr(self.reader, "get_frame_envelope", None)
+                # Consume the bounded queue in order for both files and live
+                # sources.  Clearing all pending live frames can skip the only
+                # few frames where a sprinting athlete is detectable.
+                get_frame_envelope = getattr(self.reader, "get_frame_envelope", None)
                 if callable(get_frame_envelope):
                     envelope = get_frame_envelope()
                     if envelope is None:
@@ -3504,12 +3501,28 @@ class MainWindow(QMainWindow):
             logger.info("[Main] 运动员二次校验已禁用")
             return
 
+        configured_validator_path = str(
+            self.config.get("athlete_validator_model_path") or ""
+        ).strip()
+        if not configured_validator_path and self.shared_model is not None:
+            names = getattr(self.shared_model, "names", None) or {}
+            class_names = names.values() if isinstance(names, dict) else names
+            if any(str(name).strip().lower() == "bicycle" for name in class_names):
+                logger.info(
+                    "[Main] 主模型已包含 bicycle 类，直接复用 YOLO11 人车证据，"
+                    "不加载二次校验模型"
+                )
+                return
+
         validator_path = resolve_athlete_validator_model(
-            str(self.config.get("athlete_validator_model_path") or ""),
+            configured_validator_path,
             [Path.cwd(), Path(__file__).resolve().parent.parent],
         )
         if validator_path is None:
-            logger.warning("[Main] 未找到 yolov8s.pt，非号码事件将保持原有放行策略")
+            logger.warning(
+                "[Main] 未找到可选的 YOLO11 自行车二次校验模型，"
+                "非号码事件将使用主模型证据"
+            )
             return
 
         try:
@@ -4656,7 +4669,7 @@ class MainWindow(QMainWindow):
                 is_video_file = StreamReader.is_video_file_source(source)
                 reader = StreamReader(
                     source,
-                    queue_size=4 if is_video_file else 1,
+                    queue_size=4,
                     overflow_policy="block" if is_video_file else "drop_oldest",
                 )
                 if not reader.start():

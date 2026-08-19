@@ -69,7 +69,8 @@ def resolve_athlete_validator_model(configured_path: str, search_roots: List[Pat
         else:
             candidates.extend(root / configured for root in roots)
             candidates.append(configured)
-    candidates.extend(root / "yolov8s.pt" for root in roots)
+    candidates.extend(root / "yolo11s.pt" for root in roots)
+    candidates.extend(root / "yolo11n.pt" for root in roots)
 
     for candidate in candidates:
         if candidate.is_file():
@@ -503,6 +504,11 @@ class TrackState:
 
     # Evidence from bib detector (not OCR).
     has_bib_box: bool = False
+    last_equipment_time: Optional[float] = None
+    equipment_observation_count: int = 0
+    equipment_crossing_rel_x: Optional[float] = None
+    equipment_crossing_rel_y: Optional[float] = None
+    crossing_anchor_kind: str = "person"
     start_line_dist: Optional[float] = None
     observation_count: int = 0
     synthetic_kind: str = ""
@@ -1484,6 +1490,7 @@ class Detector:
         self.enable_roi_filter = False
         self.person_class_ids: Set[int] = {0}
         self.bib_class_ids: Set[int] = {1}
+        self.equipment_class_ids: Set[int] = set()
         self.bike_model_mode = False
         # 静态背景过滤：用于屏蔽观众/龙门结构等“几乎不动”的目标，减少无关框与误过线
         # 误判为静态后，只要出现明显位移也会自动恢复，不会长期吞掉真正运动员
@@ -1641,7 +1648,10 @@ class Detector:
         self._empty_athlete_streak = 0
         self._under_detect_streak = 0
         self._static_filter_cooldown_frames = 0
-        self._noid_track_pool: Dict[int, Tuple[int, int, float]] = {}
+        # Temporary IDs for detector boxes that ByteTrack did not assign.  Keep
+        # a small motion state so fast, newly visible riders can be reattached
+        # without reusing one virtual ID for two riders in the same frame.
+        self._noid_track_pool: Dict[int, Dict[str, Any]] = {}
         self._noid_next_track_id = 900000
         self._split_track_pool: Dict[int, Tuple[int, int, float]] = {}
         self._split_next_track_id = 970000
@@ -3614,6 +3624,11 @@ class Detector:
 
         self.person_class_ids = set(person_ids)
         self.bib_class_ids = set(bib_ids)
+        self.equipment_class_ids = (
+            set(bike_ids) - set(person_ids)
+            if self.event_profile.required_equipment == "bicycle"
+            else set()
+        )
         return True
 
     # =========================================================================
@@ -3718,10 +3733,21 @@ class Detector:
                         logger.info(f"[Detector] 号码范围: {r['prefix']}{r['start']:04d} ~ {r['prefix']}{r['end']:04d}")
                 logger.info(f"[Detector] 共设置 {len(self._bib_ranges)} 条号码段规则")
 
-    def set_finish_line(self, pt1: Tuple[int, int], pt2: Tuple[int, int]):
-        """设置终点线"""
-        self._line_pt1 = pt1
-        self._line_pt2 = pt2
+    def set_finish_line(
+        self,
+        pt1: Optional[Tuple[int, int]],
+        pt2: Optional[Tuple[int, int]],
+    ):
+        """Set a finish line while preserving persisted endpoint semantics."""
+        if pt1 is None or pt2 is None:
+            self._line_pt1 = pt1
+            self._line_pt2 = pt2
+            return
+
+        # crossing_direction is defined by point_side_of_line(), so swapping
+        # endpoints would silently invert every persisted direction setting.
+        self._line_pt1 = (int(pt1[0]), int(pt1[1]))
+        self._line_pt2 = (int(pt2[0]), int(pt2[1]))
 
     def set_on_crossing(self, callback: Callable[[CrossingEvent], None]):
         """设置过线事件回调"""
@@ -3879,8 +3905,25 @@ class Detector:
         if self.event_profile.required_equipment is None:
             return True
 
+        primary_equipment_aware = bool(self.equipment_class_ids)
+        has_recent_primary_equipment = False
+        if primary_equipment_aware and state.last_equipment_time is not None:
+            reference_time = float(state.crossed_time or state.last_seen_time)
+            equipment_age = reference_time - float(state.last_equipment_time)
+            has_recent_primary_equipment = (
+                -0.10 <= equipment_age <= 0.90
+                and state.equipment_observation_count > 0
+            )
+        if has_recent_primary_equipment:
+            return True
+
         athlete_evidence = self._bicycle_evidence_in_crop(crop)
         if athlete_evidence is None:
+            # Keep detection fail-open for occluded bicycles.  Only reject the
+            # narrow upright shape typical of a finish-line official when the
+            # primary model supports bicycles but never associated one.
+            if primary_equipment_aware and self._is_upright_cycling_bystander(state):
+                return False
             return True
         has_bicycle, has_centered_bicycle, has_cycle_ambiguity = athlete_evidence
         if not has_bicycle:
@@ -3908,6 +3951,19 @@ class Detector:
                 return True
         return False
 
+    @staticmethod
+    def _is_upright_cycling_bystander(state: TrackState) -> bool:
+        if state.equipment_observation_count > 0 or state.has_bib_box:
+            return False
+        pending_data = state.pending_event_data or {}
+        bbox = pending_data.get("bbox")
+        if not bbox or len(bbox) != 4:
+            return False
+        x1, y1, x2, y2 = [float(value) for value in bbox]
+        box_width = max(1.0, x2 - x1)
+        box_height = max(1.0, y2 - y1)
+        return box_height / box_width >= 2.60
+
     def _passes_profile_athlete_geometry(
         self,
         bbox: List[int],
@@ -3928,6 +3984,234 @@ class Detector:
             area_ratio >= self.profile_min_athlete_area_ratio
             and height_ratio >= self.profile_min_athlete_height_ratio
         )
+
+    def _associate_profile_equipment(
+        self,
+        athletes: List[dict],
+        equipment_boxes: List[dict],
+    ) -> None:
+        """Attach one bicycle box to each compatible rider observation."""
+        if self.event_profile.required_equipment != "bicycle":
+            return
+
+        candidates = []
+        for athlete_index, athlete in enumerate(athletes):
+            ax1, ay1, ax2, ay2 = [float(value) for value in athlete["bbox"]]
+            athlete_width = max(1.0, ax2 - ax1)
+            athlete_height = max(1.0, ay2 - ay1)
+            athlete_center_x = (ax1 + ax2) * 0.5
+            athlete_center_y = (ay1 + ay2) * 0.5
+
+            for equipment_index, equipment in enumerate(equipment_boxes):
+                bx1, by1, bx2, by2 = [float(value) for value in equipment["bbox"]]
+                equipment_width = max(1.0, bx2 - bx1)
+                equipment_height = max(1.0, by2 - by1)
+                equipment_center_x = (bx1 + bx2) * 0.5
+                equipment_center_y = (by1 + by2) * 0.5
+                equipment_conf = float(equipment.get("conf", 0.0) or 0.0)
+                if equipment_conf < 0.15:
+                    continue
+
+                # A bicycle may extend beyond the rider, but a very large or
+                # very tall box is usually a merged/background detection.
+                if equipment_width > athlete_width * 3.0:
+                    continue
+                if equipment_height > athlete_height * 1.55:
+                    continue
+
+                overlap_width = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+                horizontal_overlap = overlap_width / min(
+                    athlete_width,
+                    equipment_width,
+                )
+                center_gap_px = abs(athlete_center_x - equipment_center_x)
+                center_gap = center_gap_px / max(athlete_width, equipment_width)
+                lower_body_overlap = (
+                    by2 >= ay1 + athlete_height * 0.40
+                    and by1 <= ay2 + athlete_height * 0.35
+                )
+                vertical_anchor = (equipment_center_y - athlete_center_y) / athlete_height
+                if (
+                    horizontal_overlap < 0.30
+                    or center_gap_px > max(athlete_width * 0.90, equipment_width * 0.40)
+                    or not (-0.35 <= vertical_anchor <= 0.95)
+                    or not lower_body_overlap
+                ):
+                    continue
+
+                vertical_overlap = max(0.0, min(ay2, by2) - max(ay1, by1)) / min(
+                    athlete_height,
+                    equipment_height,
+                )
+                score = (
+                    horizontal_overlap * 2.0
+                    + vertical_overlap
+                    + equipment_conf * 0.25
+                    - center_gap
+                )
+                candidates.append((score, athlete_index, equipment_index))
+
+        used_athletes = set()
+        used_equipment = set()
+        for _, athlete_index, equipment_index in sorted(candidates, reverse=True):
+            if athlete_index in used_athletes or equipment_index in used_equipment:
+                continue
+            athlete = athletes[athlete_index]
+            equipment = equipment_boxes[equipment_index]
+            equipment_bbox = list(equipment["bbox"])
+            athlete["person_bbox"] = list(athlete["bbox"])
+            athlete["equipment_bbox"] = equipment_bbox
+            athlete["equipment_conf"] = float(equipment.get("conf", 0.0))
+            athlete["crossing_x"] = int(round((equipment_bbox[0] + equipment_bbox[2]) * 0.5))
+            athlete["crossing_y"] = int(equipment_bbox[3])
+            used_athletes.add(athlete_index)
+            used_equipment.add(equipment_index)
+
+    @staticmethod
+    def _athlete_crossing_point(athlete: dict) -> Tuple[int, int]:
+        return (
+            int(athlete.get("crossing_x", athlete["center_x"])),
+            int(athlete.get("crossing_y", athlete["bottom_y"])),
+        )
+
+    @staticmethod
+    def _stabilize_athlete_crossing_point(
+        athlete: dict,
+        state: TrackState,
+        current_time: float,
+    ) -> None:
+        """Keep one crossing anchor when bicycle detections briefly disappear."""
+        bbox = athlete.get("bbox") or ()
+        if len(bbox) != 4:
+            return
+
+        x1, y1, x2, y2 = [float(value) for value in bbox]
+        width = max(1.0, x2 - x1)
+        height = max(1.0, y2 - y1)
+        person_x = float(athlete.get("center_x", (x1 + x2) * 0.5))
+        person_y = float(athlete.get("bottom_y", y2))
+
+        if athlete.get("equipment_bbox"):
+            crossing_x, crossing_y = Detector._athlete_crossing_point(athlete)
+            rel_x = (float(crossing_x) - person_x) / width
+            rel_y = (float(crossing_y) - person_y) / height
+            state.equipment_crossing_rel_x = rel_x
+            state.equipment_crossing_rel_y = rel_y
+            state.crossing_anchor_kind = "equipment"
+            state.last_equipment_time = float(current_time)
+            state.equipment_observation_count += 1
+            athlete["crossing_x"] = int(round(person_x + rel_x * width))
+            athlete["crossing_y"] = int(round(person_y + rel_y * height))
+            return
+
+        if (
+            state.crossing_anchor_kind == "equipment"
+            and state.equipment_crossing_rel_x is not None
+            and state.equipment_crossing_rel_y is not None
+        ):
+            athlete["crossing_x"] = int(
+                round(person_x + state.equipment_crossing_rel_x * width)
+            )
+            athlete["crossing_y"] = int(
+                round(person_y + state.equipment_crossing_rel_y * height)
+            )
+
+    def _assign_untracked_track_id(
+        self,
+        bbox: List[int],
+        current_time: float,
+        claimed_track_ids: Set[int],
+    ) -> int:
+        """Assign a frame-unique virtual ID using short-horizon motion matching."""
+        x1, y1, x2, y2 = [int(value) for value in bbox]
+        center_x = (x1 + x2) * 0.5
+        center_y = (y1 + y2) * 0.5
+        diagonal = max(1.0, float(np.hypot(x2 - x1, y2 - y1)))
+        stale_track_ids = []
+        candidates = []
+
+        for track_id, track in self._noid_track_pool.items():
+            last_time = float(track.get("last_time", 0.0))
+            elapsed = float(current_time - last_time)
+            if elapsed < 0.0 or elapsed > 0.75:
+                stale_track_ids.append(track_id)
+                continue
+            if track_id in claimed_track_ids:
+                continue
+
+            previous_bbox = [float(value) for value in track.get("bbox", bbox)]
+            previous_width = max(1.0, previous_bbox[2] - previous_bbox[0])
+            previous_height = max(1.0, previous_bbox[3] - previous_bbox[1])
+            previous_area = previous_width * previous_height
+            current_area = max(1.0, float((x2 - x1) * (y2 - y1)))
+            scale_ratio = min(previous_area, current_area) / max(previous_area, current_area)
+            if scale_ratio < 0.45:
+                continue
+
+            previous_center = track.get("center", (center_x, center_y))
+            velocity = track.get("velocity", (0.0, 0.0))
+            prediction_horizon = min(0.25, max(0.0, elapsed))
+            predicted_x = float(previous_center[0]) + float(velocity[0]) * prediction_horizon
+            predicted_y = float(previous_center[1]) + float(velocity[1]) * prediction_horizon
+            predicted_distance = float(np.hypot(center_x - predicted_x, center_y - predicted_y))
+
+            shift_x = predicted_x - float(previous_center[0])
+            shift_y = predicted_y - float(previous_center[1])
+            predicted_bbox = [
+                previous_bbox[0] + shift_x,
+                previous_bbox[1] + shift_y,
+                previous_bbox[2] + shift_x,
+                previous_bbox[3] + shift_y,
+            ]
+            predicted_iou = bbox_iou(bbox, predicted_bbox)
+            previous_diagonal = max(
+                1.0,
+                float(np.hypot(previous_width, previous_height)),
+            )
+            normalizer = max(diagonal, previous_diagonal)
+            close_without_overlap = predicted_distance <= max(30.0, normalizer * 0.18)
+            if predicted_iou < 0.05 and not close_without_overlap:
+                continue
+            if predicted_distance > max(45.0, min(120.0, normalizer * 0.45)):
+                continue
+
+            score = (
+                predicted_distance / normalizer
+                + (1.0 - scale_ratio) * 0.35
+                - predicted_iou * 0.55
+            )
+            candidates.append((score, track_id))
+
+        for track_id in stale_track_ids:
+            self._noid_track_pool.pop(track_id, None)
+
+        if candidates:
+            _, track_id = min(candidates, key=lambda item: item[0])
+            previous = self._noid_track_pool[track_id]
+            elapsed = max(1e-3, float(current_time - previous.get("last_time", current_time)))
+            previous_center = previous.get("center", (center_x, center_y))
+            measured_velocity = (
+                (center_x - float(previous_center[0])) / elapsed,
+                (center_y - float(previous_center[1])) / elapsed,
+            )
+            previous_velocity = previous.get("velocity", (0.0, 0.0))
+            velocity = (
+                float(previous_velocity[0]) * 0.55 + measured_velocity[0] * 0.45,
+                float(previous_velocity[1]) * 0.55 + measured_velocity[1] * 0.45,
+            )
+        else:
+            track_id = self._noid_next_track_id
+            self._noid_next_track_id += 1
+            velocity = (0.0, 0.0)
+
+        self._noid_track_pool[track_id] = {
+            "center": (center_x, center_y),
+            "velocity": velocity,
+            "bbox": [x1, y1, x2, y2],
+            "last_time": float(current_time),
+        }
+        claimed_track_ids.add(track_id)
+        return track_id
 
     def _passes_athlete_aspect_filter(
         self,
@@ -3965,6 +4249,36 @@ class Detector:
         """设置过线方向"""
         self.crossing_direction = direction
 
+    @staticmethod
+    def _recent_line_motion_direction(
+        position_history: List[Tuple[float, int, int]],
+        pt1: Tuple[int, int],
+        pt2: Tuple[int, int],
+        min_motion_px: float,
+    ) -> Optional[str]:
+        """Return the signed finish-line direction from recent track motion."""
+        if len(position_history) < 2:
+            return None
+
+        line_length = float(np.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1]))
+        if line_length <= 1.0:
+            return None
+
+        _, start_x, start_y = position_history[0]
+        _, end_x, end_y = position_history[-1]
+        start_side = point_side_of_line(
+            start_x, start_y, pt1[0], pt1[1], pt2[0], pt2[1]
+        ) / line_length
+        end_side = point_side_of_line(
+            end_x, end_y, pt1[0], pt1[1], pt2[0], pt2[1]
+        ) / line_length
+        signed_motion = end_side - start_side
+        if signed_motion >= min_motion_px:
+            return "neg_to_pos"
+        if signed_motion <= -min_motion_px:
+            return "pos_to_neg"
+        return None
+
     def _is_gate_like_bbox(self, bbox: List[int], frame_shape: Tuple[int, int]) -> bool:
         """判断是否为龙门/拱门类大结构框（用于误检抑制）。"""
         if not bbox or len(bbox) < 4:
@@ -3992,7 +4306,12 @@ class Detector:
             self._recent_events.clear()
             self._event_id = start_event_id
             self._start_time = None
+            self._noid_track_pool.clear()
+            self._noid_next_track_id = 900000
             self._split_track_pool.clear()
+            self._split_next_track_id = 970000
+            self._athlete_detector_track_pool.clear()
+            self._athlete_detector_next_track_id = 920000
             self._forced_bib_rescue_last.clear()
             self._wide_split_last.clear()
             self._participant_identity_manager = ParticipantIdentityManager(
@@ -4909,6 +5228,18 @@ class Detector:
         state.observation_count += previous_state.observation_count
         state.cross_signal_count = previous_state.cross_signal_count
         state.cross_signal_last_time = previous_state.cross_signal_last_time
+        state.equipment_observation_count += previous_state.equipment_observation_count
+        state.equipment_crossing_rel_x = previous_state.equipment_crossing_rel_x
+        state.equipment_crossing_rel_y = previous_state.equipment_crossing_rel_y
+        state.crossing_anchor_kind = previous_state.crossing_anchor_kind
+        if (
+            previous_state.last_equipment_time is not None
+            and (
+                state.last_equipment_time is None
+                or previous_state.last_equipment_time > state.last_equipment_time
+            )
+        ):
+            state.last_equipment_time = previous_state.last_equipment_time
         if hasattr(previous_state, "_near_line_hits"):
             setattr(state, "_near_line_hits", getattr(previous_state, "_near_line_hits"))
 
@@ -5057,7 +5388,9 @@ class Detector:
             "augment": False,
             "imgsz": self.process_imgsz,  # 使用配置的尺寸
         }
-        tracked_class_ids = sorted(self.person_class_ids | self.bib_class_ids)
+        tracked_class_ids = sorted(
+            self.person_class_ids | self.bib_class_ids | self.equipment_class_ids
+        )
         if tracked_class_ids:
             track_kwargs["classes"] = tracked_class_ids
         self._raw_model_boxes = []
@@ -5096,6 +5429,7 @@ class Detector:
         # 2. 收集结果
         athletes = []
         bibs = []
+        equipment_boxes = []
         
         all_boxes = []
         for result in results:
@@ -5146,6 +5480,11 @@ class Detector:
                 for cls_i, conf_i, xyxy, _ in all_boxes
                 if int(cls_i) in self.person_class_ids
             ]
+            tracked_equipment_boxes = [
+                list(xyxy)
+                for cls_i, _, xyxy, _ in all_boxes
+                if int(cls_i) in self.equipment_class_ids
+            ]
             all_boxes = [box for box in all_boxes if int(box[0]) not in self.bib_class_ids]
             for cls_i, conf_i, xyxy_i in self._raw_model_boxes:
                 raw_xyxy = list(xyxy_i)
@@ -5160,6 +5499,14 @@ class Detector:
                 conf_i = float(conf_i)
                 if cls_i in self.bib_class_ids:
                     all_boxes.append((cls_i, conf_i, raw_xyxy, None))
+                    continue
+                if cls_i in self.equipment_class_ids:
+                    if not any(
+                        bbox_iou(raw_xyxy, existing_bbox) >= 0.70
+                        for existing_bbox in tracked_equipment_boxes
+                    ):
+                        all_boxes.append((cls_i, conf_i, raw_xyxy, None))
+                        tracked_equipment_boxes.append(raw_xyxy)
                     continue
 
                 # ByteTrack can omit a newly visible fast athlete even when the
@@ -5239,6 +5586,7 @@ class Detector:
         raw_person_candidates = 0
         roi_rejected_person = 0
         roi_auto_disabled = False
+        claimed_virtual_track_ids: Set[int] = set()
 
         for cls, conf, xyxy, box_id in all_boxes:
             cls = int(cls)
@@ -5334,29 +5682,11 @@ class Detector:
                 else:
                     if conf < self.untracked_detection_conf:
                         continue
-                    cx_i = int((x1 + x2) * 0.5)
-                    cy_i = int((y1 + y2) * 0.5)
-                    best_key = None
-                    best_dist = 1e9
-                    stale_keys = []
-                    for key, (px, py, last_t) in self._noid_track_pool.items():
-                        if current_time - last_t > 1.2:
-                            stale_keys.append(key)
-                            continue
-                        dist = np.hypot(cx_i - px, cy_i - py)
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_key = key
-                    for stale_key in stale_keys:
-                        self._noid_track_pool.pop(stale_key, None)
-
-                    if best_key is not None and best_dist <= max(40.0, 0.06 * max(width, height)):
-                        track_id = best_key
-                    else:
-                        track_id = self._noid_next_track_id
-                        self._noid_next_track_id += 1
-
-                    self._noid_track_pool[track_id] = (cx_i, cy_i, current_time)
+                    track_id = self._assign_untracked_track_id(
+                        [x1, y1, x2, y2],
+                        current_time,
+                        claimed_virtual_track_ids,
+                    )
                 
                 # === 性能优化 3: 目标上限过滤 ===
                 # 策略：靠近终点的人 (bottom_y > 0.45*H) 绝不丢弃，远处的人按 N 限制
@@ -5393,6 +5723,14 @@ class Detector:
                     'center_x': (x1 + x2) // 2,
                     'center_y': (y1 + y2) // 2
                 })
+            elif cls in self.equipment_class_ids:
+                equipment_boxes.append({
+                    'bbox': [x1, y1, x2, y2],
+                    'conf': conf,
+                    'center_x': (x1 + x2) // 2,
+                    'center_y': (y1 + y2) // 2,
+                    'bottom_y': y2,
+                })
 
         recovered_athletes, athlete_detector_ms = self._detect_speed_skating_athletes(
             infer_frame,
@@ -5407,6 +5745,8 @@ class Detector:
             raw_bike_detections += len(recovered_athletes)
             raw_person_candidates += len(recovered_athletes)
         _infer_ms += athlete_detector_ms
+
+        self._associate_profile_equipment(athletes, equipment_boxes)
 
         # 3. 号码牌驱动补全
         if bibs:
@@ -5427,11 +5767,12 @@ class Detector:
                         continue
 
                     if tid not in self._track_states:
+                        crossing_x, crossing_y = self._athlete_crossing_point(athlete)
                         self._track_states[tid] = TrackState(
-                            prev_x=athlete['center_x'],
-                            prev_y=athlete['bottom_y'],
+                            prev_x=crossing_x,
+                            prev_y=crossing_y,
                             last_seen_time=current_time,
-                            start_pos=(athlete['center_x'], athlete['bottom_y']),
+                            start_pos=(crossing_x, crossing_y),
                             start_time=current_time
                         )
 
@@ -5487,11 +5828,12 @@ class Detector:
                 continue
             with self._lock:
                 if track_id not in self._track_states:
+                    crossing_x, crossing_y = self._athlete_crossing_point(athlete)
                     self._track_states[track_id] = TrackState(
-                        prev_x=athlete['center_x'],
-                        prev_y=athlete['bottom_y'],
+                        prev_x=crossing_x,
+                        prev_y=crossing_y,
                         last_seen_time=current_time,
-                        start_pos=(athlete['center_x'], athlete['bottom_y']),
+                        start_pos=(crossing_x, crossing_y),
                         start_time=current_time
                     )
                 state = self._track_states[track_id]
@@ -5499,6 +5841,11 @@ class Detector:
                 state.observation_count += 1
                 state.synthetic_kind = str(athlete.get('synthetic_kind') or '')
                 state.participant_id = str(athlete.get('participant_id') or state.participant_id or '')
+                self._stabilize_athlete_crossing_point(
+                    athlete,
+                    state,
+                    current_time,
+                )
                 
                 # === 性能优化 4: 背景过滤增强 ===
                 # 在处理前进行背景判定
@@ -5514,7 +5861,7 @@ class Detector:
                 if state.is_static:
                     # 热修：允许误判为静态的真实运动员在出现明显位移后自动恢复
                     if not state.vlm_is_background:
-                        cx, cy = athlete['center_x'], athlete['bottom_y']
+                        cx, cy = self._athlete_crossing_point(athlete)
                         sx, sy = state.start_pos if state.start_pos else (cx, cy)
                         move_from_start = np.sqrt((cx - sx) ** 2 + (cy - sy) ** 2)
                         reactivate_dist = max(40.0, height * 0.04)
@@ -5944,7 +6291,7 @@ class Detector:
                     state = self._track_states.get(tid)
                     if not state or state.is_static: continue
                     
-                    curr_x, curr_y = athlete['center_x'], athlete['bottom_y']
+                    curr_x, curr_y = self._athlete_crossing_point(athlete)
                     prev_x, prev_y = state.prev_x, state.prev_y
 
                     if not self._is_event_eligible_athlete(athlete, state.observation_count):
@@ -5985,6 +6332,7 @@ class Detector:
                                                pt2[0], pt2[1])
                     d_prev = point_side_of_line(prev_x, prev_y, pt1[0], pt1[1],
                                                pt2[0], pt2[1])
+                    geometric_crossing = d_curr * d_prev < 0
 
                     line_dist_curr = point_to_line_dist(curr_x, curr_y, pt1[0], pt1[1], pt2[0], pt2[1])
                     line_dist_prev = point_to_line_dist(prev_x, prev_y, pt1[0], pt1[1], pt2[0], pt2[1])
@@ -5999,6 +6347,7 @@ class Detector:
                     recent_normal_motion = 0.0
                     recent_tangent_motion = 0.0
                     line_normal_dominant = False
+                    recent_crossing_direction = None
                     try:
                         hist = state.position_history
                         hist.append((current_time, int(curr_x), int(curr_y)))
@@ -6029,6 +6378,12 @@ class Detector:
                                     min_normal_motion,
                                     recent_tangent_motion * 0.70,
                                 )
+                            recent_crossing_direction = self._recent_line_motion_direction(
+                                hist,
+                                pt1,
+                                pt2,
+                                min_motion_px=max(4.0, height * 0.003),
+                            )
                     except Exception:
                         pass
 
@@ -6110,36 +6465,63 @@ class Detector:
                         (abs(curr_y - prev_y) >= 1 or abs(curr_x - prev_x) >= 2)):
                         move_towards_line = line_dist_curr <= line_dist_prev * 1.90
                         if move_towards_line:
-                            d_curr = 1e-6
-                            d_prev = -1e-6
+                            if self.crossing_direction == 'pos_to_neg':
+                                if recent_crossing_direction == 'pos_to_neg':
+                                    d_curr = -1e-6
+                                    d_prev = 1e-6
+                            elif self.crossing_direction == 'neg_to_pos':
+                                if recent_crossing_direction == 'neg_to_pos':
+                                    d_curr = 1e-6
+                                    d_prev = -1e-6
+                            else:
+                                d_curr = 1e-6
+                                d_prev = -1e-6
 
                     # 判定过线 (符号改变)
                     cross_signal = ((d_curr * d_prev < 0) or force_near_cross) and (not state.crossed)
                     if cross_signal:
                         # 检查过线方向 (如果设置了方向)
-                        if force_near_cross:
-                            is_correct_direction = True
-                        else:
-                            is_correct_direction = True
-                            if self.crossing_direction == 'pos_to_neg':
-                                is_correct_direction = (d_prev > 0 and d_curr < 0)
-                            elif self.crossing_direction == 'neg_to_pos':
-                                is_correct_direction = (d_prev < 0 and d_curr > 0)
+                        is_correct_direction = True
+                        if self.crossing_direction == 'pos_to_neg':
+                            is_correct_direction = (
+                                (d_prev > 0 and d_curr < 0)
+                                or (
+                                    force_near_cross
+                                    and recent_crossing_direction == 'pos_to_neg'
+                                )
+                            )
+                        elif self.crossing_direction == 'neg_to_pos':
+                            is_correct_direction = (
+                                (d_prev < 0 and d_curr > 0)
+                                or (
+                                    force_near_cross
+                                    and recent_crossing_direction == 'neg_to_pos'
+                                )
+                            )
 
                         if is_correct_direction:
-                            # UNKNOWN 防路人：没有号码牌框证据时，要求运动方向以终点线法向为主
+                            # Keep near-line fallback strict, while allowing an
+                            # actual side-to-side crossing in an oblique camera view.
                             if not state.best_bib and not getattr(state, "has_bib_box", False):
                                 try:
                                     min_speed = 22.0
+                                    has_explicit_crossing_motion = (
+                                        geometric_crossing
+                                        and recent_crossing_direction is not None
+                                        and recent_normal_motion >= max(14.0, height * 0.010)
+                                    )
+                                    has_clear_crossing_motion = (
+                                        line_normal_dominant or has_explicit_crossing_motion
+                                    )
 
                                     # 起始就贴着终点线的目标（典型路人/观众）更严格：没有明显运动证据则直接拦截
                                     start_dist = float(state.start_line_dist or 0.0)
                                     min_start_dist = max(38.0, height * 0.028)
-                                    if start_dist < min_start_dist and track_age >= 0.20 and not line_normal_dominant:
+                                    if start_dist < min_start_dist and track_age >= 0.20 and not has_clear_crossing_motion:
                                         self._update_crossing_vote(state, current_time, has_cross_signal=False)
                                         continue
 
-                                    if track_age >= 0.18 and (not line_normal_dominant or recent_speed < min_speed):
+                                    if track_age >= 0.18 and (not has_clear_crossing_motion or recent_speed < min_speed):
                                         self._update_crossing_vote(state, current_time, has_cross_signal=False)
                                         continue
                                 except Exception:
@@ -6200,7 +6582,7 @@ class Detector:
                 with self._lock:
                     state = self._track_states.get(tid)
                     if state:
-                        state.prev_x, state.prev_y = athlete['center_x'], athlete['bottom_y']
+                        state.prev_x, state.prev_y = self._athlete_crossing_point(athlete)
 
         # 7. 事件生成
         with self._lock:

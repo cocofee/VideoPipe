@@ -347,7 +347,7 @@ class _LatestEnvelopeReader(_EnvelopeReader):
         return self.envelope
 
 
-def test_video_thread_prefers_latest_frame_for_inference():
+def test_video_thread_preserves_bounded_fifo_order_for_live_inference():
     frame = np.zeros((8, 12, 3), dtype=np.uint8)
     envelope = FrameEnvelope(
         original_frame=frame,
@@ -363,8 +363,8 @@ def test_video_thread_prefers_latest_frame_for_inference():
 
     thread.run()
 
-    assert reader.calls == 1
-    assert reader.fifo_calls == 0
+    assert reader.calls == 0
+    assert reader.fifo_calls == 1
     assert detector.received_frame is frame
 
 

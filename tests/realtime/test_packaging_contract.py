@@ -38,12 +38,19 @@ def test_build_script_validates_inputs_before_replacing_package():
 
     build_index = script.index("python -m PyInstaller")
     assert script.index("$ResolvedModel =") < build_index
+    assert script.index("$ResolvedAthleteModel =") < build_index
     assert script.index("$ResolvedSource =") < build_index
     assert script.index("$ResolvedFfmpeg =") < build_index
+    assert "function Stage-DistributionInput" in script
+    assert "Stage-DistributionInput -InputPath $ResolvedModel" in script
+    assert "Stage-DistributionInput -InputPath $ResolvedAthleteModel" in script
+    assert "Stage-DistributionInput -InputPath $ResolvedSource" in script
+    assert "Stage-DistributionInput -InputPath $ResolvedFfmpeg" in script
     assert "$env:VIDEOPIPE_FFMPEG = $ResolvedFfmpeg" in script
     assert "--ocr-cpu-threads 1" in script
     assert '--sport-profile $SportProfile' in script
     assert 'Start-$Variant-$SportProfile.cmd' in script
+    assert 'yolo11s.pt' in script
 
 
 def test_build_requires_a_clean_distribution_directory():

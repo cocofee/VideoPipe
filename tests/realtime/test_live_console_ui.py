@@ -312,3 +312,47 @@ def test_race_config_updates_sport_profile_and_combo(qapp, tmp_path, monkeypatch
     assert window.model_path == current_model
     assert window.config["model_path"] == current_model
     window.close()
+
+
+def test_explicit_runtime_source_and_profile_survive_race_config(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(MainWindow, "_prompt_race_selection", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_init_ocr_runtime", lambda self: None)
+    race_dir = tmp_path / "race"
+    race_dir.mkdir()
+    (race_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "source": "old-video.mp4",
+                "sources": ["old-video.mp4"],
+                "sport_profile": "cycling",
+                "model_path": "D:/old-computer/yolov8s.pt",
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime_source = "rtsp://camera.example/live"
+    current_model = str(tmp_path / "yolo11-best.pt")
+    window = MainWindow(
+        {
+            "source": runtime_source,
+            "sources": [runtime_source],
+            "model_path": current_model,
+            "sport_profile": "speed_skating",
+            "output_dir": str(tmp_path),
+            "yolo_only_mode": True,
+            "live_monitor_enabled": False,
+        },
+        runtime_source_override=runtime_source,
+        runtime_sport_profile_override="speed_skating",
+    )
+
+    window._apply_race_config(race_dir)
+
+    assert window.sources == [runtime_source]
+    assert window.config["source"] == runtime_source
+    assert window.config["sources"] == [runtime_source]
+    assert window.sport_profile == "speed_skating"
+    assert window.config["sport_profile"] == "speed_skating"
+    assert window.model_path == current_model
+    assert window.config["model_path"] == current_model
+    window.close()

@@ -301,7 +301,14 @@ def test_video_thread_combines_identity_and_reader_metrics():
         segment_id=2,
     )
     reader = _EnvelopeReader(envelope)
-    reader.get_info = lambda: {"queue_depth": 3, "dropped_frame_count": 4}
+    reader.get_info = lambda: {
+        "queue_depth": 3,
+        "actual_fps": 50.0,
+        "dropped_frame_count": 4,
+        "consumer_skipped_frame_count": 6,
+        "discarded_frame_count": 10,
+        "drop_rate": 0.2,
+    }
     detector = _TimestampDetector()
     detector.last_frame_metrics = {
         "participants": 2,
@@ -318,7 +325,12 @@ def test_video_thread_combines_identity_and_reader_metrics():
     assert thread.last_frame_metrics["track_fragments_merged"] == 1
     assert thread.last_frame_metrics["identity_ambiguities"] == 1
     assert thread.last_frame_metrics["queue_depth"] == 3
+    assert thread.last_frame_metrics["capture_fps"] == 50.0
+    assert thread.last_frame_metrics["inference_fps"] > 0.0
     assert thread.last_frame_metrics["dropped_frames"] == 4
+    assert thread.last_frame_metrics["consumer_skipped_frames"] == 6
+    assert thread.last_frame_metrics["discarded_frames"] == 10
+    assert thread.last_frame_metrics["drop_rate"] == 0.2
 
 
 class _LatestEnvelopeReader(_EnvelopeReader):
@@ -353,6 +365,28 @@ def test_video_thread_prefers_latest_frame_for_inference():
 
     assert reader.calls == 1
     assert reader.fifo_calls == 0
+    assert detector.received_frame is frame
+
+
+def test_video_thread_preserves_fifo_order_for_local_video():
+    frame = np.zeros((8, 12, 3), dtype=np.uint8)
+    envelope = FrameEnvelope(
+        original_frame=frame,
+        frame_index=9,
+        capture_time_ms=2_000.0,
+        arrival_time_ms=2_005.0,
+        segment_id=0,
+    )
+    reader = _LatestEnvelopeReader(envelope)
+    reader.source = "race.mkv"
+    detector = _TimestampDetector()
+    thread = VideoThread(reader, detector, ui_skip=99)
+    detector.thread = thread
+
+    thread.run()
+
+    assert reader.calls == 0
+    assert reader.fifo_calls == 1
     assert detector.received_frame is frame
 
 

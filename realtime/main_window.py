@@ -601,13 +601,18 @@ class VideoThread(QThread):
         self._running = True
         frame_count = 0
         last_frame_ts = 0.0
+        inference_timestamps = deque(maxlen=120)
 
         while self._running:
             envelope = None
             try:
-                get_frame_envelope = getattr(self.reader, "get_latest_frame_envelope", None)
-                if not callable(get_frame_envelope):
+                source = getattr(self.reader, "source", None)
+                if StreamReader.is_video_file_source(source):
                     get_frame_envelope = getattr(self.reader, "get_frame_envelope", None)
+                else:
+                    get_frame_envelope = getattr(self.reader, "get_latest_frame_envelope", None)
+                    if not callable(get_frame_envelope):
+                        get_frame_envelope = getattr(self.reader, "get_frame_envelope", None)
                 if callable(get_frame_envelope):
                     envelope = get_frame_envelope()
                     if envelope is None:
@@ -653,20 +658,31 @@ class VideoThread(QThread):
                 logger.exception(f"[VideoThread-{self.source_id}] process_frame 异常: {e}")
                 events, athletes, bibs = [], [], []
             detector_metrics = dict(getattr(self.detector, "last_frame_metrics", {}) or {})
+            processing_completed = time.monotonic()
+            processing_time_ms = (processing_completed - processing_started) * 1000.0
+            inference_timestamps.append(processing_completed)
+            if len(inference_timestamps) >= 2:
+                inference_window_seconds = inference_timestamps[-1] - inference_timestamps[0]
+                inference_fps = (
+                    (len(inference_timestamps) - 1) / inference_window_seconds
+                    if inference_window_seconds > 0
+                    else 0.0
+                )
+            else:
+                inference_fps = 1000.0 / max(processing_time_ms, 0.001)
+            try:
+                reader_metrics = dict(self.reader.get_info() or {})
+            except Exception:
+                reader_metrics = {}
             if detector_metrics.get("roi_auto_disabled"):
                 self.roi_auto_disabled.emit(self.source_id)
             if envelope is not None:
-                processing_time_ms = (time.monotonic() - processing_started) * 1000.0
                 envelope = envelope.with_processing_time(processing_time_ms)
                 self.last_processed_envelope = envelope
                 capture_latency_ms = envelope.arrival_time_ms - envelope.capture_time_ms
                 if capture_latency_ms < 0 or capture_latency_ms > 60_000:
                     capture_latency_ms = None
                 queue_latency_ms = max(0.0, processing_started_wall_ms - envelope.arrival_time_ms)
-                try:
-                    reader_metrics = dict(self.reader.get_info() or {})
-                except Exception:
-                    reader_metrics = {}
                 self.last_frame_metrics = {
                     **detector_metrics,
                     "frame_index": envelope.frame_index,
@@ -678,8 +694,24 @@ class VideoThread(QThread):
                     "processing_time_ms": processing_time_ms,
                     "end_to_end_latency_ms": queue_latency_ms + processing_time_ms,
                     "queue_depth": reader_metrics.get("queue_depth"),
+                    "capture_fps": float(reader_metrics.get("actual_fps", 0.0) or 0.0),
+                    "inference_fps": inference_fps,
                     "dropped_frames": reader_metrics.get("dropped_frame_count"),
                     "consumer_skipped_frames": reader_metrics.get("consumer_skipped_frame_count"),
+                    "discarded_frames": reader_metrics.get("discarded_frame_count"),
+                    "drop_rate": float(reader_metrics.get("drop_rate", 0.0) or 0.0),
+                }
+            else:
+                self.last_frame_metrics = {
+                    **detector_metrics,
+                    "processing_time_ms": processing_time_ms,
+                    "queue_depth": reader_metrics.get("queue_depth"),
+                    "capture_fps": float(reader_metrics.get("actual_fps", 0.0) or 0.0),
+                    "inference_fps": inference_fps,
+                    "dropped_frames": reader_metrics.get("dropped_frame_count"),
+                    "consumer_skipped_frames": reader_metrics.get("consumer_skipped_frame_count"),
+                    "discarded_frames": reader_metrics.get("discarded_frame_count"),
+                    "drop_rate": float(reader_metrics.get("drop_rate", 0.0) or 0.0),
                 }
 
             # 发送过线事件
@@ -2240,9 +2272,21 @@ class MainWindow(QMainWindow):
     log_signal = pyqtSignal(str)
     field_issue_saved_signal = pyqtSignal(object)
 
-    def __init__(self, config: dict):
+    def __init__(
+        self,
+        config: dict,
+        *,
+        runtime_source_override=None,
+        runtime_sport_profile_override=None,
+    ):
         super().__init__()
         self.config = config
+        self._runtime_source_override = runtime_source_override
+        self._runtime_sport_profile_override = (
+            normalize_sport_profile(runtime_sport_profile_override)
+            if runtime_sport_profile_override is not None
+            else None
+        )
         self._yolo_only_mode = bool(config.get("yolo_only_mode", False))
         self.config["yolo_only_mode"] = self._yolo_only_mode
         self.sport_profile = normalize_sport_profile(config.get("sport_profile", "cycling"))
@@ -2269,6 +2313,9 @@ class MainWindow(QMainWindow):
         self.database: Optional[Database] = None
         self.recorder: Optional[EventRecorder] = None
         self.recording_manager: Optional[ManualRecordingManager] = None
+        self._recording_error_message = ""
+        self._auto_record_live_sources = bool(config.get("auto_record_live_sources", True))
+        self.config["auto_record_live_sources"] = self._auto_record_live_sources
         self.viewer_dialog: Optional[ImageViewerDialog] = None
         self.ocr_manager: Optional[OCRManager] = None
         self.field_issue_log: Optional[FieldIssueLog] = None
@@ -2308,6 +2355,8 @@ class MainWindow(QMainWindow):
         self._live_monitor_window_seconds = float(config.get('live_monitor_window_seconds', 30.0))
         self._live_monitor_update_seconds = float(config.get('live_monitor_update_seconds', 1.2))
         self._live_monitor_min_fps = float(config.get('live_monitor_min_fps', 12.0))
+        self._live_monitor_warn_drop_rate = float(config.get('live_monitor_warn_drop_rate', 0.05))
+        self._live_monitor_severe_drop_rate = float(config.get('live_monitor_severe_drop_rate', 0.15))
         self._live_monitor_warn_cooldown_seconds = float(config.get('live_monitor_warn_cooldown_seconds', 8.0))
         self._live_monitor_samples: Dict[int, deque] = {}
         self._live_monitor_last_warn_ts: Dict[int, float] = {}
@@ -2317,6 +2366,8 @@ class MainWindow(QMainWindow):
         self.config['live_monitor_window_seconds'] = self._live_monitor_window_seconds
         self.config['live_monitor_update_seconds'] = self._live_monitor_update_seconds
         self.config['live_monitor_min_fps'] = self._live_monitor_min_fps
+        self.config['live_monitor_warn_drop_rate'] = self._live_monitor_warn_drop_rate
+        self.config['live_monitor_severe_drop_rate'] = self._live_monitor_severe_drop_rate
         self.config['live_monitor_warn_cooldown_seconds'] = self._live_monitor_warn_cooldown_seconds
 
         self._ocr_poll_timer = QTimer(self)
@@ -2443,6 +2494,15 @@ class MainWindow(QMainWindow):
             )
             if key in self.config
         }
+        if self._runtime_source_override is not None:
+            runtime_config.update(
+                {
+                    "source": self._runtime_source_override,
+                    "sources": [self._runtime_source_override],
+                }
+            )
+        if self._runtime_sport_profile_override is not None:
+            runtime_config["sport_profile"] = self._runtime_sport_profile_override
         config_file = race_dir / "config.json"
         if config_file.exists():
             try:
@@ -3043,6 +3103,7 @@ class MainWindow(QMainWindow):
         fps_val = float(getattr(self, f'_fps_{source_id}', 0.0))
         thread = self.video_threads.get(source_id)
         frame_metrics = dict(getattr(thread, 'last_frame_metrics', {}) or {})
+        frame_metrics['display_fps'] = fps_val
 
         self._live_monitor_samples[source_id].append(
             (
@@ -3058,6 +3119,13 @@ class MainWindow(QMainWindow):
                 int(frame_metrics.get('identity_ambiguities', 0) or 0),
                 int(frame_metrics.get('queue_depth', 0) or 0),
                 int(frame_metrics.get('dropped_frames', 0) or 0),
+                int(frame_metrics.get('consumer_skipped_frames', 0) or 0),
+                int(frame_metrics.get('discarded_frames', 0) or 0),
+                float(frame_metrics.get('drop_rate', 0.0) or 0.0),
+                float(frame_metrics.get('capture_fps', 0.0) or 0.0),
+                float(frame_metrics.get('inference_fps', fps_val) or 0.0),
+                float(frame_metrics.get('queue_latency_ms', 0.0) or 0.0),
+                float(frame_metrics.get('end_to_end_latency_ms', 0.0) or 0.0),
             )
         )
 
@@ -3082,8 +3150,26 @@ class MainWindow(QMainWindow):
         bib_only_ratio = float(sum(item[5] for item in samples)) / max(1, n)
         split_hits = int(sum(1 for item in samples if item[3] > 0))
 
-        fps_values = [float(item[6]) for item in samples if float(item[6]) > 0.01]
+        display_fps_values = [float(item[6]) for item in samples if float(item[6]) > 0.01]
+        capture_fps_values = [
+            float(item[15]) for item in samples
+            if len(item) > 15 and float(item[15]) > 0.01
+        ]
+        inference_fps_values = [
+            float(item[16]) if len(item) > 16 else float(item[6])
+            for item in samples
+            if (len(item) > 16 and float(item[16]) > 0.01) or float(item[6]) > 0.01
+        ]
+        fps_values = inference_fps_values
         avg_fps = float(sum(fps_values) / max(1, len(fps_values))) if fps_values else 0.0
+        capture_fps = (
+            float(sum(capture_fps_values) / len(capture_fps_values))
+            if capture_fps_values else 0.0
+        )
+        display_fps = (
+            float(sum(display_fps_values) / len(display_fps_values))
+            if display_fps_values else 0.0
+        )
         latest = samples[-1]
         participant_count = int(latest[7]) if len(latest) > 7 else 0
         fragment_merges = sum(int(item[8]) for item in samples if len(item) > 8)
@@ -3096,11 +3182,33 @@ class MainWindow(QMainWindow):
             (int(item[11]) for item in samples if len(item) > 11),
             default=0,
         )
+        consumer_skipped_frames = max(
+            (int(item[12]) for item in samples if len(item) > 12),
+            default=0,
+        )
+        discarded_frames = max(
+            (int(item[13]) for item in samples if len(item) > 13),
+            default=dropped_frames + consumer_skipped_frames,
+        )
+        drop_rate = max(
+            (float(item[14]) for item in samples if len(item) > 14),
+            default=0.0,
+        )
+        queue_latency_ms = max(
+            (float(item[17]) for item in samples if len(item) > 17),
+            default=0.0,
+        )
+        end_to_end_latency_ms = max(
+            (float(item[18]) for item in samples if len(item) > 18),
+            default=0.0,
+        )
 
         severe = (avg_fps > 0 and avg_fps < float(self._live_monitor_min_fps) * 0.80) or \
-                 mismatch_ratio >= 0.30 or bib_only_ratio >= 0.22
+                 mismatch_ratio >= 0.30 or bib_only_ratio >= 0.22 or \
+                 drop_rate > float(getattr(self, '_live_monitor_severe_drop_rate', 0.15))
         warning = (avg_fps > 0 and avg_fps < float(self._live_monitor_min_fps)) or \
-                  mismatch_ratio >= 0.18 or bib_only_ratio >= 0.12
+                  mismatch_ratio >= 0.18 or bib_only_ratio >= 0.12 or \
+                  drop_rate > float(getattr(self, '_live_monitor_warn_drop_rate', 0.05))
 
         if severe:
             level = 'danger'
@@ -3113,8 +3221,12 @@ class MainWindow(QMainWindow):
             note = '正常'
 
         detail_parts = []
+        if capture_fps > 0:
+            detail_parts.append(f"采集={capture_fps:.1f}FPS")
         if avg_fps > 0:
-            detail_parts.append(f"FPS={avg_fps:.1f}")
+            detail_parts.append(f"推理={avg_fps:.1f}FPS")
+        if display_fps > 0:
+            detail_parts.append(f"显示={display_fps:.1f}FPS")
         if mismatch_ratio > 0.0:
             detail_parts.append(f"并排漏检风险={mismatch_ratio:.0%}")
         if bib_only_ratio > 0.0:
@@ -3125,7 +3237,11 @@ class MainWindow(QMainWindow):
         detail_parts.append(f"轨迹合并={fragment_merges}")
         detail_parts.append(f"身份歧义={identity_ambiguities}")
         detail_parts.append(f"队列峰值={queue_depth_max}")
-        detail_parts.append(f"丢帧={dropped_frames}")
+        detail_parts.append(f"丢帧={discarded_frames} ({drop_rate:.1%})")
+        if queue_latency_ms > 0:
+            detail_parts.append(f"队列延迟={queue_latency_ms:.0f}ms")
+        if end_to_end_latency_ms > 0:
+            detail_parts.append(f"总延迟={end_to_end_latency_ms:.0f}ms")
 
         detail_text = " | ".join(detail_parts) if detail_parts else "采样正常"
         return {
@@ -3134,6 +3250,9 @@ class MainWindow(QMainWindow):
             'label': f"机位{source_id + 1}:{note}",
             'note': note,
             'avg_fps': avg_fps,
+            'capture_fps': capture_fps,
+            'inference_fps': avg_fps,
+            'display_fps': display_fps,
             'mismatch_ratio': mismatch_ratio,
             'bib_only_ratio': bib_only_ratio,
             'split_hits': split_hits,
@@ -3142,6 +3261,11 @@ class MainWindow(QMainWindow):
             'identity_ambiguities': identity_ambiguities,
             'queue_depth_max': queue_depth_max,
             'dropped_frames': dropped_frames,
+            'consumer_skipped_frames': consumer_skipped_frames,
+            'discarded_frames': discarded_frames,
+            'drop_rate': drop_rate,
+            'queue_latency_ms': queue_latency_ms,
+            'end_to_end_latency_ms': end_to_end_latency_ms,
             'detail': detail_text,
         }
 
@@ -4219,9 +4343,11 @@ class MainWindow(QMainWindow):
 
         if self.recorder is not None:
             try:
-                self.recorder.stop()
+                stopped_cleanly = self.recorder.stop()
             except Exception as exc:
-                logger.warning(f"[Main] 停止事件记录器失败: {exc}")
+                raise RuntimeError(f"事件记录器停止失败，未切换赛事: {exc}") from exc
+            if stopped_cleanly is False:
+                raise RuntimeError("事件记录器仍在写入，未关闭数据库或切换赛事")
             self.recorder = None
 
         if self.ocr_manager is not None:
@@ -4527,7 +4653,12 @@ class MainWindow(QMainWindow):
                 self.detectors[i] = detector
 
                 # 流读取器
-                reader = StreamReader(source, queue_size=1)
+                is_video_file = StreamReader.is_video_file_source(source)
+                reader = StreamReader(
+                    source,
+                    queue_size=4 if is_video_file else 1,
+                    overflow_policy="block" if is_video_file else "drop_oldest",
+                )
                 if not reader.start():
                     logger.warning(f"[Main] 无法连接到机位 {i+1}: {source}")
                     # 继续尝试其他机位
@@ -4618,6 +4749,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "recording_status_label"):
             return
         if active:
+            self.recording_status_label.setToolTip("")
             duration = self._format_recording_duration(manager.elapsed_seconds)
             size_mb = manager.total_size_bytes / (1024 * 1024)
             self.recording_status_label.setText(f"录像: {duration} | {size_mb:.1f} MB")
@@ -4625,6 +4757,14 @@ class MainWindow(QMainWindow):
                 "margin-right: 12px; color: #cf1322; font-weight: bold; font-size: 13px;"
             )
         else:
+            recording_error = getattr(self, "_recording_error_message", "")
+            if recording_error:
+                self.recording_status_label.setText("录像: 异常")
+                self.recording_status_label.setToolTip(recording_error)
+                self.recording_status_label.setStyleSheet(
+                    "margin-right: 12px; color: #cf1322; font-weight: bold; font-size: 13px;"
+                )
+                return
             self.recording_status_label.setText("录像: 待机")
             self.recording_status_label.setStyleSheet(
                 "margin-right: 12px; color: #666; font-weight: bold; font-size: 13px;"
@@ -4636,12 +4776,37 @@ class MainWindow(QMainWindow):
         else:
             self._start_manual_recording()
 
-    def _start_manual_recording(self):
+    def _start_auto_recording_if_needed(self):
+        if not getattr(self, '_auto_record_live_sources', False):
+            return
+        if any(is_rtsp_source(source) for source in self.sources):
+            self._start_manual_recording(automatic=True)
+            return
+        if any(StreamReader.is_live_source(source) for source in self.sources):
+            message = "当前实时源不是 RTSP，自动录像暂不可用；AI 采集继续运行。"
+            self._recording_error_message = message
+            logger.warning(f"[Recording] {message}")
+            self.statusBar().showMessage(message)
+
+    def _start_manual_recording(self, *, automatic: bool = False):
         if not self._race_ready:
-            QMessageBox.warning(self, "提示", "请先选择或创建赛事。")
+            if not automatic:
+                QMessageBox.warning(self, "提示", "请先选择或创建赛事。")
             return
         if not self._running:
-            QMessageBox.warning(self, "提示", "请先启动AI检测，再开始录像。")
+            if not automatic:
+                QMessageBox.warning(self, "提示", "请先启动AI检测，再开始录像。")
+            return
+
+        rtsp_sources = [source for source in self.sources if is_rtsp_source(source)]
+        if not rtsp_sources:
+            message = "当前实时源不是 RTSP，暂不支持自动录像。"
+            self._recording_error_message = message
+            logger.warning(f"[Recording] {message}")
+            if automatic:
+                self.statusBar().showMessage(message)
+            else:
+                QMessageBox.warning(self, "录像失败", message)
             return
 
         manager = ManualRecordingManager(
@@ -4652,17 +4817,23 @@ class MainWindow(QMainWindow):
             paths = manager.start()
         except RecordingError as exc:
             logger.error(f"[Recording] 开始录像失败: {exc}")
-            QMessageBox.warning(self, "录像失败", str(exc))
+            self._recording_error_message = f"自动录像失败: {exc}" if automatic else str(exc)
+            if automatic:
+                self.statusBar().showMessage(self._recording_error_message)
+            else:
+                QMessageBox.warning(self, "录像失败", str(exc))
             self.recording_manager = None
             self._refresh_recording_ui()
             return
 
         self.recording_manager = manager
+        self._recording_error_message = ""
         self._recording_poll_timer.start()
         self._refresh_recording_ui()
         names = ", ".join(path.name for path in paths)
-        logger.info(f"[Recording] 已开始手动录像: {names}")
-        self.statusBar().showMessage(f"录像已开始，保存到: {self.output_dir / 'videos'}")
+        mode = "自动" if automatic else "手动"
+        logger.info(f"[Recording] 已开始{mode}录像: {names}")
+        self.statusBar().showMessage(f"{mode}录像已开始，保存到: {self.output_dir / 'videos'}")
 
     def _stop_manual_recording(self, *, show_message: bool = True):
         manager = self.recording_manager
@@ -4705,6 +4876,7 @@ class MainWindow(QMainWindow):
         error = manager.check_error()
         if error:
             logger.error(f"[Recording] {error}")
+            self._recording_error_message = str(error)
             try:
                 manager.stop()
             except RecordingError:
@@ -4771,6 +4943,8 @@ class MainWindow(QMainWindow):
                 # 初始状态同步
                 self._update_conn_status(reader.status, source_id)
 
+        self._start_auto_recording_if_needed()
+
         self.start_btn.setText("停止采集")
         self.start_btn.setObjectName("stop_btn")
         self.start_btn.setStyle(self.start_btn.style())  # 刷新样式
@@ -4784,7 +4958,9 @@ class MainWindow(QMainWindow):
             self.event_list.refresh_list()
 
         connected = self._connected_source_count()
-        self.statusBar().showMessage(f"运行中 (已连接 {connected}/{len(self.sources)} 路机位)")
+        status = f"运行中 (已连接 {connected}/{len(self.sources)} 路机位)"
+        recording_error = getattr(self, "_recording_error_message", "")
+        self.statusBar().showMessage(f"{status} | {recording_error}" if recording_error else status)
 
     def _stop(self):
         """停止 (支持多机位)"""
@@ -5540,7 +5716,12 @@ class MainWindow(QMainWindow):
             logger.debug(f"[MainWindow] 正在提交给 EventRecorder 保存...")
             if not getattr(self.recorder, "_running", False):
                 logger.warning("[MainWindow] EventRecorder 未运行，尝试自动启动...")
-                self.recorder.start()
+                try:
+                    self.recorder.start()
+                except RuntimeError as exc:
+                    logger.error(f"[MainWindow] EventRecorder 无法重新启动: {exc}")
+                    self.statusBar().showMessage("事件记录器停止未完成，已阻止继续写入", 5000)
+                    return
             self.recorder.record(event)
             
         # 3. 刷新右侧列表
@@ -5830,7 +6011,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='实时计时系统GUI')
-    parser.add_argument('--source', type=str, default='rtsp://localhost:8554/test',
+    parser.add_argument('--source', type=str, default=None,
                        help='视频源')
     parser.add_argument('--model', type=str, default=None,
                        help='模型路径（不指定则自动查找）')
@@ -5875,8 +6056,13 @@ def main():
         x1, y1, x2, y2 = 0, 850, 1920, 850
 
     output_path = resolve_output_dir(args.output, base_dir=runtime_root)
+    runtime_source = (
+        resolve_source(args.source, base_dir=runtime_root)
+        if args.source is not None
+        else None
+    )
     config = {
-        'source': resolve_source(args.source, base_dir=runtime_root),
+        'source': runtime_source or 'rtsp://localhost:8554/test',
         'model_path': model_path,
         'output_dir': str(output_path),
         'runtime_dir': str(runtime_root),
@@ -5918,13 +6104,20 @@ def main():
     config['runtime_dir'] = str(runtime_root)
     config['yolo_only_mode'] = bool(args.yolo_only)
     config['ocr_cpu_threads'] = max(1, min(4, int(args.ocr_cpu_threads)))
+    if runtime_source is not None:
+        config['source'] = runtime_source
+        config['sources'] = [runtime_source]
     if args.model:
         config['model_path'] = model_path
     if args.sport_profile:
         config['sport_profile'] = args.sport_profile
 
     app = QApplication(sys.argv)
-    window = MainWindow(config)
+    window = MainWindow(
+        config,
+        runtime_source_override=runtime_source,
+        runtime_sport_profile_override=args.sport_profile,
+    )
     window.show()
     
     if args.auto_start:

@@ -137,6 +137,49 @@ def test_releasing_current_race_stops_workers_and_closes_database():
     assert harness._ocr_runtime_state == "idle"
 
 
+def test_releasing_race_keeps_database_open_when_recorder_is_still_writing():
+    class _Recorder:
+        def stop(self):
+            return False
+
+    class _Database:
+        def __init__(self):
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    class _Timer:
+        def isActive(self):
+            return False
+
+    class _Harness:
+        _release_current_race = MainWindow._release_current_race
+
+        def __init__(self):
+            self.recording_manager = None
+            self.preview_threads = {}
+            self.video_threads = {}
+            self.readers = {}
+            self.detectors = {}
+            self.recorder = _Recorder()
+            self.ocr_manager = None
+            self.database = _Database()
+            self._ocr_poll_timer = _Timer()
+
+    harness = _Harness()
+
+    try:
+        harness._release_current_race()
+    except RuntimeError as exc:
+        assert "仍在写入" in str(exc)
+    else:
+        raise AssertionError("race release should fail while the recorder is still writing")
+
+    assert harness.database.closed == 0
+    assert harness.recorder is not None
+
+
 def test_vlm_settings_keep_cloud_ocr_out_of_detector_frame_path(monkeypatch):
     class _Vlm:
         def __init__(self, api_key, model):

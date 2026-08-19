@@ -77,6 +77,26 @@ def resolve_athlete_validator_model(configured_path: str, search_roots: List[Pat
     return None
 
 
+def resolve_athlete_detector_model(configured_path: str, search_roots: List[Path]) -> Optional[Path]:
+    """Resolve the optional generic YOLO11 person detector."""
+    roots = [Path(root).expanduser() for root in search_roots]
+    candidates: List[Path] = []
+    if configured_path:
+        configured = Path(configured_path).expanduser()
+        if configured.is_absolute():
+            candidates.append(configured)
+        else:
+            candidates.extend(root / configured for root in roots)
+            candidates.append(configured)
+    candidates.extend(root / "yolo11s.pt" for root in roots)
+    candidates.extend(root / "yolo11n.pt" for root in roots)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
 def resolve_performance_profile(
     requested: str = "auto",
     *,
@@ -1403,6 +1423,7 @@ class Detector:
                  model: Optional[YOLO] = None, ocr: Optional[Any] = None, ocr_engine: str = "rapidocr",
                  only_numeric: bool = False, realtime_ocr: bool = False,
                  gate_guard_enabled: bool = True, athlete_validator: Optional[Any] = None,
+                 athlete_detector: Optional[Any] = None,
                  performance_profile: str = "auto", sport_profile: str = "cycling",
                  event_settle_seconds: Optional[float] = None,
                  event_profile: Optional[EventProfile] = None,
@@ -1417,6 +1438,8 @@ class Detector:
         self.realtime_ocr_enabled = bool(realtime_ocr and self.ocr_pipeline_enabled)
         self.enable_gate_guard = bool(gate_guard_enabled) # 龙门安全模式（抑制龙门/拱门误检）
         self._athlete_validator = athlete_validator
+        self._athlete_detector = athlete_detector
+        self._athlete_detector_failed = False
         normalized_sport_profile = (
             str(sport_profile or "cycling").strip().lower() or "cycling"
         )
@@ -1443,6 +1466,10 @@ class Detector:
         self.athlete_validator_min_bicycle_area_ratio = 0.05
         self.athlete_validator_bicycle_center_x_min = 0.25
         self.athlete_validator_bicycle_center_x_max = 0.75
+        self.athlete_detector_imgsz = 896
+        self.athlete_detector_conf = 0.20
+        self.athlete_detector_trackside_bottom_ratio = 0.48
+        self.speed_skating_primary_bottom_ratio = 0.45
         resolved_profile = resolve_performance_profile(performance_profile)
         self.performance_profile = str(resolved_profile["name"])
         self._merged_pairs = set() # 用于减少重复合并日志
@@ -1618,6 +1645,8 @@ class Detector:
         self._noid_next_track_id = 900000
         self._split_track_pool: Dict[int, Tuple[int, int, float]] = {}
         self._split_next_track_id = 970000
+        self._athlete_detector_track_pool: Dict[int, Dict[str, Any]] = {}
+        self._athlete_detector_next_track_id = 920000
         self._forced_bib_rescue_last: Dict[Tuple[int, int], float] = {}
         self._wide_split_last: Dict[Any, float] = {}
 
@@ -1630,6 +1659,7 @@ class Detector:
         self._raw_model_boxes: List[Tuple[int, float, List[float]]] = []
         self._raw_detection_capture_registered = False
         self._register_raw_detection_capture()
+        self._initialize_athlete_detector()
 
         # 选手名单
         self._athlete_list: set = set()
@@ -1673,6 +1703,52 @@ class Detector:
             self._raw_detection_capture_registered = True
         except Exception as exc:
             logger.debug(f"[Detector-{self.source_id}] Raw detection capture unavailable: {exc}")
+
+    def _initialize_athlete_detector(self) -> None:
+        """Load a sibling generic YOLO11 model for speed-skating person recovery."""
+        if self.sport_profile != "speed_skating" or self._athlete_detector is not None:
+            return
+
+        names = getattr(self._model, "names", None)
+        if (not names) and hasattr(self._model, "model"):
+            names = getattr(self._model.model, "names", None)
+        if isinstance(names, dict):
+            normalized_names = {
+                int(index): str(label).strip().lower()
+                for index, label in names.items()
+                if str(index).lstrip("-").isdigit()
+            }
+        elif isinstance(names, (list, tuple)):
+            normalized_names = {index: str(label).strip().lower() for index, label in enumerate(names)}
+        else:
+            normalized_names = {}
+        if (
+            len(normalized_names) >= 20
+            and normalized_names.get(0) == "person"
+            and normalized_names.get(1) == "bicycle"
+        ):
+            logger.info(f"[Detector-{self.source_id}] Primary COCO YOLO model already provides person detection")
+            return
+
+        model_root = Path(self.model_path).expanduser().resolve().parent
+        detector_path = resolve_athlete_detector_model("", [model_root])
+        if detector_path is None:
+            logger.warning(
+                f"[Detector-{self.source_id}] YOLO11 person model not found; using the primary model only"
+            )
+            return
+
+        try:
+            self._athlete_detector = YOLO(str(detector_path))
+            logger.info(
+                f"[Detector-{self.source_id}] Speed-skating person detector ready: {detector_path.name}"
+            )
+        except Exception as exc:
+            self._athlete_detector = None
+            self._athlete_detector_failed = True
+            logger.warning(
+                f"[Detector-{self.source_id}] Person detector unavailable; using the custom model only: {exc}"
+            )
 
     def _capture_raw_model_boxes(self, predictor: Any) -> None:
         captured: List[Tuple[int, float, List[float]]] = []
@@ -2173,6 +2249,203 @@ class Detector:
                 unmatched.discard(bib_idx)
 
         return assignments, unmatched
+
+    def _allocate_athlete_detector_track_id(
+        self,
+        bbox: List[int],
+        current_time: float,
+        frame_shape: Tuple[int, int],
+        used_track_ids: Set[int],
+    ) -> int:
+        """Associate generic-person detections with a short velocity-aware track."""
+        height, width = int(frame_shape[0]), int(frame_shape[1])
+        x1, y1, x2, y2 = [float(value) for value in bbox]
+        center_x = (x1 + x2) * 0.5
+        center_y = (y1 + y2) * 0.5
+        box_width = max(1.0, x2 - x1)
+        box_height = max(1.0, y2 - y1)
+
+        stale_track_ids = [
+            track_id
+            for track_id, state in self._athlete_detector_track_pool.items()
+            if current_time - float(state.get("time", 0.0)) > 0.75
+        ]
+        for track_id in stale_track_ids:
+            self._athlete_detector_track_pool.pop(track_id, None)
+
+        best_track_id = None
+        best_score = float("inf")
+        base_match_distance = max(90.0, 0.11 * max(width, height))
+        for track_id, state in self._athlete_detector_track_pool.items():
+            if track_id in used_track_ids:
+                continue
+            elapsed = current_time - float(state.get("time", 0.0))
+            if elapsed < 0.0 or elapsed > 0.75:
+                continue
+
+            previous_width = max(1.0, float(state.get("width", box_width)))
+            previous_height = max(1.0, float(state.get("height", box_height)))
+            width_ratio = max(previous_width, box_width) / min(previous_width, box_width)
+            height_ratio = max(previous_height, box_height) / min(previous_height, box_height)
+            if width_ratio > 2.8 or height_ratio > 2.8:
+                continue
+
+            predicted_x = float(state.get("center_x", center_x)) + float(state.get("vx", 0.0)) * elapsed
+            predicted_y = float(state.get("center_y", center_y)) + float(state.get("vy", 0.0)) * elapsed
+            distance = float(np.hypot(center_x - predicted_x, center_y - predicted_y))
+            size_penalty = (abs(width_ratio - 1.0) + abs(height_ratio - 1.0)) * 24.0
+            score = distance + size_penalty
+            max_distance = base_match_distance + min(80.0, elapsed * 180.0)
+            if distance <= max_distance and score < best_score:
+                best_track_id = int(track_id)
+                best_score = score
+
+        if best_track_id is None:
+            best_track_id = int(self._athlete_detector_next_track_id)
+            self._athlete_detector_next_track_id += 1
+            if self._athlete_detector_next_track_id >= 969000:
+                self._athlete_detector_next_track_id = 920000
+            velocity_x = 0.0
+            velocity_y = 0.0
+        else:
+            previous = self._athlete_detector_track_pool[best_track_id]
+            elapsed = current_time - float(previous.get("time", current_time))
+            velocity_x = float(previous.get("vx", 0.0))
+            velocity_y = float(previous.get("vy", 0.0))
+            if elapsed > 1e-3:
+                observed_vx = (center_x - float(previous.get("center_x", center_x))) / elapsed
+                observed_vy = (center_y - float(previous.get("center_y", center_y))) / elapsed
+                velocity_x = velocity_x * 0.45 + observed_vx * 0.55
+                velocity_y = velocity_y * 0.45 + observed_vy * 0.55
+
+        self._athlete_detector_track_pool[best_track_id] = {
+            "center_x": center_x,
+            "center_y": center_y,
+            "width": box_width,
+            "height": box_height,
+            "time": float(current_time),
+            "vx": velocity_x,
+            "vy": velocity_y,
+        }
+        used_track_ids.add(best_track_id)
+        return best_track_id
+
+    def _detect_speed_skating_athletes(
+        self,
+        infer_frame: np.ndarray,
+        infer_offset_x: int,
+        infer_offset_y: int,
+        frame_shape: Tuple[int, int],
+        current_time: float,
+        existing_athletes: List[dict],
+    ) -> Tuple[List[dict], float]:
+        """Recover track-side skaters with a generic YOLO11 person detector."""
+        if (
+            self.sport_profile != "speed_skating"
+            or self._athlete_detector is None
+            or self._athlete_detector_failed
+        ):
+            return [], 0.0
+
+        started = time.time()
+        try:
+            results = self._athlete_detector.predict(
+                source=infer_frame,
+                classes=[0],
+                conf=self.athlete_detector_conf,
+                iou=0.60,
+                imgsz=self.athlete_detector_imgsz,
+                verbose=False,
+            )
+        except Exception as exc:
+            self._athlete_detector_failed = True
+            logger.warning(
+                f"[Detector-{self.source_id}] Person detector failed; disabling fallback: {exc}"
+            )
+            return [], (time.time() - started) * 1000.0
+
+        height, width = int(frame_shape[0]), int(frame_shape[1])
+        recovered: List[dict] = []
+        used_track_ids: Set[int] = set()
+        min_bottom = height * self.athlete_detector_trackside_bottom_ratio
+        min_height = max(float(self.min_bh), height * 0.08)
+
+        for result in results or []:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            for index in range(len(boxes)):
+                confidence_value = boxes.conf[index]
+                confidence = (
+                    float(confidence_value.item())
+                    if hasattr(confidence_value, "item")
+                    else float(confidence_value)
+                )
+                xyxy_value = boxes.xyxy[index]
+                xyxy = xyxy_value.tolist() if hasattr(xyxy_value, "tolist") else list(xyxy_value)
+                x1 = int(round(float(xyxy[0]) + infer_offset_x))
+                y1 = int(round(float(xyxy[1]) + infer_offset_y))
+                x2 = int(round(float(xyxy[2]) + infer_offset_x))
+                y2 = int(round(float(xyxy[3]) + infer_offset_y))
+                bbox = [
+                    max(0, min(width, x1)),
+                    max(0, min(height, y1)),
+                    max(0, min(width, x2)),
+                    max(0, min(height, y2)),
+                ]
+                box_width = bbox[2] - bbox[0]
+                box_height = bbox[3] - bbox[1]
+                if box_width <= 0 or box_height < min_height or bbox[3] < min_bottom:
+                    continue
+                if (box_width * box_height) > width * height * 0.30:
+                    continue
+                if not self._passes_athlete_aspect_filter(bbox, confidence, (height, width)):
+                    continue
+
+                duplicates_existing = any(
+                    bbox_iou(bbox, athlete.get("bbox", [])) >= 0.35
+                    or bbox_overlap_over_smaller(bbox, athlete.get("bbox", [])) >= 0.78
+                    for athlete in existing_athletes + recovered
+                    if athlete.get("bbox")
+                )
+                if duplicates_existing:
+                    continue
+
+                track_id = self._allocate_athlete_detector_track_id(
+                    bbox,
+                    current_time,
+                    (height, width),
+                    used_track_ids,
+                )
+                recovered.append({
+                    "bbox": bbox,
+                    "conf": confidence,
+                    "track_id": track_id,
+                    "bib_text": "",
+                    "center_x": (bbox[0] + bbox[2]) // 2,
+                    "center_y": (bbox[1] + bbox[3]) // 2,
+                    "bottom_y": bbox[3],
+                    "athlete_detector": "yolo11_person",
+                })
+
+        return recovered, (time.time() - started) * 1000.0
+
+    def _passes_speed_skating_trackside_filter(
+        self,
+        bbox: List[int],
+        frame_shape: Tuple[int, int],
+    ) -> bool:
+        """Reject person boxes that end above the track-side spectator barrier."""
+        if self.sport_profile != "speed_skating":
+            return True
+        pt1 = getattr(self, "_line_pt1", (0, 0))
+        pt2 = getattr(self, "_line_pt2", (0, 0))
+        if abs(int(pt2[0]) - int(pt1[0])) < abs(int(pt2[1]) - int(pt1[1])):
+            # A vertical finish line can legitimately be crossed in the upper
+            # part of the image; keep the existing endpoint semantics there.
+            return True
+        height = max(1, int(frame_shape[0]))
+        return int(bbox[3]) >= int(height * self.speed_skating_primary_bottom_ratio)
 
     @staticmethod
     def _is_event_eligible_athlete(athlete: dict, observation_count: int) -> bool:
@@ -4536,6 +4809,7 @@ class Detector:
         timestamp: float,
         *,
         bib_bboxes=(),
+        excluded_participant_ids: Optional[Set[str]] = None,
     ) -> Tuple[dict, Any]:
         participant_bbox = self._identity_bbox(athlete.get("bbox"))
         if participant_bbox is None:
@@ -4581,12 +4855,62 @@ class Detector:
             bib_bboxes=tuple(normalized_bib_bboxes),
             confidence=float(athlete.get("conf", 0.0) or 0.0),
         )
-        resolution = self._participant_identity_manager.resolve(observation)
+        resolution = self._participant_identity_manager.resolve(
+            observation,
+            excluded_participant_ids=excluded_participant_ids,
+        )
         resolved = dict(athlete)
         resolved["participant_id"] = resolution.participant.participant_id
         resolved["raw_track_ids"] = sorted(resolution.participant.raw_track_ids)
         resolved["identity_status"] = resolution.participant.identity_status
         return resolved, resolution
+
+    def _inherit_fragment_motion_state(
+        self,
+        track_id: int,
+        state: TrackState,
+        participant_id: str,
+        current_time: float,
+    ) -> None:
+        """Carry crossing motion across a confirmed raw-track fragment switch."""
+        state.participant_id = str(participant_id or "")
+        if not state.participant_id:
+            return
+
+        max_gap_seconds = max(
+            0.0,
+            float(self._participant_identity_manager.config.max_match_gap_ms) / 1000.0,
+        )
+        candidates = []
+        for previous_track_id, previous_state in self._track_states.items():
+            if previous_track_id == track_id:
+                continue
+            if previous_state.participant_id != state.participant_id:
+                continue
+            if previous_state.crossed or previous_state.event_emitted:
+                continue
+            gap_seconds = float(current_time - previous_state.last_seen_time)
+            if 0.0 <= gap_seconds <= max_gap_seconds:
+                candidates.append((previous_state.last_seen_time, previous_state))
+
+        if not candidates:
+            return
+
+        _, previous_state = max(candidates, key=lambda item: item[0])
+        state.prev_x = previous_state.prev_x
+        state.prev_y = previous_state.prev_y
+        state.start_pos = previous_state.start_pos
+        state.start_time = previous_state.start_time
+        state.max_displacement = previous_state.max_displacement
+        state.last_positions = list(previous_state.last_positions)
+        state.position_history = list(previous_state.position_history)
+        state.avg_speed = previous_state.avg_speed
+        state.start_line_dist = previous_state.start_line_dist
+        state.observation_count += previous_state.observation_count
+        state.cross_signal_count = previous_state.cross_signal_count
+        state.cross_signal_last_time = previous_state.cross_signal_last_time
+        if hasattr(previous_state, "_near_line_hits"):
+            setattr(state, "_near_line_hits", getattr(previous_state, "_near_line_hits"))
 
     def resolve_participant(
         self,
@@ -4716,6 +5040,14 @@ class Detector:
                 infer_offset_x = 0
                 infer_offset_y = 0
 
+        try:
+            names = getattr(self._model, "names", None) or {}
+            if (not names) and hasattr(self._model, "model"):
+                names = getattr(self._model.model, "names", None) or {}
+            self._map_model_class_ids(names)
+        except Exception:
+            pass
+
         track_kwargs = {
             "persist": True,
             "verbose": False,
@@ -4725,6 +5057,9 @@ class Detector:
             "augment": False,
             "imgsz": self.process_imgsz,  # 使用配置的尺寸
         }
+        tracked_class_ids = sorted(self.person_class_ids | self.bib_class_ids)
+        if tracked_class_ids:
+            track_kwargs["classes"] = tracked_class_ids
         self._raw_model_boxes = []
         try:
             _t0 = time.time()
@@ -4859,7 +5194,7 @@ class Detector:
         runtime_person_class_ids = set(self.person_class_ids)
 
         # 帧内兜底：若当前帧没有任何“person类”命中，则把非 bib 类临时视为 person，避免整帧漏人
-        if present_class_ids and present_class_ids.isdisjoint(runtime_person_class_ids):
+        if not self._class_map_logged and present_class_ids and present_class_ids.isdisjoint(runtime_person_class_ids):
             fallback_person_ids = set(present_class_ids) - set(self.bib_class_ids)
             if fallback_person_ids:
                 runtime_person_class_ids = fallback_person_ids
@@ -4938,6 +5273,16 @@ class Detector:
                 if not self._passes_athlete_aspect_filter(
                     [x1, y1, x2, y2],
                     conf,
+                    (height, width),
+                ):
+                    continue
+                if not self._passes_speed_skating_trackside_filter(
+                    [x1, y1, x2, y2],
+                    (height, width),
+                ):
+                    continue
+                if not self._passes_profile_athlete_geometry(
+                    [x1, y1, x2, y2],
                     (height, width),
                 ):
                     continue
@@ -5048,6 +5393,20 @@ class Detector:
                     'center_x': (x1 + x2) // 2,
                     'center_y': (y1 + y2) // 2
                 })
+
+        recovered_athletes, athlete_detector_ms = self._detect_speed_skating_athletes(
+            infer_frame,
+            infer_offset_x,
+            infer_offset_y,
+            (height, width),
+            current_time,
+            athletes,
+        )
+        if recovered_athletes:
+            athletes.extend(recovered_athletes)
+            raw_bike_detections += len(recovered_athletes)
+            raw_person_candidates += len(recovered_athletes)
+        _infer_ms += athlete_detector_ms
 
         # 3. 号码牌驱动补全
         if bibs:
@@ -5435,6 +5794,7 @@ class Detector:
         # Resolve identity only after same-frame deduplication and wide-box splitting.
         identity_resolutions = {}
         resolved_athletes = []
+        assigned_participant_ids: Set[str] = set()
         for athlete in athletes:
             raw_track_id = athlete.get("track_id")
             bib_boxes = tuple(
@@ -5446,9 +5806,22 @@ class Detector:
                 athlete,
                 current_time,
                 bib_bboxes=bib_boxes,
+                excluded_participant_ids=assigned_participant_ids,
             )
             resolved_athletes.append(resolved)
             identity_resolutions[id(resolved)] = resolution
+            assigned_participant_ids.add(resolution.participant.participant_id)
+            if raw_track_id is not None and raw_track_id in self._track_states:
+                state = self._track_states[raw_track_id]
+                if resolution.merged_raw_track:
+                    self._inherit_fragment_motion_state(
+                        raw_track_id,
+                        state,
+                        resolution.participant.participant_id,
+                        current_time,
+                    )
+                else:
+                    state.participant_id = resolution.participant.participant_id
         athletes = resolved_athletes
 
         # 5.2 提交 OCR 任务 (异步双链路：基于高质量缓存)
@@ -6077,7 +6450,19 @@ class Detector:
                                     dx_ok2 = dx2 <= max(12.0, cw * 0.06)
                                     dy_ok2 = dy2 <= max(28.0, ch * 0.10)
 
-                                    if size_close and dx_ok2 and dy_ok2 and giou2 >= 0.70:
+                                    old_participant_id = str(old.get('participant_id') or '').strip()
+                                    participants_are_compatible = not (
+                                        curr_participant_id
+                                        and old_participant_id
+                                        and curr_participant_id != old_participant_id
+                                    )
+                                    if (
+                                        participants_are_compatible
+                                        and size_close
+                                        and dx_ok2
+                                        and dy_ok2
+                                        and giou2 >= 0.70
+                                    ):
                                         is_dup = True
                                         dup_reason = "unknown_reid_jitter"
                                         logger.info(f"[Detector-{self.source_id}] ID {tid} UNKNOWN疑似摆动/ID切换重复过线，抑制输出")

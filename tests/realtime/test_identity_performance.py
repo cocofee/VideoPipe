@@ -89,6 +89,13 @@ def test_live_monitor_reports_identity_and_queue_metrics_without_extra_refreshes
             "identity_ambiguities": 1,
             "queue_depth": 3,
             "dropped_frames": 4,
+            "consumer_skipped_frames": 6,
+            "discarded_frames": 10,
+            "drop_rate": 0.20,
+            "capture_fps": 50.0,
+            "inference_fps": 19.0,
+            "queue_latency_ms": 18.0,
+            "end_to_end_latency_ms": 62.0,
         }
     )
     window = SimpleNamespace(
@@ -96,6 +103,8 @@ def test_live_monitor_reports_identity_and_queue_metrics_without_extra_refreshes
         _live_monitor_samples={},
         _live_monitor_window_seconds=30.0,
         _live_monitor_min_fps=12.0,
+        _live_monitor_warn_drop_rate=0.05,
+        _live_monitor_severe_drop_rate=0.15,
         video_threads={0: thread},
         _fps_0=20.0,
     )
@@ -109,4 +118,12 @@ def test_live_monitor_reports_identity_and_queue_metrics_without_extra_refreshes
     assert evaluation["identity_ambiguities"] == 1
     assert evaluation["queue_depth_max"] == 3
     assert evaluation["dropped_frames"] == 4
+    assert evaluation["consumer_skipped_frames"] == 6
+    assert evaluation["discarded_frames"] == 10
+    assert evaluation["drop_rate"] == 0.20
+    assert evaluation["capture_fps"] == 50.0
+    assert evaluation["inference_fps"] == 19.0
+    assert evaluation["display_fps"] == 20.0
+    assert evaluation["level"] == "danger"
+    assert "丢帧=10 (20.0%)" in evaluation["detail"]
     assert "身份=2" in evaluation["detail"]

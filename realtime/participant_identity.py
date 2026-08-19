@@ -75,14 +75,19 @@ class ParticipantIdentityManager:
         self._fragment_merge_count = 0
         self._ambiguity_count = 0
 
-    def resolve(self, observation: ParticipantObservation) -> IdentityResolution:
+    def resolve(
+        self,
+        observation: ParticipantObservation,
+        excluded_participant_ids: Optional[set[str]] = None,
+    ) -> IdentityResolution:
         """Resolve one observation to an existing or newly created participant."""
 
         self.prune_expired(observation.capture_time_ms)
+        excluded_participant_ids = set(excluded_participant_ids or ())
         raw_track_key = self._raw_track_key(observation)
         if raw_track_key is not None:
             participant_id = self._raw_track_map.get(raw_track_key)
-            if participant_id is not None:
+            if participant_id is not None and participant_id not in excluded_participant_ids:
                 participant = self._participants.get(participant_id)
                 if participant is None:
                     self._raw_track_map.pop(raw_track_key, None)
@@ -108,7 +113,7 @@ class ParticipantIdentityManager:
                     )
 
         candidates = sorted(
-            self._match_candidates(observation),
+            self._match_candidates(observation, excluded_participant_ids),
             key=lambda candidate: candidate.score,
             reverse=True,
         )
@@ -204,10 +209,15 @@ class ParticipantIdentityManager:
         return tuple(reasons)
 
     def _match_candidates(
-        self, observation: ParticipantObservation
+        self,
+        observation: ParticipantObservation,
+        excluded_participant_ids: Optional[set[str]] = None,
     ) -> list[_MatchCandidate]:
+        excluded_participant_ids = set(excluded_participant_ids or ())
         candidates = []
         for participant_id, participant in self._participants.items():
+            if participant_id in excluded_participant_ids:
+                continue
             state = self._states[participant_id]
             if (
                 state.source_id != observation.source_id

@@ -108,10 +108,23 @@ def test_local_video_plays_first_frame_once_and_stops_at_eof(monkeypatch):
     assert capture.released is True
 
 
-def test_video_file_source_detection_excludes_cameras_and_rtsp():
+def test_source_detection_distinguishes_local_files_and_live_protocols():
     assert StreamReader.is_video_file_source("race.mp4") is True
-    assert StreamReader.is_video_file_source("rtsp://camera/live") is False
+    assert StreamReader.is_video_file_source(r"C:\race videos\race.mkv") is True
+    assert StreamReader.is_video_file_source("file:///C:/race/race.mp4") is True
     assert StreamReader.is_video_file_source(0) is False
+    assert StreamReader.is_live_source(0) is True
+    for source in (
+        "rtsp://camera/live",
+        "rtsps://camera/live",
+        "rtmp://camera/live",
+        "rtmps://camera/live",
+        "http://camera/live.m3u8",
+        "https://camera/live.m3u8",
+        "srt://camera:9000",
+    ):
+        assert StreamReader.is_live_source(source) is True
+        assert StreamReader.is_video_file_source(source) is False
 
 
 def test_bounded_queue_drops_oldest_frame_and_reports_metrics(monkeypatch):
@@ -139,6 +152,8 @@ def test_bounded_queue_drops_oldest_frame_and_reports_metrics(monkeypatch):
     assert all(envelope.arrival_time_ms > 0 for envelope in envelopes)
     assert reader.queue_depth == 0
     assert reader.get_info()["dropped_frame_count"] == 1
+    assert reader.get_info()["discarded_frame_count"] == 1
+    assert reader.get_info()["drop_rate"] == 1 / 3
 
 
 def test_get_latest_frame_envelope_discards_stale_inference_frames():
@@ -160,6 +175,9 @@ def test_get_latest_frame_envelope_discards_stale_inference_frames():
     assert envelope.frame_index == 2
     assert reader.queue_depth == 0
     assert reader.get_info()["consumer_skipped_frame_count"] == 2
+    reader._frame_count = 3
+    assert reader.get_info()["discarded_frame_count"] == 2
+    assert reader.get_info()["drop_rate"] == 2 / 3
 
 
 class _LiveCapture:
@@ -218,6 +236,20 @@ def test_queue_size_is_separate_from_capture_buffer_size(monkeypatch):
     assert reader.queue_capacity == 5
     assert (cv2.CAP_PROP_BUFFERSIZE, 3) in capture.set_calls
     assert StreamReader("unused").queue_capacity == 8
+
+
+def test_blocking_overflow_policy_preserves_queued_frame_order():
+    reader = StreamReader("race.mp4", queue_size=2, overflow_policy="block")
+    reader._running = True
+    first = FrameEnvelope("first", 0, 0.0, 1.0, 0)
+    second = FrameEnvelope("second", 1, 40.0, 41.0, 0)
+
+    reader._enqueue_envelope(first)
+    reader._enqueue_envelope(second)
+
+    assert reader.get_frame_envelope() is first
+    assert reader.get_frame_envelope() is second
+    assert reader.dropped_frame_count == 0
 
 
 def test_live_timestamps_and_legacy_frame_time_use_wall_clock(monkeypatch):

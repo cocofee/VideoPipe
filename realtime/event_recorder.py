@@ -84,8 +84,12 @@ class EventRecorder:
         self._snapshot_queue: queue.Queue = queue.Queue(maxsize=20)
         
         self._running = False
+        self._accepting_events = False
         self._thread: Optional[threading.Thread] = None
         self._snapshot_thread: Optional[threading.Thread] = None
+        self._lifecycle_lock = threading.RLock()
+        self._stop_lock = threading.Lock()
+        self._restart_blocked = False
 
         # 回调
         self._on_event_saved: Optional[Callable[[int], None]] = None
@@ -151,8 +155,17 @@ class EventRecorder:
 
     def start(self):
         """启动记录器"""
-        if self._running:
-            return
+        with self._lifecycle_lock:
+            if self._restart_blocked:
+                raise RuntimeError("EventRecorder 停止未完成，禁止重新启动")
+            if self._thread and self._thread.is_alive():
+                if self._running:
+                    return
+                raise RuntimeError("EventRecorder 保存线程仍在退出")
+            if self._snapshot_thread and self._snapshot_thread.is_alive():
+                raise RuntimeError("EventRecorder 抓拍线程仍在退出")
+            if self._running:
+                return
 
         # 启动时同步一次数据库中的已存号码，初始化缓存（仅在启用去重时）
         if self.enable_dedup:
@@ -186,53 +199,83 @@ class EventRecorder:
         else:
             logger.info(f"[EventRecorder] 号码去重已禁用（耐力测试模式）")
 
-        self._running = True
-        
-        # 启动保存线程
-        self._thread = threading.Thread(target=self._process_loop, daemon=True)
-        self._thread.start()
+        with self._lifecycle_lock:
+            self._running = True
+            self._accepting_events = True
+            # 启动保存线程
+            self._thread = threading.Thread(target=self._process_loop, daemon=True)
+            self._thread.start()
 
-        # 启动抓拍线程
-        self._snapshot_thread = threading.Thread(target=self._snapshot_loop, daemon=True)
-        self._snapshot_thread.start()
+            # 启动抓拍线程
+            self._snapshot_thread = threading.Thread(target=self._snapshot_loop, daemon=True)
+            self._snapshot_thread.start()
             
         logger.info(f"[EventRecorder] 已启动，输出目录: {self.output_dir}")
 
     def stop(self):
         """停止记录器"""
-        self._running = False
-        if self._thread:
-            try:
-                self._queue.put_nowait(None)
-            except queue.Full:
-                with self._queue.mutex:
-                    self._queue.queue.clear()
-                    self._queue.unfinished_tasks = 0
-                    self._queue.all_tasks_done.notify_all()
-                try:
-                    self._queue.put_nowait(None)
-                except queue.Full:
-                    logger.error("[EventRecorder] 停止时保存队列仍然满，跳过哨兵入队")
-            self._thread.join(timeout=2)
-            self._thread = None
-        
-        if self._snapshot_thread:
-            try:
-                self._snapshot_queue.put_nowait(None)
-            except queue.Full:
-                with self._snapshot_queue.mutex:
-                    self._snapshot_queue.queue.clear()
-                    self._snapshot_queue.unfinished_tasks = 0
-                    self._snapshot_queue.all_tasks_done.notify_all()
-                    self._snapshot_queue.not_full.notify_all()
-                try:
-                    self._snapshot_queue.put_nowait(None)
-                except queue.Full:
-                    logger.error("[EventRecorder] 停止时抓拍队列仍然满，跳过哨兵入队")
-            self._snapshot_thread.join(timeout=2)
-            self._snapshot_thread = None
+        with self._stop_lock:
+            with self._lifecycle_lock:
+                if not self._running and not self._thread and not self._snapshot_thread:
+                    return True
+                self._accepting_events = False
+
+            self._drain_queue(self._queue, "保存", timeout=5.0)
+            if self._thread:
+                self._put_stop_sentinel(self._queue, "保存")
+                self._thread.join(timeout=5)
+                if self._thread.is_alive():
+                    logger.error("[EventRecorder] 保存线程在停止超时后仍未退出，未清空队列")
+                else:
+                    self._thread = None
+
+            self._drain_queue(self._snapshot_queue, "抓拍", timeout=5.0)
+            if self._snapshot_thread:
+                self._put_stop_sentinel(self._snapshot_queue, "抓拍")
+                self._snapshot_thread.join(timeout=5)
+                if self._snapshot_thread.is_alive():
+                    logger.error("[EventRecorder] 抓拍线程在停止超时后仍未退出，未清空队列")
+                else:
+                    self._snapshot_thread = None
+
+            clean = not any(
+                thread is not None and thread.is_alive()
+                for thread in (self._thread, self._snapshot_thread)
+            )
+            with self._lifecycle_lock:
+                self._running = False
+                self._restart_blocked = not clean
             
         logger.info(f"[EventRecorder] 已停止，共保存 {self._saved_count} 个事件，丢弃关键事件 {self._dropped_critical_count} 个")
+        return clean
+
+    @property
+    def restart_blocked(self) -> bool:
+        with self._lifecycle_lock:
+            return self._restart_blocked
+
+    @staticmethod
+    def _drain_queue(work_queue: queue.Queue, name: str, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while time.monotonic() < deadline:
+            with work_queue.mutex:
+                unfinished = work_queue.unfinished_tasks
+            if unfinished == 0:
+                return True
+            time.sleep(0.01)
+        with work_queue.mutex:
+            unfinished = work_queue.unfinished_tasks
+        if unfinished:
+            logger.error(f"[EventRecorder] 停止时{name}队列未排空，剩余任务={unfinished}")
+            return False
+        return True
+
+    @staticmethod
+    def _put_stop_sentinel(work_queue: queue.Queue, name: str) -> None:
+        try:
+            work_queue.put(None, timeout=5.0)
+        except queue.Full:
+            logger.error(f"[EventRecorder] 停止时{name}队列无法写入哨兵，未清空队列")
 
     def set_enable_dedup(self, enabled: bool):
         """设置是否启用号码去重"""
@@ -282,11 +325,12 @@ class EventRecorder:
         Args:
             event: 过线事件
         """
-        if not self._running:
-            logger.warning("[EventRecorder] 记录器未运行，无法保存事件")
-            return
-        logger.debug(f"[EventRecorder] 收到事件并加入队列: ID={event.track_id}, Bib={event.bib_number}")
-        self._enqueue_critical_event(event)
+        with self._lifecycle_lock:
+            if not self._accepting_events:
+                logger.warning("[EventRecorder] 记录器未运行，无法保存事件")
+                return
+            logger.debug(f"[EventRecorder] 收到事件并加入队列: ID={event.track_id}, Bib={event.bib_number}")
+            self._enqueue_critical_event(event)
 
     def _enqueue_critical_event(self, event: CrossingEvent):
         try:
@@ -311,8 +355,12 @@ class EventRecorder:
                     kept.append(it)
                 for it in kept:
                     q.append(it)
-                self._queue.unfinished_tasks = len(q)
-                self._queue.all_tasks_done.notify_all()
+                self._queue.unfinished_tasks = max(
+                    0,
+                    self._queue.unfinished_tasks - dropped,
+                )
+                if self._queue.unfinished_tasks == 0:
+                    self._queue.all_tasks_done.notify_all()
                 self._queue.not_full.notify_all()
         except Exception as e:
             logger.warning(f"[EventRecorder] 清理队列失败，将后台阻塞入队: {e}")
@@ -354,7 +402,7 @@ class EventRecorder:
         """
         更新现有事件的截图 (异步)
         """
-        if not self._running:
+        if not self._accepting_events:
             return
             
         # 构造一个特殊的 CrossingEvent 用于更新
@@ -377,16 +425,19 @@ class EventRecorder:
             bib_crop=bib_crop,
             is_update_only=True
         )
-        try:
-            self._queue.put_nowait(update_event)
-        except queue.Full:
-            logger.warning(f"[EventRecorder] 队列已满，丢弃补图更新: event_id={event_id}, source_id={source_id}")
+        with self._lifecycle_lock:
+            if not self._accepting_events:
+                return
+            try:
+                self._queue.put_nowait(update_event)
+            except queue.Full:
+                logger.warning(f"[EventRecorder] 队列已满，丢弃补图更新: event_id={event_id}, source_id={source_id}")
 
     def update_event_info(self, event_id: int, bib: str, conf: float, status: Any, source_id: int, track_id: Optional[int] = None):
         """
         异步更新事件文本信息 (号码、置信度、状态)
         """
-        if not self._running:
+        if not self._accepting_events:
             return
             
         update_event = CrossingEvent(
@@ -405,10 +456,13 @@ class EventRecorder:
             source_id=source_id,
             is_info_update=True
         )
-        try:
-            self._queue.put_nowait(update_event)
-        except queue.Full:
-            logger.warning(f"[EventRecorder] 队列已满，丢弃补录信息更新: event_id={event_id}, source_id={source_id}")
+        with self._lifecycle_lock:
+            if not self._accepting_events:
+                return
+            try:
+                self._queue.put_nowait(update_event)
+            except queue.Full:
+                logger.warning(f"[EventRecorder] 队列已满，丢弃补录信息更新: event_id={event_id}, source_id={source_id}")
 
     def save_hard_example(self, frame: np.ndarray, bib_crop: Optional[np.ndarray], bib_bbox: List[int], ocr_text: Optional[str]):
         """
@@ -450,12 +504,16 @@ class EventRecorder:
 
     def _process_loop(self):
         """处理循环"""
-        while self._running:
+        while True:
             try:
                 event = self._queue.get(timeout=1)
                 if event is None:
+                    self._queue.task_done()
                     break
-                self._save_event(event)
+                try:
+                    self._save_event(event)
+                finally:
+                    self._queue.task_done()
             except queue.Empty:
                 continue
             except Exception as e:
@@ -463,54 +521,56 @@ class EventRecorder:
 
     def _snapshot_loop(self):
         """高清抓拍循环 (ISAPI)"""
-        while self._running:
+        while True:
             try:
                 task = self._snapshot_queue.get(timeout=1)
                 if task is None:
+                    self._snapshot_queue.task_done()
                     break
-                
-                event_id = task.get('event_id')
-                source_id = task.get('source_id')
-                time_str = task.get('time_str')
-                
-                config = self.camera_configs.get(source_id)
-                if not config:
-                    continue
-                
-                # 海康 ISAPI 抓拍 URL (通道 101 通常是主码流)
-                url = f"http://{config['ip']}/ISAPI/Streaming/channels/101/picture"
-                
                 try:
-                    response = requests.get(
-                        url, 
-                        auth=HTTPDigestAuth(config['user'], config['pass']),
-                        timeout=5
-                    )
-                    
-                    if response.status_code == 200:
-                        filename = f"isapi_{event_id:03d}_S{source_id}_{time_str}.jpg"
-                        save_path = self.screenshot_isapi_dir / filename
-                        
-                        with open(save_path, "wb") as f:
-                            f.write(response.content)
-                        
-                        # 将抓拍关联至证据链
-                        evidence_data = {
-                            'event_id': event_id,
-                            'source_id': source_id,
-                            'screenshot_full': str(save_path),
-                            'confidence': 1.0
-                        }
-                        if self.source_count <= 1:
-                            self.database.upsert_best_evidence(event_id, evidence_data)
+                    event_id = task.get('event_id')
+                    source_id = task.get('source_id')
+                    time_str = task.get('time_str')
+
+                    config = self.camera_configs.get(source_id)
+                    if not config:
+                        continue
+
+                    # 海康 ISAPI 抓拍 URL (通道 101 通常是主码流)
+                    url = f"http://{config['ip']}/ISAPI/Streaming/channels/101/picture"
+
+                    try:
+                        response = requests.get(
+                            url,
+                            auth=HTTPDigestAuth(config['user'], config['pass']),
+                            timeout=5
+                        )
+
+                        if response.status_code == 200:
+                            filename = f"isapi_{event_id:03d}_S{source_id}_{time_str}.jpg"
+                            save_path = self.screenshot_isapi_dir / filename
+
+                            with open(save_path, "wb") as f:
+                                f.write(response.content)
+
+                            # 将抓拍关联至证据链
+                            evidence_data = {
+                                'event_id': event_id,
+                                'source_id': source_id,
+                                'screenshot_full': str(save_path),
+                                'confidence': 1.0
+                            }
+                            if self.source_count <= 1:
+                                self.database.upsert_best_evidence(event_id, evidence_data)
+                            else:
+                                self.database.insert_evidence(evidence_data)
+                            logger.info(f"[EventRecorder] 已保存 ISAPI 高清抓拍: {filename}")
                         else:
-                            self.database.insert_evidence(evidence_data)
-                        logger.info(f"[EventRecorder] 已保存 ISAPI 高清抓拍: {filename}")
-                    else:
-                        logger.warning(f"[EventRecorder] ISAPI 抓拍失败: HTTP {response.status_code}")
-                except Exception as e:
-                    logger.error(f"[EventRecorder] ISAPI 请求异常: {e}")
-                    
+                            logger.warning(f"[EventRecorder] ISAPI 抓拍失败: HTTP {response.status_code}")
+                    except Exception as e:
+                        logger.error(f"[EventRecorder] ISAPI 请求异常: {e}")
+                finally:
+                    self._snapshot_queue.task_done()
             except queue.Empty:
                 continue
             except Exception as e:

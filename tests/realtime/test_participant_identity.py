@@ -209,6 +209,36 @@ def test_simultaneous_adjacent_riders_never_merge():
     assert right.created is True
 
 
+def test_participant_already_used_in_frame_is_not_reused_by_exact_track_mapping():
+    manager = ParticipantIdentityManager(config=IdentityConfig())
+    first = manager.resolve(
+        observation(track_id=405, time_ms=1000, bbox=(100, 100, 200, 300))
+    )
+
+    collision = manager.resolve(
+        observation(track_id=405, time_ms=1040, bbox=(400, 100, 500, 300)),
+        excluded_participant_ids={first.participant.participant_id},
+    )
+
+    assert collision.participant.participant_id != first.participant.participant_id
+    assert collision.created is True
+
+
+def test_participant_already_used_in_frame_is_not_reused_by_fragment_match():
+    manager = ParticipantIdentityManager(config=IdentityConfig())
+    first = manager.resolve(
+        observation(track_id=405, time_ms=1000, bbox=(100, 100, 200, 300))
+    )
+
+    collision = manager.resolve(
+        observation(track_id=605, time_ms=1040, bbox=(105, 100, 205, 300)),
+        excluded_participant_ids={first.participant.participant_id},
+    )
+
+    assert collision.participant.participant_id != first.participant.participant_id
+    assert collision.created is True
+
+
 def test_similar_bib_layout_only_supports_a_geometrically_valid_match():
     manager = ParticipantIdentityManager(config=IdentityConfig())
     first = manager.resolve(

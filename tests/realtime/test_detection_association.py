@@ -9,6 +9,7 @@ from realtime.detector import (
     Detector,
     LOCAL_VIDEO_EVENT_SETTLE_SECONDS,
     TrackState,
+    resolve_athlete_detector_model,
     resolve_athlete_validator_model,
     resolve_performance_profile,
 )
@@ -130,6 +131,24 @@ class _EmptyTrackingModel:
         return []
 
 
+class _SequencedPersonDetectorModel:
+    def __init__(self, predictions):
+        self.predictions = list(predictions)
+        self.calls = 0
+        self.kwargs = []
+
+    def predict(self, source, **kwargs):
+        prediction = self.predictions[min(self.calls, len(self.predictions) - 1)]
+        self.calls += 1
+        self.kwargs.append(kwargs)
+        boxes = _SimpleBoxes(
+            cls=[0] * len(prediction),
+            conf=[item[0] for item in prediction],
+            xyxy=[item[1] for item in prediction],
+        )
+        return [SimpleNamespace(boxes=boxes, names={0: "person"})]
+
+
 class _Boxes:
     def __init__(self):
         self.cls = np.asarray([0, 1], dtype=np.float32)
@@ -157,6 +176,23 @@ class _OriginalFrameTrackingModel:
         return [SimpleNamespace(boxes=_Boxes(), names=self.names)]
 
 
+class _PrimarySpeedSkatingPersonModel:
+    names = {0: "person"}
+
+    def __init__(self):
+        self.kwargs = None
+
+    def track(self, frame, **kwargs):
+        self.kwargs = kwargs
+        boxes = _SimpleBoxes(
+            cls=[0, 0],
+            conf=[0.95, 0.90],
+            xyxy=[[80, 80, 160, 220], [300, 250, 420, 540]],
+            ids=[7, 8],
+        )
+        return [SimpleNamespace(boxes=boxes, names=self.names)]
+
+
 class _VerticalFinishCrossingModel:
     names = {0: "person"}
 
@@ -170,6 +206,23 @@ class _VerticalFinishCrossingModel:
             conf=[0.95],
             xyxy=[[center_x - 50, 300, center_x + 50, 500]],
             ids=[11],
+        )
+        return [SimpleNamespace(boxes=boxes, names=self.names)]
+
+
+class _FragmentedVerticalFinishCrossingModel:
+    names = {0: "person"}
+
+    def __init__(self):
+        self._observations = iter(((101, 400), (101, 350), (202, 300)))
+
+    def track(self, frame, **kwargs):
+        track_id, center_x = next(self._observations)
+        boxes = _SimpleBoxes(
+            cls=[0],
+            conf=[0.95],
+            xyxy=[[center_x - 50, 300, center_x + 50, 500]],
+            ids=[track_id],
         )
         return [SimpleNamespace(boxes=boxes, names=self.names)]
 
@@ -1027,6 +1080,38 @@ def test_crossing_lifecycle_admits_by_participant_before_allocating_event_id():
     assert snapshot.raw_track_ids == (101, 202)
 
 
+def test_unknown_reid_jitter_does_not_suppress_distinct_participant_events():
+    frame = np.zeros((320, 320, 3), dtype=np.uint8)
+    detector = Detector(
+        model_path="fake.pt",
+        model=_EmptyTrackingModel(),
+        ocr=None,
+        athlete_validator=_ValidatorModel(["bicycle"]),
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+
+    first_state = _pending_crossing_state(frame, 101)
+    first_state.pending_event_data["participant_id"] = "P000004"
+    detector._track_states[101] = first_state
+    first_events, _, _ = detector.process_frame(frame, timestamp=1.0)
+
+    second_state = _pending_crossing_state(frame, 202)
+    second_state.pending_event_data.update(
+        {
+            "participant_id": "P000005",
+            "bbox": [104, 120, 184, 280],
+        }
+    )
+    second_state.best_athlete_crop = frame[120:280, 104:184].copy()
+    detector._track_states[202] = second_state
+    second_events, _, _ = detector.process_frame(frame, timestamp=1.3)
+
+    assert [event.event_id for event in first_events] == [1]
+    assert [event.event_id for event in second_events] == [2]
+    assert second_events[0].participant_id == "P000005"
+
+
 def test_rejected_bib_candidate_does_not_consume_event_id():
     frame = np.zeros((320, 320, 3), dtype=np.uint8)
     detector = Detector(
@@ -1199,6 +1284,80 @@ def test_raw_near_track_person_is_kept_when_tracker_drops_new_athlete():
     assert {athlete["track_id"] for athlete in athletes} == {11, 900000}
 
 
+def test_speed_skating_generic_person_detector_recovers_trackside_people():
+    person_detector = _SequencedPersonDetectorModel([
+        [
+            (0.92, [80, 80, 160, 220]),
+            (0.88, [400, 250, 520, 540]),
+        ],
+        [
+            (0.91, [340, 250, 460, 540]),
+        ],
+    ])
+    detector = Detector(
+        model_path="fake.pt",
+        model=_EmptyTrackingModel(),
+        ocr=None,
+        athlete_detector=person_detector,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    _, first_athletes, _ = detector.process_frame(frame, timestamp=0.0)
+    _, second_athletes, _ = detector.process_frame(frame, timestamp=0.04)
+
+    assert [athlete["bbox"] for athlete in first_athletes] == [[400, 250, 520, 540]]
+    assert [athlete["bbox"] for athlete in second_athletes] == [[340, 250, 460, 540]]
+    assert first_athletes[0]["track_id"] == second_athletes[0]["track_id"] == 920000
+    assert first_athletes[0]["athlete_detector"] == "yolo11_person"
+    assert person_detector.kwargs[0]["classes"] == [0]
+
+
+def test_speed_skating_primary_person_detector_rejects_spectator_boxes():
+    model = _PrimarySpeedSkatingPersonModel()
+    detector = Detector(
+        model_path="fake.pt",
+        model=model,
+        ocr=None,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+    _, athletes, _ = detector.process_frame(frame, timestamp=0.0)
+
+    assert [athlete["bbox"] for athlete in athletes] == [[300, 250, 420, 540]]
+    assert athletes[0]["track_id"] == 8
+    assert model.kwargs["classes"] == [0]
+
+
+def test_speed_skating_generic_person_detector_deduplicates_custom_athlete_box():
+    person_detector = _SequencedPersonDetectorModel([
+        [(0.90, [610, 360, 990, 990])],
+    ])
+    detector = Detector(
+        model_path="fake.pt",
+        model=_OriginalFrameTrackingModel(),
+        ocr=None,
+        athlete_detector=person_detector,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    _, athletes, _ = detector.process_frame(frame, timestamp=0.0)
+
+    assert len(athletes) == 1
+    assert athletes[0]["track_id"] == 11
+
+
 def test_edge_entry_athlete_keeps_raw_box_when_tracker_clips_it_too_narrow():
     detector = Detector(
         model_path="fake.pt",
@@ -1344,6 +1503,37 @@ def test_speed_skating_unknown_athlete_crosses_vertical_finish_line():
         detector.stop()
 
 
+def test_speed_skating_crossing_survives_raw_track_fragment_switch():
+    detector = Detector(
+        model_path="fake.pt",
+        model=_FragmentedVerticalFinishCrossingModel(),
+        ocr=None,
+        event_settle_seconds=0.0,
+        sport_profile="speed_skating",
+    )
+    detector.enable_static_background_filter = False
+    detector.enable_finish_segment_filter = False
+    detector.adaptive_frame_skip = False
+    detector.set_finish_line((320, 100), (320, 600))
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    try:
+        events = []
+        participants = []
+        for timestamp in (0.0, 0.1, 0.2):
+            frame_events, athletes, _ = detector.process_frame(frame, timestamp=timestamp)
+            events.extend(frame_events)
+            participants.extend(athlete["participant_id"] for athlete in athletes)
+
+        assert len(events) == 1
+        assert events[0].track_id == 202
+        assert len(set(participants)) == 1
+        assert detector._track_states[202].start_time == 0.0
+        assert detector._track_states[202].prev_x == 300
+    finally:
+        detector.stop()
+
+
 def test_speed_skating_finish_segment_margin_accepts_upper_endpoint_crossing():
     detector = Detector(
         model_path="fake.pt",
@@ -1404,6 +1594,17 @@ def test_resolve_athlete_validator_prefers_config_then_default(tmp_path):
 
     assert resolve_athlete_validator_model(str(configured), [fallback_root]) == configured.resolve()
     assert resolve_athlete_validator_model("", [fallback_root]) == fallback.resolve()
+
+
+def test_resolve_athlete_detector_prefers_yolo11s_sibling(tmp_path):
+    fallback_root = tmp_path / "fallback"
+    fallback_root.mkdir()
+    nano = fallback_root / "yolo11n.pt"
+    small = fallback_root / "yolo11s.pt"
+    nano.write_bytes(b"nano")
+    small.write_bytes(b"small")
+
+    assert resolve_athlete_detector_model("", [fallback_root]) == small.resolve()
 
 
 def test_small_high_contrast_bib_crop_is_penalized():

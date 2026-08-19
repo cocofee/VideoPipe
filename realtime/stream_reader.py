@@ -11,6 +11,7 @@ import time
 from collections import deque
 from typing import Optional, Tuple, Callable
 from enum import Enum
+from urllib.parse import urlsplit
 
 try:
     from .frame_envelope import FrameEnvelope
@@ -57,6 +58,16 @@ class StreamReader:
         reader.stop()
     """
 
+    _LIVE_SOURCE_SCHEMES = {
+        "rtsp",
+        "rtsps",
+        "rtmp",
+        "rtmps",
+        "http",
+        "https",
+        "srt",
+    }
+
     def __init__(self, source, buffer_size: int = 1, queue_size: int = 8,
                  overflow_policy: str = "drop_oldest"):
         """
@@ -71,8 +82,8 @@ class StreamReader:
         self.source = source
         self.buffer_size = max(1, int(buffer_size))
         self.queue_capacity = max(1, int(queue_size))
-        if overflow_policy not in {"drop_oldest", "drop_newest"}:
-            raise ValueError("overflow_policy must be 'drop_oldest' or 'drop_newest'")
+        if overflow_policy not in {"drop_oldest", "drop_newest", "block"}:
+            raise ValueError("overflow_policy must be 'drop_oldest', 'drop_newest', or 'block'")
         self.overflow_policy = overflow_policy
 
         # 状态
@@ -179,9 +190,28 @@ class StreamReader:
         self._on_frame = callback
 
     @staticmethod
-    def is_video_file_source(source) -> bool:
+    def _source_scheme(source) -> str:
+        if not isinstance(source, str):
+            return ""
+        value = source.strip()
+        if len(value) >= 3 and value[1] == ":" and value[2] in {"/", "\\"}:
+            return ""
+        return urlsplit(value).scheme.lower()
+
+    @classmethod
+    def is_live_source(cls, source) -> bool:
+        """Return whether the source should use realtime capture semantics."""
+        if isinstance(source, int):
+            return True
+        return cls._source_scheme(source) in cls._LIVE_SOURCE_SCHEMES
+
+    @classmethod
+    def is_video_file_source(cls, source) -> bool:
         """Return whether the source is a finite local video input."""
-        return isinstance(source, str) and not source.lower().startswith("rtsp")
+        if not isinstance(source, str):
+            return False
+        scheme = cls._source_scheme(source)
+        return scheme in {"", "file"}
 
     def _set_status(self, status: StreamStatus):
         """设置状态并触发回调"""
@@ -205,7 +235,7 @@ class StreamReader:
 
         try:
             # 创建VideoCapture
-            if isinstance(self.source, str) and self.source.startswith('rtsp'):
+            if self._source_scheme(self.source) in {"rtsp", "rtsps"}:
                 # RTSP流 - 使用 FFMPEG 插件
                 # 修复：通过环境变量设置超时，避免连接时卡死
                 import os
@@ -301,13 +331,21 @@ class StreamReader:
         return arrival_time_ms
 
     def _enqueue_envelope(self, envelope: FrameEnvelope) -> None:
-        with self._queue_lock:
-            if len(self._frame_queue) >= self.queue_capacity:
-                self._dropped_frame_count += 1
-                if self.overflow_policy == "drop_newest":
+        while True:
+            with self._queue_lock:
+                if len(self._frame_queue) < self.queue_capacity:
+                    self._frame_queue.append(envelope)
                     return
-                self._frame_queue.popleft()
-            self._frame_queue.append(envelope)
+                if self.overflow_policy != "block":
+                    self._dropped_frame_count += 1
+                    if self.overflow_policy == "drop_newest":
+                        return
+                    self._frame_queue.popleft()
+                    self._frame_queue.append(envelope)
+                    return
+            if not self._running:
+                return
+            time.sleep(0.001)
 
     def _read_loop(self):
         """读帧循环（在独立线程中运行）"""
@@ -512,6 +550,14 @@ class StreamReader:
         Returns:
             包含流信息的字典
         """
+        dropped_frame_count = self.dropped_frame_count
+        consumer_skipped_frame_count = self.consumer_skipped_frame_count
+        discarded_frame_count = dropped_frame_count + consumer_skipped_frame_count
+        drop_rate = (
+            min(1.0, discarded_frame_count / self._frame_count)
+            if self._frame_count > 0
+            else 0.0
+        )
         return {
             "source": self.source,
             "status": self.status.value,
@@ -528,6 +574,8 @@ class StreamReader:
             "queue_depth": self.queue_depth,
             "dropped_frame_count": self.dropped_frame_count,
             "consumer_skipped_frame_count": self.consumer_skipped_frame_count,
+            "discarded_frame_count": discarded_frame_count,
+            "drop_rate": drop_rate,
         }
 
 

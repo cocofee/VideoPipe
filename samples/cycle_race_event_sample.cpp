@@ -65,12 +65,44 @@ int main() {
         return 1;
     }
 
+    const std::string correction_payload = R"({
+        "schema_version": 1,
+        "message_type": "passage",
+        "event_id": "demo-race-final-0001",
+        "race_id": "demo-race",
+        "stage_id": "final",
+        "group_id": "men-open",
+        "sequence": 1,
+        "chip_id": "chip-23",
+        "bib": "23",
+        "passage_time_ms": 123400,
+        "lap": 1,
+        "source": "cyclerace",
+        "revision": 2
+    })";
+    const auto correction = ingestor.ingest_json(correction_payload);
+    if (correction != vp_utils::vp_passage_event_ingest_result::accepted ||
+        store.size() != 1 || store.events().front().revision != 2 ||
+        store.events().front().passage_time_ms != 123400) {
+        std::cerr << "event revision update was not accepted" << std::endl;
+        return 1;
+    }
+
+    const auto duplicate_correction = ingestor.ingest_json(correction_payload);
+    if (duplicate_correction != vp_utils::vp_passage_event_ingest_result::duplicate ||
+        store.size() != 1) {
+        std::cerr << "event revision idempotency check failed" << std::endl;
+        return 1;
+    }
+
     {
         std::ofstream corrupt_tail(journal_path, std::ios::out | std::ios::app | std::ios::binary);
         corrupt_tail << "{\"schema_version\":1";
     }
     vp_utils::vp_passage_event_store recovered_store(journal_path);
     if (recovered_store.size() != 1 || !recovered_store.contains("demo-race-final-0001") ||
+        recovered_store.events().front().revision != 2 ||
+        recovered_store.events().front().passage_time_ms != 123400 ||
         !recovered_store.recovered_incomplete_tail()) {
         std::cerr << "event recovery check failed" << std::endl;
         return 1;

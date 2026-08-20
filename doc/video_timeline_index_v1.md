@@ -53,6 +53,11 @@ checkpoint batch; a failed append remains queued for retry at the next segment b
 
 ## CycleRace mapping
 
+When CycleRace corrects a logical passage after a second chip arrives, it keeps the
+same `event_id` and increments `revision`. VideoPipe must update the indexed review
+target to the highest accepted revision; an older revision remains historical evidence
+but must not overwrite the newer race-time mapping.
+
 A CycleRace passage time is a race-clock value, not a computer wall-clock timestamp. Video
 lookup requires a calibration point:
 

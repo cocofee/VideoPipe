@@ -41,6 +41,9 @@ namespace vp_objects {
         if (emitted_at_ms < 0) {
             throw std::invalid_argument("passage event emitted_at_ms must not be negative");
         }
+        if (revision <= 0) {
+            throw std::invalid_argument("passage event revision must be positive");
+        }
     }
 
     void to_json(nlohmann::json& json, const vp_passage_event& event) {
@@ -59,6 +62,7 @@ namespace vp_objects {
             {"lap", event.lap},
             {"source", event.source},
             {"emitted_at_ms", event.emitted_at_ms},
+            {"revision", event.revision},
         };
     }
 
@@ -76,6 +80,7 @@ namespace vp_objects {
         event.lap = json.at("lap").get<int>();
         event.source = json.at("source").get<std::string>();
         event.emitted_at_ms = json.value("emitted_at_ms", static_cast<std::int64_t>(0));
+        event.revision = json.value("revision", 1);
         event.validate();
     }
 

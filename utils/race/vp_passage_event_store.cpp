@@ -24,7 +24,8 @@ namespace vp_utils {
                 left.passage_time_ms == right.passage_time_ms &&
                 left.lap == right.lap &&
                 left.source == right.source &&
-                left.emitted_at_ms == right.emitted_at_ms;
+                left.emitted_at_ms == right.emitted_at_ms &&
+                left.revision == right.revision;
         }
 
         bool is_incomplete_json_tail(const std::string& line) {
@@ -124,11 +125,29 @@ namespace vp_utils {
 
             try {
                 auto event = json.get<vp_objects::vp_passage_event>();
-                if (event_positions.find(event.event_id) != event_positions.end()) {
-                    throw std::runtime_error("duplicate event_id in passage event journal: " + event.event_id);
+                const auto existing = event_positions.find(event.event_id);
+                if (existing != event_positions.end()) {
+                    const auto& current = journal_events[existing->second];
+                    if (event.revision < current.revision) {
+                        offset = terminated ? line_end + 1 : content.size();
+                        continue;
+                    }
+                    if (event.revision == current.revision) {
+                        if (!same_event(current, event)) {
+                            throw std::runtime_error(
+                                "conflicting passage event revision in journal: " + event.event_id);
+                        }
+                        offset = terminated ? line_end + 1 : content.size();
+                        continue;
+                    }
                 }
-                event_positions[event.event_id] = journal_events.size();
-                journal_events.push_back(std::move(event));
+                if (existing != event_positions.end()) {
+                    journal_events[existing->second] = std::move(event);
+                }
+                else {
+                    event_positions[event.event_id] = journal_events.size();
+                    journal_events.push_back(std::move(event));
+                }
             }
             catch (const std::exception& error) {
                 throw std::runtime_error(
@@ -143,11 +162,17 @@ namespace vp_utils {
         std::lock_guard<std::mutex> guard(store_lock);
         const auto existing = event_positions.find(event.event_id);
         if (existing != event_positions.end()) {
-            if (!same_event(journal_events[existing->second], event)) {
-                throw vp_passage_event_conflict_error(
-                    "passage event_id was reused with different content: " + event.event_id);
+            const auto& current = journal_events[existing->second];
+            if (event.revision < current.revision) {
+                return false;
             }
-            return false;
+            if (event.revision == current.revision && !same_event(current, event)) {
+                throw vp_passage_event_conflict_error(
+                    "passage event revision was reused with different content: " + event.event_id);
+            }
+            if (event.revision == current.revision) {
+                return false;
+            }
         }
 
         nlohmann::json json = event;
@@ -167,8 +192,13 @@ namespace vp_utils {
             throw std::runtime_error("failed to append passage event journal: " + journal_path.string());
         }
 
-        event_positions[event.event_id] = journal_events.size();
-        journal_events.push_back(event);
+        if (existing != event_positions.end()) {
+            journal_events[existing->second] = event;
+        }
+        else {
+            event_positions[event.event_id] = journal_events.size();
+            journal_events.push_back(event);
+        }
         return true;
     }
 

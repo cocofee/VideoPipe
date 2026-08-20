@@ -4,7 +4,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 
 #include "vp_passage_event_store.h"
 
@@ -28,7 +28,7 @@ namespace vp_utils {
         vp_passage_event_store& event_store;
         std::mutex delivery_lock;
         std::function<void(const vp_objects::vp_passage_event&)> accepted_hooker;
-        std::unordered_set<std::string> delivered_event_ids;
+        std::unordered_map<std::string, int> delivered_event_revisions;
 
     public:
         explicit vp_passage_event_ingestor(vp_passage_event_store& event_store);

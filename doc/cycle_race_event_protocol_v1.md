@@ -25,7 +25,8 @@ the event, but does not directly overwrite official results.
   "passage_time_ms": 123456,
   "lap": 1,
   "source": "cyclerace",
-  "emitted_at_ms": 0
+  "emitted_at_ms": 0,
+  "revision": 1
 }
 ```
 
@@ -46,14 +47,19 @@ the event, but does not directly overwrite official results.
 | `lap` | yes | Zero for non-lap races, otherwise current lap |
 | `source` | yes | Normally `cyclerace` |
 | `emitted_at_ms` | no | Sender diagnostic timestamp; never used as official race time |
+| `revision` | no | Positive passage correction version; omitted legacy payloads mean `1` |
 
 ## Delivery semantics
 
 1. CycleRace may retry the same message after a timeout.
-2. VideoPipe deduplicates by `event_id`.
-3. A newly accepted event is appended to the local JSONL journal before the review callback runs.
-4. A restart reloads the journal and keeps the event idempotency index.
-5. A syntactically incomplete final JSONL line may be truncated during startup recovery;
+2. VideoPipe deduplicates by `event_id` and `revision`.
+3. A higher revision for the same `event_id` is an update (for example, a dual-chip
+   correction to `passage_time_ms`) and is appended to the journal.
+4. Repeating the same `event_id` and revision with identical content is a duplicate;
+   repeating a revision with different content is a conflict.
+5. A newly accepted event is appended to the local JSONL journal before the review callback runs.
+6. A restart reloads the journal and keeps the latest revision for each event id.
+7. A syntactically incomplete final JSONL line may be truncated during startup recovery;
    malformed complete lines and any middle-of-file corruption stop recovery with an explicit error.
 
 ## HTTP transport

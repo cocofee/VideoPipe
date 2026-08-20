@@ -36,7 +36,7 @@ namespace vp_utils {
         vp_passage_event_store(const vp_passage_event_store&) = delete;
         vp_passage_event_store& operator=(const vp_passage_event_store&) = delete;
 
-        // Returns false when event_id was already persisted.
+        // Returns false when this event revision was already persisted or is stale.
         bool append(const vp_objects::vp_passage_event& event);
         bool contains(const std::string& event_id) const;
         std::size_t size() const;

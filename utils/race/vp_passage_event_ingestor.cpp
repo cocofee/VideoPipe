@@ -12,17 +12,20 @@ namespace vp_utils {
         std::function<void(const vp_objects::vp_passage_event&)> hooker) {
         std::lock_guard<std::mutex> guard(delivery_lock);
         accepted_hooker = std::move(hooker);
-        delivered_event_ids.clear();
+        delivered_event_revisions.clear();
     }
 
     vp_passage_event_ingest_result vp_passage_event_ingestor::ingest(
         const vp_objects::vp_passage_event& event) {
         const auto appended = event_store.append(event);
         std::lock_guard<std::mutex> guard(delivery_lock);
-        if (accepted_hooker && delivered_event_ids.find(event.event_id) == delivered_event_ids.end()) {
+        const auto delivered = delivered_event_revisions.find(event.event_id);
+        const auto already_delivered = delivered != delivered_event_revisions.end()
+            && delivered->second >= event.revision;
+        if (accepted_hooker && !already_delivered) {
             try {
                 accepted_hooker(event);
-                delivered_event_ids.insert(event.event_id);
+                delivered_event_revisions[event.event_id] = event.revision;
             }
             catch (const std::exception& error) {
                 throw vp_passage_event_delivery_error(error.what());

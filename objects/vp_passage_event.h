@@ -31,6 +31,9 @@ namespace vp_objects {
         // Optional sender timestamp. It is diagnostic only, not the race time authority.
         std::int64_t emitted_at_ms = 0;
 
+        // Monotonic passage correction version. Legacy payloads default to 1.
+        int revision = 1;
+
         void validate() const;
     };
 

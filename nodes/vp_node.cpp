@@ -10,25 +10,35 @@ namespace vp_nodes {
 
     }
 
-    // there is only one thread poping data from the in_queue, we don't use lock here when poping.
-    // there is only one thread pushing data to the out_queue, we don't use lock here when pushing.
+    // Queues are bounded so slow downstream nodes apply backpressure instead of growing memory.
     void vp_node::handle_run() {
         // cache for batch handling if need
         std::vector<std::shared_ptr<vp_objects::vp_frame_meta>> frame_meta_batch_cache;
-        while (alive) {
+        while (true) {
             // wait for producer, make sure in_queue is not empty.
             this->in_queue_semaphore.wait();
 
-            VP_DEBUG(vp_utils::string_format("[%s] before handling meta, in_queue.size()==>%d", node_name.c_str(), in_queue.size()));
-            auto in_meta = this->in_queue.front();
-            
+            std::shared_ptr<vp_objects::vp_meta> in_meta;
+            std::size_t in_queue_size = 0;
+            {
+                std::lock_guard<std::mutex> guard(this->in_queue_lock);
+                if (this->in_queue.empty()) {
+                    continue;
+                }
+                in_meta = this->in_queue.front();
+                this->in_queue.pop();
+                in_queue_size = this->in_queue.size();
+            }
+            this->in_queue_not_full.notify_one();
+            VP_DEBUG(vp_utils::string_format("[%s] before handling meta, in_queue.size()==>%d", node_name.c_str(), static_cast<int>(in_queue_size)));
+
             // dead flag
             if (in_meta == nullptr) {
-                continue;
+                break;
             }
-            
+
             // handling hooker activated if need
-            invoke_meta_handling_hooker(node_name, in_queue.size(), in_meta);
+            invoke_meta_handling_hooker(node_name, in_queue_size, in_meta);
 
             std::shared_ptr<vp_objects::vp_meta> out_meta;
             auto batch_complete = false;
@@ -54,73 +64,82 @@ namespace vp_nodes {
                     } 
                     else {
                         // cache not complete, do nothing
-                        VP_DEBUG(vp_utils::string_format("[%s] handle meta with batch, frame_meta_batch_cache.size()==>%d", node_name.c_str(), frame_meta_batch_cache.size()));
+                        VP_DEBUG(vp_utils::string_format(
+                            "[%s] handle meta with batch, frame_meta_batch_cache.size()==>%d",
+                            node_name.c_str(),
+                            static_cast<int>(frame_meta_batch_cache.size())));
                     }
                 }
             }
             else {
                 throw "invalid meta type!";
             }
-            this->in_queue.pop();
-            VP_DEBUG(vp_utils::string_format("[%s] after handling meta, in_queue.size()==>%d", node_name.c_str(), in_queue.size()));
+            VP_DEBUG(vp_utils::string_format("[%s] after handling meta, in_queue.size()==>%d", node_name.c_str(), static_cast<int>(in_queue_size)));
 
             // one by one mode
             // return nullptr means do not push it to next nodes(such as in des nodes).
             if (out_meta != nullptr && node_type() != vp_node_type::DES) {
-                VP_DEBUG(vp_utils::string_format("[%s] before handling meta, out_queue.size()==>%d", node_name.c_str(), out_queue.size()));
-                this->out_queue.push(out_meta);
-
-                // handled hooker activated if need
-                invoke_meta_handled_hooker(node_name, out_queue.size(), out_meta);
-
-                // notify consumer of out_queue
-                this->out_queue_semaphore.signal();
-                VP_DEBUG(vp_utils::string_format("[%s] after handling meta, out_queue.size()==>%d", node_name.c_str(), out_queue.size()));
+                pendding_meta(out_meta);
             }
 
             // batch by batch mode
             if (batch_complete && node_type() != vp_node_type::DES) {
                 // push to out_queue one by one
                 for (auto& i: frame_meta_batch_cache) {
-                    VP_DEBUG(vp_utils::string_format("[%s] before handling meta, out_queue.size()==>%d", node_name.c_str(), out_queue.size()));
-                    this->out_queue.push(i);
-
-                    // handled hooker activated if need
-                    invoke_meta_handled_hooker(node_name, out_queue.size(), i);
-
-                    // notify consumer of out_queue
-                    this->out_queue_semaphore.signal();
-                    VP_DEBUG(vp_utils::string_format("[%s] after handling meta, out_queue.size()==>%d", node_name.c_str(), out_queue.size()));
+                    pendding_meta(i);
                 }
                 // clean cache for the next batch
                 frame_meta_batch_cache.clear();
             }
         }
-        // send dead flag for dispatch_thread
-        this->out_queue.push(nullptr);
-        this->out_queue_semaphore.signal();
-    }
 
-    // there is only one thread poping from the out_queue, we don't use lock here when poping.
+        // Flush a partial batch on shutdown so queued frames are not silently lost.
+        if (!frame_meta_batch_cache.empty() && node_type() != vp_node_type::DES) {
+            this->handle_frame_meta(frame_meta_batch_cache);
+            for (auto& meta: frame_meta_batch_cache) {
+                pendding_meta(meta);
+            }
+            frame_meta_batch_cache.clear();
+        }
+
+        // send dead flag for dispatch_thread
+        pendding_meta(nullptr);
+    }
     void vp_node::dispatch_run() {
-        while (alive) {
+        while (true) {
             // wait for producer, make sure out_queue is not empty.
             this->out_queue_semaphore.wait();
 
-            VP_DEBUG(vp_utils::string_format("[%s] before dispatching meta, out_queue.size()==>%d", node_name.c_str(), out_queue.size()));
-            auto out_meta = this->out_queue.front();
+            std::shared_ptr<vp_objects::vp_meta> out_meta;
+            std::size_t out_queue_size = 0;
+            {
+                std::lock_guard<std::mutex> guard(this->out_queue_lock);
+                if (this->out_queue.empty()) {
+                    continue;
+                }
+                out_meta = this->out_queue.front();
+                this->out_queue.pop();
+                out_queue_size = this->out_queue.size();
+            }
+            this->out_queue_not_full.notify_one();
+            VP_DEBUG(vp_utils::string_format(
+                "[%s] before dispatching meta, out_queue.size()==>%d",
+                node_name.c_str(),
+                static_cast<int>(out_queue_size)));
             // dead flag
             if (out_meta == nullptr) {
-                continue;
+                break;
             }
 
             // leaving hooker activated if need
-            invoke_meta_leaving_hooker(node_name, out_queue.size(), out_meta);
+            invoke_meta_leaving_hooker(node_name, out_queue_size, out_meta);
 
             // do something..
             this->push_meta(out_meta);
-            this->out_queue.pop();
-            VP_DEBUG(vp_utils::string_format("[%s] after dispatching meta, out_queue.size()==>%d", node_name.c_str(), out_queue.size()));
+            VP_DEBUG(vp_utils::string_format(
+                "[%s] after dispatching meta, out_queue.size()==>%d",
+                node_name.c_str(),
+                static_cast<int>(out_queue_size)));
         }
     }
 
@@ -141,8 +160,14 @@ namespace vp_nodes {
             return;
         }
 
-        std::lock_guard<std::mutex> guard(this->in_queue_lock);
-        VP_DEBUG(vp_utils::string_format("[%s] before meta flow, in_queue.size()==>%d", node_name.c_str(), in_queue.size()));
+        std::unique_lock<std::mutex> guard(this->in_queue_lock);
+        this->in_queue_not_full.wait(guard, [this]() {
+            return !this->alive || this->in_queue.size() < this->max_in_queue_size;
+        });
+        if (!this->alive) {
+            return;
+        }
+        VP_DEBUG(vp_utils::string_format("[%s] before meta flow, in_queue.size()==>%d", node_name.c_str(), static_cast<int>(in_queue.size())));
         this->in_queue.push(meta);
 
         // arriving hooker activated if need
@@ -150,7 +175,7 @@ namespace vp_nodes {
         
         // notify consumer of in_queue
         this->in_queue_semaphore.signal();
-        VP_DEBUG(vp_utils::string_format("[%s] after meta flow, in_queue.size()==>%d", node_name.c_str(), in_queue.size()));
+        VP_DEBUG(vp_utils::string_format("[%s] after meta flow, in_queue.size()==>%d", node_name.c_str(), static_cast<int>(in_queue.size())));
     }
 
     void vp_node::detach() {
@@ -203,8 +228,10 @@ namespace vp_nodes {
 
     void vp_node::deinitialized() {
         // send dead flag
-        alive = false;
-        {
+        const auto was_alive = alive.exchange(false);
+        in_queue_not_full.notify_all();
+        out_queue_not_full.notify_all();
+        if (was_alive) {
             std::lock_guard<std::mutex> guard(this->in_queue_lock);
             this->in_queue.push(nullptr);
             this->in_queue_semaphore.signal();
@@ -239,9 +266,16 @@ namespace vp_nodes {
     }
 
     void vp_node::pendding_meta(std::shared_ptr<vp_objects::vp_meta> meta) {
+        std::unique_lock<std::mutex> guard(this->out_queue_lock);
+        this->out_queue_not_full.wait(guard, [this]() {
+            return !this->alive || this->out_queue.size() < this->max_out_queue_size;
+        });
         this->out_queue.push(meta);
-        // handled hooker activated if need
-        invoke_meta_handled_hooker(node_name, out_queue.size(), meta);        
+        const auto queue_size = this->out_queue.size();
+        guard.unlock();
+        if (meta) {
+            invoke_meta_handled_hooker(node_name, queue_size, meta);
+        }
         // notify consumer of out_queue
         this->out_queue_semaphore.signal();
     }

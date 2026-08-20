@@ -96,6 +96,21 @@ target_link_libraries(frame_fusion_sample ${PROJECT_NAME})
 add_executable(vp_test "vp_test.cpp")
 target_link_libraries(vp_test ${PROJECT_NAME})
 
+add_executable(cycle_race_event_sample "cycle_race_event_sample.cpp")
+target_link_libraries(cycle_race_event_sample ${PROJECT_NAME})
+
+add_executable(cycle_race_http_sample "cycle_race_http_sample.cpp")
+target_link_libraries(cycle_race_http_sample ${PROJECT_NAME})
+
+add_executable(cycle_race_video_locator_sample "cycle_race_video_locator_sample.cpp")
+target_link_libraries(cycle_race_video_locator_sample ${PROJECT_NAME})
+
+add_executable(cycle_race_dual_camera_record_sample "cycle_race_dual_camera_record_sample.cpp")
+target_link_libraries(cycle_race_dual_camera_record_sample ${PROJECT_NAME})
+
+add_executable(cycle_race_queue_drain_sample "cycle_race_queue_drain_sample.cpp")
+target_link_libraries(cycle_race_queue_drain_sample ${PROJECT_NAME})
+
 # samples depend on Kafka
 if(VP_WITH_KAFKA)
     add_executable(message_broker_kafka_sample "message_broker_kafka_sample.cpp")

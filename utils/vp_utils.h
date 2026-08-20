@@ -3,6 +3,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <vector>
 #include <regex>
 #include <opencv2/imgproc.hpp>
@@ -17,11 +18,16 @@ namespace vp_utils {
     // string format in C++17
     template<typename ... Args>
     inline string string_format(const string& format, Args ... args){
-        size_t size = 1 + snprintf(nullptr, 0, format.c_str(), args ...); 
-        // unique_ptr<char[]> buf(new char[size]);
-        char bytes[size];
-        snprintf(bytes, size, format.c_str(), args ...);
-        return string(bytes);
+        const auto formatted_size = snprintf(nullptr, 0, format.c_str(), args ...);
+        if (formatted_size < 0) {
+            throw std::invalid_argument("failed to format string");
+        }
+        const auto size = static_cast<std::size_t>(formatted_size) + 1;
+        std::vector<char> bytes(size);
+        if (snprintf(bytes.data(), size, format.c_str(), args ...) < 0) {
+            throw std::invalid_argument("failed to format string");
+        }
+        return string(bytes.data());
     }
 
     // get optimal font scale depend on screen width and height

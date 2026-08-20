@@ -1,4 +1,7 @@
 #include "vp_app_src_node.h"
+#include "../utils/race/vp_video_time.h"
+
+#include <utility>
 
 namespace vp_nodes {
     vp_app_src_node::vp_app_src_node(std::string node_name, 
@@ -12,6 +15,12 @@ namespace vp_nodes {
 
     // host code acts as previous node, call vp_node::meta_flow(...)
     bool vp_app_src_node::push_frames(std::vector<cv::Mat> frames) {
+        return push_frames(std::move(frames), {}, 0);
+    }
+
+    bool vp_app_src_node::push_frames(std::vector<cv::Mat> frames,
+                                      std::vector<std::int64_t> source_pts_us,
+                                      int provided_source_session) {
         // vp_app_src_node not working
         if (!gate.is_open()) {
             VP_WARN(vp_utils::string_format("[%s] is not working!", node_name.c_str()));
@@ -21,6 +30,13 @@ namespace vp_nodes {
         if (frames.size() == 0) {
             return false;
         }
+
+        if (!source_pts_us.empty() && source_pts_us.size() != frames.size()) {
+            VP_WARN(vp_utils::string_format("[%s] source_pts_us MUST be empty or match frames size!", node_name.c_str()));
+            return false;
+        }
+
+        this->source_session = provided_source_session;
 
         // MUST have the same size
         auto size_warn = [this]() {
@@ -55,11 +71,23 @@ namespace vp_nodes {
         vp_stream_info stream_info {channel_index, original_fps, original_width, original_height, to_string()};
         invoke_stream_info_hooker(node_name, stream_info);
 
-        for (auto& f: frames) {
+        for (std::size_t i = 0; i < frames.size(); ++i) {
+            auto& f = frames[i];
             frame_index++;
             auto frame = f.clone();  // cv::Mat::clone() inside pipeline
+            const auto source_pts = source_pts_us.empty() ? -1 : source_pts_us[i];
             // create frame meta and meta flow like previous node
-            auto in_meta = std::make_shared<vp_objects::vp_frame_meta>(frame, frame_index, channel_index, original_width, original_height, original_fps);
+            auto in_meta = std::make_shared<vp_objects::vp_frame_meta>(
+                frame,
+                frame_index,
+                channel_index,
+                original_width,
+                original_height,
+                original_fps,
+                source_pts,
+                this->source_session,
+                vp_utils::monotonic_time_us(),
+                vp_utils::wall_time_ms());
 
             vp_node::meta_flow(in_meta);
         }

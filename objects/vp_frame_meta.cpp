@@ -1,15 +1,37 @@
+#include <chrono>
 #include <iterator>
 
 #include "vp_frame_meta.h"
 
 namespace vp_objects {
         
-    vp_frame_meta::vp_frame_meta(cv::Mat frame, int frame_index, int channel_index, int original_width, int original_height, int fps): 
+    vp_frame_meta::vp_frame_meta(cv::Mat frame,
+                                 int frame_index,
+                                 int channel_index,
+                                 int original_width,
+                                 int original_height,
+                                 int fps,
+                                 std::int64_t source_pts_us,
+                                 int source_session,
+                                 std::int64_t capture_monotonic_us,
+                                 std::int64_t capture_wall_time_ms):
         vp_meta(vp_meta_type::FRAME, channel_index), 
-        frame_index(frame_index), 
+        frame_index(frame_index),
+        fps(fps),
+        source_pts_us(source_pts_us),
+        source_session(source_session),
+        capture_monotonic_us(
+            capture_monotonic_us >= 0
+                ? capture_monotonic_us
+                : std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch()).count()),
+        capture_wall_time_ms(
+            capture_wall_time_ms >= 0
+                ? capture_wall_time_ms
+                : std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch()).count()),
         original_width(original_width),
         original_height(original_height),
-        fps(fps),
         frame(frame) {
             assert(!frame.empty());
     }
@@ -20,10 +42,14 @@ namespace vp_objects {
     vp_frame_meta::vp_frame_meta(const vp_frame_meta& meta): 
         vp_meta(meta),
         frame_index(meta.frame_index),
+        fps(meta.fps),
+        source_pts_us(meta.source_pts_us),
+        source_session(meta.source_session),
+        capture_monotonic_us(meta.capture_monotonic_us),
+        capture_wall_time_ms(meta.capture_wall_time_ms),
         original_width(meta.original_width),
         original_height(meta.original_height),
-        description(meta.description),
-        fps(meta.fps) {
+        description(meta.description) {
             // deep copy frame data
             this->frame = meta.frame.clone();
             this->osd_frame = meta.osd_frame.clone();

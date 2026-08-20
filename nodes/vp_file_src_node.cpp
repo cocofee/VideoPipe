@@ -2,6 +2,7 @@
 #include <iostream>
 
 #include "../utils/logger/vp_logger.h"
+#include "../utils/race/vp_video_time.h"
 #include "vp_file_src_node.h"
 
 namespace vp_nodes {
@@ -47,6 +48,7 @@ namespace vp_nodes {
                     VP_WARN(vp_utils::string_format("[%s] open file failed, try again...", node_name.c_str()));
                     continue;
                 }
+                source_session++;
             }
 
             // video properties
@@ -72,10 +74,19 @@ namespace vp_nodes {
                 VP_INFO(vp_utils::string_format("[%s] reading frame complete, total frame==>%d", node_name.c_str(), frame_index));
                 if (cycle) {
                     VP_INFO(vp_utils::string_format("[%s] cycle flag is true, continue!", node_name.c_str()));
-                    file_capture.set(cv::CAP_PROP_POS_FRAMES, 0);
+                    if (file_capture.set(cv::CAP_PROP_POS_FRAMES, 0)) {
+                        source_session++;
+                    }
+                    else {
+                        VP_WARN(vp_utils::string_format("[%s] reset file position failed!", node_name.c_str()));
+                    }
                 }
                 continue;
             }
+
+            const auto source_pts_us = vp_utils::capture_source_pts_us(file_capture);
+            const auto capture_monotonic_us = vp_utils::monotonic_time_us();
+            const auto capture_wall_time_ms = vp_utils::wall_time_ms();
 
             // need skip
             if (skip < skip_interval) {
@@ -98,20 +109,20 @@ namespace vp_nodes {
 
             this->frame_index++;
             // create frame meta
-            auto out_meta = 
-                std::make_shared<vp_objects::vp_frame_meta>(resize_frame, this->frame_index, this->channel_index, video_width, video_height, fps);
+            auto out_meta =
+                std::make_shared<vp_objects::vp_frame_meta>(resize_frame,
+                                                            this->frame_index,
+                                                            this->channel_index,
+                                                            video_width,
+                                                            video_height,
+                                                            fps,
+                                                            source_pts_us,
+                                                            source_session,
+                                                            capture_monotonic_us,
+                                                            capture_wall_time_ms);
 
             if (out_meta != nullptr) {
-                this->out_queue.push(out_meta);
-
-                // handled hooker activated if need
-                if (this->meta_handled_hooker) {
-                    meta_handled_hooker(node_name, out_queue.size(), out_meta);
-                }
-
-                // important! notify consumer of out_queue in case it is waiting.
-                this->out_queue_semaphore.signal();
-                VP_DEBUG(vp_utils::string_format("[%s] after handling meta, out_queue.size()==>%d", node_name.c_str(), out_queue.size()));
+                pendding_meta(out_meta);
             }
 
             // for fps
@@ -123,8 +134,7 @@ namespace vp_nodes {
         }
 
         // send dead flag for dispatch_thread
-        this->out_queue.push(nullptr);
-        this->out_queue_semaphore.signal();        
+        pendding_meta(nullptr);
     }
 
     // return stream path

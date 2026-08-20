@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <vector>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -34,7 +35,16 @@ namespace vp_objects {
     private:
         /* data */
     public:
-        vp_frame_meta(cv::Mat frame, int frame_index = -1, int channel_index = -1, int original_width = 0, int original_height = 0, int fps = 0);
+        vp_frame_meta(cv::Mat frame,
+                      int frame_index = -1,
+                      int channel_index = -1,
+                      int original_width = 0,
+                      int original_height = 0,
+                      int fps = 0,
+                      std::int64_t source_pts_us = -1,
+                      int source_session = 0,
+                      std::int64_t capture_monotonic_us = -1,
+                      std::int64_t capture_wall_time_ms = -1);
         ~vp_frame_meta();
 
         // define copy constructor since we need deep copy operation.
@@ -45,6 +55,20 @@ namespace vp_objects {
 
         // fps for current video.
         int fps;
+
+        // Presentation timestamp from the source stream. -1 means unavailable.
+        // It is scoped by source_session and must not be replaced by frame_index / fps.
+        std::int64_t source_pts_us;
+
+        // Incremented when a source reconnects or restarts its timestamp timeline.
+        int source_session;
+
+        // Local steady-clock timestamp captured immediately after frame acquisition.
+        std::int64_t capture_monotonic_us;
+
+        // Local system-clock timestamp captured with capture_monotonic_us.
+        // This survives application restarts but can be affected by wall-clock corrections.
+        std::int64_t capture_wall_time_ms;
 
         // orignal frame width, fiiled by src nodes.
         int original_width;

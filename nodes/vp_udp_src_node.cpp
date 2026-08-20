@@ -2,8 +2,17 @@
 
 #include "vp_udp_src_node.h"
 #include "../utils/vp_utils.h"
+#include "../utils/race/vp_video_time.h"
+
+#include <chrono>
+#include <thread>
 
 namespace vp_nodes {
+
+    namespace {
+        constexpr int MAX_CONSECUTIVE_EMPTY_FRAMES = 30;
+        constexpr auto RECONNECT_BACKOFF = std::chrono::milliseconds(200);
+    }
         
     vp_udp_src_node::vp_udp_src_node(std::string node_name, 
                                     int channel_index, 
@@ -31,6 +40,7 @@ namespace vp_nodes {
         int video_height = 0;
         int fps = 0;
         int skip = 0;
+        int consecutive_empty_frames = 0;
         while(alive) {
             // check if need work
             gate.knock();
@@ -41,8 +51,11 @@ namespace vp_nodes {
                 original_width = original_height = original_fps = 0;
                 if (!udp_capture.open(this->gst_template, cv::CAP_GSTREAMER)) {
                     VP_WARN(vp_utils::string_format("[%s] open udp failed, try again...", node_name.c_str()));
+                    std::this_thread::sleep_for(RECONNECT_BACKOFF);
                     continue;
                 }
+                consecutive_empty_frames = 0;
+                source_session++;
             }
 
             // video properties
@@ -65,8 +78,18 @@ namespace vp_nodes {
             udp_capture >> frame;
             if(frame.empty()) {
                 VP_WARN(vp_utils::string_format("[%s] reading frame empty, total frame==>%d", node_name.c_str(), frame_index));
+                if (++consecutive_empty_frames >= MAX_CONSECUTIVE_EMPTY_FRAMES) {
+                    VP_WARN(vp_utils::string_format("[%s] too many empty frames, reconnecting...", node_name.c_str()));
+                    udp_capture.release();
+                    consecutive_empty_frames = 0;
+                    std::this_thread::sleep_for(RECONNECT_BACKOFF);
+                }
                 continue;
             }
+            consecutive_empty_frames = 0;
+
+            const auto capture_monotonic_us = vp_utils::monotonic_time_us();
+            const auto capture_wall_time_ms = vp_utils::wall_time_ms();
 
             // need skip
             if (skip < skip_interval) {
@@ -90,25 +113,24 @@ namespace vp_nodes {
             this->frame_index++;
             // create frame meta
             auto out_meta = 
-                std::make_shared<vp_objects::vp_frame_meta>(resize_frame, this->frame_index, this->channel_index, video_width, video_height, fps);
+                std::make_shared<vp_objects::vp_frame_meta>(resize_frame,
+                                                            this->frame_index,
+                                                            this->channel_index,
+                                                            video_width,
+                                                            video_height,
+                                                            fps,
+                                                            -1,
+                                                            source_session,
+                                                            capture_monotonic_us,
+                                                            capture_wall_time_ms);
 
             if (out_meta != nullptr) {
-                this->out_queue.push(out_meta);
-
-                // handled hooker activated if need
-                if (this->meta_handled_hooker) {
-                    meta_handled_hooker(node_name, out_queue.size(), out_meta);
-                }
-
-                // important! notify consumer of out_queue in case it is waiting.
-                this->out_queue_semaphore.signal();
-                VP_DEBUG(vp_utils::string_format("[%s] after handling meta, out_queue.size()==>%d", node_name.c_str(), out_queue.size()));
+                pendding_meta(out_meta);
             }       
         }
 
         // send dead flag for dispatch_thread
-        this->out_queue.push(nullptr);
-        this->out_queue_semaphore.signal();    
+        pendding_meta(nullptr);
     }
 
     // return stream uri

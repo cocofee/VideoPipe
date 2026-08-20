@@ -219,6 +219,7 @@ namespace vp_nodes {
         }
         m_inner_stream_index = ret;
         auto in_stream = m_ifmt_ctx->streams[m_inner_stream_index];
+        m_video_time_base = in_stream->time_base;
         
         /* initialize video properties */
         m_fps = int(av_q2d(in_stream->r_frame_rate));
@@ -321,6 +322,7 @@ namespace vp_nodes {
         if (m_dec_ctx) {
             avcodec_free_context(&m_dec_ctx);
         }
+        m_video_time_base = {0, 1};
 
         /* clear queue */
         {
@@ -395,6 +397,21 @@ namespace vp_nodes {
     int ff_src::get_channel_index() const {
         // no check is opened or not
         return m_channel_index;
+    }
+
+    std::int64_t ff_src::get_frame_pts_us(const ff_av_frame_ptr& frame) const {
+        if (!frame || m_video_time_base.num == 0 || m_video_time_base.den == 0) {
+            return -1;
+        }
+
+        auto timestamp = frame->best_effort_timestamp;
+        if (timestamp == AV_NOPTS_VALUE) {
+            timestamp = frame->pts;
+        }
+        if (timestamp == AV_NOPTS_VALUE) {
+            return -1;
+        }
+        return av_rescale_q(timestamp, m_video_time_base, AVRational{1, 1000000});
     }
 
     std::string ff_src::get_video_pixel_format_name() const {

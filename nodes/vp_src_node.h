@@ -35,6 +35,9 @@ namespace vp_nodes {
         int channel_index;
         float resize_ratio;
 
+        // Source timestamps may restart after a reconnect. Keep each timeline separate.
+        int source_session = -1;
+
         // control to work or not
         // all derived class need depend on the value to check if work or not (start/stop)
         vp_utils::vp_gate gate;

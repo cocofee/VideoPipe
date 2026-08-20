@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <thread>
 #include <queue>
 #include <mutex>
@@ -41,7 +42,7 @@ namespace vp_nodes {
 
     protected:
         // alive or not for node
-        bool alive = true;
+        std::atomic<bool> alive = true;
 
         // by default we handle frame meta one by one, in some situations we need handle them batch by batch(such as vp_infer_node).
         // setting this member greater than 1 means the node will handle frame meta with batch, and vp_node::handle_frame_meta_by_batch(...) will be called other than vp_node::handle_frame_meta(...).
@@ -52,8 +53,13 @@ namespace vp_nodes {
         std::queue<std::shared_ptr<vp_objects::vp_meta>> in_queue;
         // 
         std::mutex in_queue_lock;
+        std::condition_variable in_queue_not_full;
         // cache output meta to next nodes
         std::queue<std::shared_ptr<vp_objects::vp_meta>> out_queue;
+        std::mutex out_queue_lock;
+        std::condition_variable out_queue_not_full;
+        std::size_t max_in_queue_size = 8;
+        std::size_t max_out_queue_size = 8;
 
         // synchronize for in_queue
         vp_utils::vp_semaphore in_queue_semaphore;

@@ -1,5 +1,6 @@
 #pragma once
 #ifdef VP_WITH_FFMPEG
+#include <cstdint>
 #include <string>
 #include <queue>
 #include <vector>
@@ -98,6 +99,7 @@ namespace vp_nodes {
 
         /* inner flags */
         int m_inner_stream_index = -1;
+        AVRational m_video_time_base = {0, 1};
         bool m_demux_running = false;
         bool m_decode_running = false;
 
@@ -234,6 +236,12 @@ namespace vp_nodes {
          * get channel index of input.
          */
         int get_channel_index() const;
+
+        /**
+         * Convert the decoded frame source timestamp to microseconds.
+         * Returns -1 when the source did not provide a usable timestamp.
+         */
+        std::int64_t get_frame_pts_us(const ff_av_frame_ptr& frame) const;
 
         /**
          * set callback for opened event. would be activated every time ff_src opened.

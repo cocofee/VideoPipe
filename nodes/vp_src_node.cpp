@@ -22,7 +22,6 @@ namespace vp_nodes {
     }
     
     void vp_src_node::deinitialized() {
-        alive = false;
         gate.open();
         vp_node::deinitialized();
     }

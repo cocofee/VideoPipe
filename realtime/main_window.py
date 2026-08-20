@@ -99,6 +99,7 @@ try:
     from .runtime_paths import application_dir, find_model as find_runtime_model, resolve_output_dir, resolve_runtime_path, resolve_source
     from .stream_recorder import ManualRecordingManager, RecordingError, is_rtsp_source
     from .video_playback import VideoPlaybackDialog, find_recordings
+    from .passage_receiver import DEFAULT_HOST, DEFAULT_PORT, PassageEventReceiver, PassageEventStore
 except ImportError:
     import sys
     import os
@@ -121,6 +122,7 @@ except ImportError:
     from runtime_paths import application_dir, find_model as find_runtime_model, resolve_output_dir, resolve_runtime_path, resolve_source
     from stream_recorder import ManualRecordingManager, RecordingError, is_rtsp_source
     from video_playback import VideoPlaybackDialog, find_recordings
+    from passage_receiver import DEFAULT_HOST, DEFAULT_PORT, PassageEventReceiver, PassageEventStore
 
 
 class InteractiveVideoLabel(QLabel):
@@ -2268,6 +2270,7 @@ class MainWindow(QMainWindow):
     event_saved_signal = pyqtSignal(int)
     log_signal = pyqtSignal(str)
     field_issue_saved_signal = pyqtSignal(object)
+    passage_received_signal = pyqtSignal(object)
 
     def __init__(
         self,
@@ -2293,6 +2296,7 @@ class MainWindow(QMainWindow):
         self.event_saved_signal.connect(self._on_event_saved_ui)
         self.log_signal.connect(self._on_log_received_ui)
         self.field_issue_saved_signal.connect(self._on_field_issue_saved_ui)
+        self.passage_received_signal.connect(self._on_passage_received_ui)
 
         # 组件 (支持多摄像头)
         self.readers = {}         # source_id -> StreamReader
@@ -2321,6 +2325,23 @@ class MainWindow(QMainWindow):
         )
         self._field_issue_closing = False
         self._latest_frame_observations: Dict[int, tuple[list, list]] = {}
+
+        self.passage_receiver: Optional[PassageEventReceiver] = None
+        self.passage_event_store: Optional[PassageEventStore] = None
+        self._latest_passage_event = None
+        self._passage_receiver_enabled = bool(config.get("passage_receiver_enabled", False))
+        self._passage_receiver_host = str(
+            config.get("passage_receiver_host") or DEFAULT_HOST
+        ).strip()
+        try:
+            self._passage_receiver_port = int(
+                config.get("passage_receiver_port", DEFAULT_PORT)
+            )
+        except (TypeError, ValueError):
+            self._passage_receiver_port = DEFAULT_PORT
+        self.config["passage_receiver_enabled"] = self._passage_receiver_enabled
+        self.config["passage_receiver_host"] = self._passage_receiver_host
+        self.config["passage_receiver_port"] = self._passage_receiver_port
 
         # 配置
         # source 现在可以是一个列表，支持多路
@@ -2560,6 +2581,7 @@ class MainWindow(QMainWindow):
             self.live_event_review.set_database(self.database)
             self.live_event_review.set_output_dir(self.output_dir)
             self.live_event_review.clear_event()
+        self._start_passage_receiver()
         if self._yolo_only_mode:
             self.ocr_manager = None
         elif not self.ocr_manager:
@@ -2739,6 +2761,10 @@ class MainWindow(QMainWindow):
         self.race_name_label.setObjectName("race_name")
         header_layout.addWidget(self.race_name_label)
         header_layout.addStretch()
+
+        self.cyclerace_status_label = QLabel("CycleRace: 等待赛事")
+        self.cyclerace_status_label.setStyleSheet("color: #667085; font-size: 12px; font-weight: 600;")
+        header_layout.addWidget(self.cyclerace_status_label)
 
         self.capture_state_label = QLabel("采集未开始")
         self.capture_state_label.setObjectName("capture_state")
@@ -3613,6 +3639,108 @@ class MainWindow(QMainWindow):
         else:
             self.event_list.refresh_data()
 
+    def _start_passage_receiver(self):
+        MainWindow._stop_passage_receiver(self, reset_status=False)
+        self._latest_passage_event = None
+        if not self._passage_receiver_enabled:
+            self._set_passage_receiver_status(
+                "CycleRace: 未启用",
+                "#667085",
+                "当前赛事未启用 CycleRace passage 接收",
+            )
+            return
+        if not (1 <= self._passage_receiver_port <= 65535):
+            self._set_passage_receiver_status(
+                "CycleRace: 配置错误",
+                "#b54747",
+                f"无效监听端口: {self._passage_receiver_port}",
+            )
+            logger.error("[Main] CycleRace passage 接收端口无效: %s", self._passage_receiver_port)
+            return
+
+        journal_path = self.output_dir / "cyclerace_passage_events.jsonl"
+        receiver = None
+        try:
+            store = PassageEventStore(journal_path)
+            receiver = PassageEventReceiver(
+                self._passage_receiver_host,
+                self._passage_receiver_port,
+                store,
+                on_accepted=self._on_passage_received,
+            )
+            receiver.start()
+            self.passage_event_store = store
+            self.passage_receiver = receiver
+            recovered = "；已恢复未完整尾部" if store.recovered_incomplete_tail else ""
+            self._set_passage_receiver_status(
+                f"CycleRace: 监听 {receiver.listen_port}",
+                "#247a52",
+                f"{self._passage_receiver_host}:{receiver.listen_port}/api/v1/passage-events"
+                f"；已保存 {len(store)} 条{recovered}",
+            )
+        except Exception as exc:
+            if receiver is not None:
+                receiver.stop()
+            self.passage_event_store = None
+            self.passage_receiver = None
+            self._set_passage_receiver_status(
+                "CycleRace: 监听失败",
+                "#b54747",
+                str(exc),
+            )
+            logger.exception("[Main] 启动 CycleRace passage 接收失败: %s", exc)
+
+    def _stop_passage_receiver(self, *, reset_status=True):
+        receiver = getattr(self, "passage_receiver", None)
+        self.passage_receiver = None
+        self.passage_event_store = None
+        if receiver is not None:
+            try:
+                receiver.stop()
+            except Exception as exc:
+                logger.warning("[Main] 停止 CycleRace passage 接收失败: %s", exc)
+        if reset_status:
+            MainWindow._set_passage_receiver_status(
+                self,
+                "CycleRace: 等待赛事",
+                "#667085",
+                "选择赛事后开始监听",
+            )
+
+    def _on_passage_received(self, event):
+        self.passage_received_signal.emit(event)
+
+    def _on_passage_received_ui(self, event):
+        self._latest_passage_event = event
+        store = self.passage_event_store
+        count = len(store) if store is not None else 0
+        identity = event.bib.strip() or event.chip_id.strip() or "未知"
+        self._set_passage_receiver_status(
+            f"CycleRace: 已接收 {count}",
+            "#247a52",
+            f"最近通过: {identity}；组别 {event.group_id}；圈次 {event.lap}；"
+            f"revision {event.revision}",
+        )
+        self.statusBar().showMessage(
+            f"收到 CycleRace 通过记录: {identity}（第 {event.sequence} 条）",
+            3000,
+        )
+        logger.info(
+            "[Main] 收到 CycleRace passage: event_id=%s, bib=%s, sequence=%s, revision=%s",
+            event.event_id,
+            event.bib,
+            event.sequence,
+            event.revision,
+        )
+
+    def _set_passage_receiver_status(self, text, color, tooltip):
+        label = getattr(self, "cyclerace_status_label", None)
+        if label is None:
+            return
+        label.setText(text)
+        label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
+        label.setToolTip(tooltip)
+
     def _on_roi_toggle(self, source_id: int, state: int):
         """处理 ROI 开关切换"""
         is_enabled = state == Qt.Checked
@@ -4362,6 +4490,8 @@ class MainWindow(QMainWindow):
             if stopped_cleanly is False:
                 raise RuntimeError("事件记录器仍在写入，未关闭数据库或切换赛事")
             self.recorder = None
+
+        MainWindow._stop_passage_receiver(self)
 
         if self.ocr_manager is not None:
             try:
@@ -5978,6 +6108,7 @@ class MainWindow(QMainWindow):
         """窗口关闭时清理资源（此时 Qt C++ 对象仍存活，可安全操作子线程）"""
         try:
             self._field_issue_closing = True
+            MainWindow._stop_passage_receiver(self)
             field_issue_executor = getattr(self, "_field_issue_executor", None)
             if field_issue_executor is not None:
                 field_issue_executor.shutdown(wait=False, cancel_futures=False)
@@ -6040,6 +6171,15 @@ def main():
                        help='禁用 OCR，仅运行 YOLO 检测与事件保存')
     parser.add_argument('--ocr-cpu-threads', type=int, default=2,
                        help='本地 OCR 使用的 CPU 线程数（1-4）')
+    parser.add_argument('--passage-host', type=str, default=None,
+                       help='CycleRace passage 接收监听地址')
+    parser.add_argument('--passage-port', type=int, default=None,
+                       help='CycleRace passage 接收端口')
+    parser.add_argument(
+        '--disable-passage-receiver',
+        action='store_true',
+        help='禁用 CycleRace passage HTTP 接收',
+    )
 
     parser.add_argument(
         '--sport-profile',
@@ -6082,6 +6222,9 @@ def main():
         'yolo_only_mode': bool(args.yolo_only),
         'ocr_cpu_threads': max(1, min(4, int(args.ocr_cpu_threads))),
         'sport_profile': args.sport_profile or 'cycling',
+        'passage_receiver_enabled': True,
+        'passage_receiver_host': DEFAULT_HOST,
+        'passage_receiver_port': DEFAULT_PORT,
         'finish_line': {
             'x1': x1, 'y1': y1,
             'x2': x2, 'y2': y2,
@@ -6124,6 +6267,12 @@ def main():
         config['model_path'] = model_path
     if args.sport_profile:
         config['sport_profile'] = args.sport_profile
+    if args.passage_host is not None:
+        config['passage_receiver_host'] = args.passage_host
+    if args.passage_port is not None:
+        config['passage_receiver_port'] = args.passage_port
+    if args.disable_passage_receiver:
+        config['passage_receiver_enabled'] = False
 
     app = QApplication(sys.argv)
     window = MainWindow(

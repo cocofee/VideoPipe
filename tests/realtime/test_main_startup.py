@@ -108,6 +108,7 @@ def test_releasing_current_race_stops_workers_and_closes_database():
 
         def __init__(self):
             self.recording_manager = None
+            self.passage_receiver = _Stoppable()
             self.preview_threads = {0: _Stoppable()}
             self.video_threads = {0: _Stoppable()}
             self.readers = {0: _Stoppable()}
@@ -137,6 +138,7 @@ def test_releasing_current_race_stops_workers_and_closes_database():
             raise AssertionError("manual recorder should not be stopped when absent")
 
     harness = _Harness()
+    passage_receiver = harness.passage_receiver
     preview = harness.preview_threads[0]
     video = harness.video_threads[0]
     reader = harness.readers[0]
@@ -147,6 +149,7 @@ def test_releasing_current_race_stops_workers_and_closes_database():
 
     harness._release_current_race()
 
+    assert passage_receiver.stopped == 1
     assert preview.stopped == 1
     assert video.stopped == 1
     assert reader.stopped == 1
@@ -165,6 +168,7 @@ def test_releasing_current_race_stops_workers_and_closes_database():
     assert harness._race_ready is False
     assert harness._initialized is False
     assert harness._ocr_runtime_state == "idle"
+    assert harness.passage_receiver is None
 
 
 def test_releasing_race_keeps_database_open_when_recorder_is_still_writing():

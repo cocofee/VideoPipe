@@ -1,0 +1,119 @@
+{
+  "source": "C:\\Users\\Administrator\\Desktop\\电动计时软件20230309\\Photo\\01_混合组300直道赛预赛第3组.RGB",
+  "source_size": 25785808,
+  "header_size": 48,
+  "record_size": 3080,
+  "ccd_pixels": 1024,
+  "scan_line_count": 8372,
+  "tick_hz": 20000,
+  "header": {
+    "reference_tick": 490715478,
+    "event_group_id": 0,
+    "header_flag": 1,
+    "capture_config_hex": "00-04-05-01",
+    "date": "2026-08-04",
+    "last_pixel_index": 1023
+  },
+  "segments": [
+    {
+      "index": 1,
+      "start_line": 0,
+      "end_line": 1005,
+      "line_count": 1006,
+      "start_tick": 490740683,
+      "end_tick": 490780924,
+      "duration_ms": 2012.05,
+      "relative_start_ms": 1260.25
+    },
+    {
+      "index": 2,
+      "start_line": 1006,
+      "end_line": 2307,
+      "line_count": 1302,
+      "start_tick": 491793621,
+      "end_tick": 491845713,
+      "duration_ms": 2604.6,
+      "relative_start_ms": 53907.15
+    },
+    {
+      "index": 3,
+      "start_line": 2310,
+      "end_line": 3593,
+      "line_count": 1284,
+      "start_tick": 515627576,
+      "end_tick": 515678955,
+      "duration_ms": 2568.95,
+      "relative_start_ms": 1245604.9
+    },
+    {
+      "index": 4,
+      "start_line": 3594,
+      "end_line": 4145,
+      "line_count": 552,
+      "start_tick": 520698460,
+      "end_tick": 520720541,
+      "duration_ms": 1104.05,
+      "relative_start_ms": 1499149.1
+    },
+    {
+      "index": 5,
+      "start_line": 4146,
+      "end_line": 4403,
+      "line_count": 258,
+      "start_tick": 523950489,
+      "end_tick": 523960810,
+      "duration_ms": 516.05,
+      "relative_start_ms": 1661750.55
+    },
+    {
+      "index": 6,
+      "start_line": 4404,
+      "end_line": 6163,
+      "line_count": 1760,
+      "start_tick": 523973445,
+      "end_tick": 524043846,
+      "duration_ms": 3520.05,
+      "relative_start_ms": 1662898.35
+    },
+    {
+      "index": 7,
+      "start_line": 6164,
+      "end_line": 6343,
+      "line_count": 180,
+      "start_tick": 524300040,
+      "end_tick": 524307277,
+      "duration_ms": 361.85,
+      "relative_start_ms": 1679228.1
+    },
+    {
+      "index": 8,
+      "start_line": 6346,
+      "end_line": 7119,
+      "line_count": 774,
+      "start_tick": 524312551,
+      "end_tick": 524343531,
+      "duration_ms": 1549.0,
+      "relative_start_ms": 1679853.65
+    },
+    {
+      "index": 9,
+      "start_line": 7122,
+      "end_line": 7865,
+      "line_count": 744,
+      "start_tick": 525049141,
+      "end_tick": 525078929,
+      "duration_ms": 1489.4,
+      "relative_start_ms": 1716683.15
+    },
+    {
+      "index": 10,
+      "start_line": 7868,
+      "end_line": 8369,
+      "line_count": 502,
+      "start_tick": 526637308,
+      "end_tick": 526657422,
+      "duration_ms": 1005.7,
+      "relative_start_ms": 1796091.5
+    }
+  ]
+}

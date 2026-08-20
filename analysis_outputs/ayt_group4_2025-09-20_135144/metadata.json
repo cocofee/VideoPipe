@@ -1,0 +1,69 @@
+{
+  "source": "C:\\Users\\Administrator\\Desktop\\电动计时软件20230309\\Photo\\01_混合组300直道赛预赛第4组_2025-09-20 135144.RGB",
+  "source_size": 24760168,
+  "header_size": 48,
+  "record_size": 3080,
+  "ccd_pixels": 1024,
+  "scan_line_count": 8039,
+  "tick_hz": 20000,
+  "header": {
+    "reference_tick": 959537317,
+    "event_group_id": 0,
+    "header_flag": 1,
+    "capture_config_hex": "00-04-0a-01",
+    "date": "2025-09-20",
+    "last_pixel_index": 1023
+  },
+  "segments": [
+    {
+      "index": 1,
+      "start_line": 0,
+      "end_line": 1571,
+      "line_count": 1572,
+      "start_tick": 959578795,
+      "end_tick": 959610255,
+      "duration_ms": 1573.0,
+      "relative_start_ms": 2073.9
+    },
+    {
+      "index": 2,
+      "start_line": 1574,
+      "end_line": 1577,
+      "line_count": 4,
+      "start_tick": 959805239,
+      "end_tick": 959809399,
+      "duration_ms": 208.0,
+      "relative_start_ms": 13396.1
+    },
+    {
+      "index": 3,
+      "start_line": 1783,
+      "end_line": 3394,
+      "line_count": 1612,
+      "start_tick": 967567499,
+      "end_tick": 967599759,
+      "duration_ms": 1613.0,
+      "relative_start_ms": 401509.1
+    },
+    {
+      "index": 4,
+      "start_line": 3397,
+      "end_line": 6280,
+      "line_count": 2884,
+      "start_tick": 972915360,
+      "end_tick": 972973062,
+      "duration_ms": 2885.1,
+      "relative_start_ms": 668902.15
+    },
+    {
+      "index": 5,
+      "start_line": 6283,
+      "end_line": 8036,
+      "line_count": 1754,
+      "start_tick": 996994254,
+      "end_tick": 997029354,
+      "duration_ms": 1755.0,
+      "relative_start_ms": 1872846.85
+    }
+  ]
+}

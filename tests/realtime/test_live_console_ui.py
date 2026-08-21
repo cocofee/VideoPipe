@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -11,7 +12,12 @@ from PyQt5.QtWidgets import QApplication, QDialog, QFileDialog, QLabel
 import realtime.main_window as main_window
 from realtime.event_list_widget import EventListWidget
 from realtime.live_event_review import LiveEventReview
-from realtime.main_window import MainWindow, NewRaceDialog, VLMConfigDialog
+from realtime.main_window import (
+    ExternalClipProbeThread,
+    MainWindow,
+    NewRaceDialog,
+    VLMConfigDialog,
+)
 
 
 @pytest.fixture(scope="module")
@@ -218,6 +224,7 @@ def test_main_window_uses_live_console_structure(qapp, tmp_path, monkeypatch):
     data_actions = [action.text() for action in data_menu.actions()]
     assert "打开已有赛事..." in data_actions
     assert "录像回放..." in data_actions
+    assert "导入高速摄像片段..." in data_actions
 
     visible_text = [label.text() for label in window.findChildren(QLabel)]
     assert not any(text.startswith("RANK ") for text in visible_text)
@@ -242,6 +249,190 @@ def test_main_window_uses_live_console_structure(qapp, tmp_path, monkeypatch):
     assert window.live_monitor_label.text() == "巡检: 待机"
     assert window.sport_profile_combo.isEnabled()
     window.close()
+
+
+def test_external_clip_import_uses_active_passage_race_id(tmp_path, monkeypatch):
+    sidecar = tmp_path / "clips.json"
+    sidecar.write_text("{}", encoding="utf-8")
+    timeline_store = object()
+    begin_calls = []
+
+    class _Window:
+        _import_external_clips = MainWindow._import_external_clips
+
+        def __init__(self):
+            self._race_ready = True
+            self.recording_manager = None
+            self.video_timeline_store = timeline_store
+            self.passage_event_store = SimpleNamespace(
+                events=lambda: (SimpleNamespace(race_id="race-1"),)
+            )
+            self.passage_review_dialog = None
+            self.output_dir = tmp_path
+
+        def _begin_external_clip_import(self, path, race_id):
+            begin_calls.append((path, race_id))
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileName",
+        lambda *args, **kwargs: (str(sidecar), "JSON sidecar (*.json)"),
+    )
+    _Window()._import_external_clips()
+
+    assert begin_calls == [(str(sidecar), "race-1")]
+
+
+def test_external_clip_probe_runs_outside_the_ui_thread(qapp, monkeypatch):
+    ui_thread_id = threading.get_ident()
+    worker_thread_ids = []
+    completed = []
+
+    def _load(sidecar_path, **kwargs):
+        worker_thread_ids.append(threading.get_ident())
+        kwargs["progress_callback"](1, 1, sidecar_path)
+        return ("verified-clip",)
+
+    monkeypatch.setattr(main_window, "load_external_clip_sidecar", _load)
+    thread = ExternalClipProbeThread("clips.json", "race-1")
+    thread.completed.connect(completed.append)
+
+    thread.start()
+    assert thread.wait(2_000)
+    qapp.processEvents()
+
+    assert worker_thread_ids and worker_thread_ids[0] != ui_thread_id
+    assert completed == [("verified-clip",)]
+    thread.deleteLater()
+
+
+def test_external_clip_result_is_discarded_after_race_switch(tmp_path, monkeypatch):
+    import_calls = []
+    warnings = []
+    old_timeline = object()
+    old_passage = object()
+
+    class _Window:
+        _on_external_clip_import_verified = MainWindow._on_external_clip_import_verified
+
+        def __init__(self):
+            self._race_ready = True
+            self.output_dir = tmp_path / "race-2"
+            self.video_timeline_store = object()
+            self.passage_event_store = object()
+            self._external_clip_import_context = {
+                "race_dir": (tmp_path / "race-1").absolute(),
+                "race_id": "race-1",
+                "timeline_store": old_timeline,
+                "passage_store": old_passage,
+            }
+
+    monkeypatch.setattr(
+        main_window,
+        "import_verified_external_clips",
+        lambda *args, **kwargs: import_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        main_window.QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args[1:]),
+    )
+
+    _Window()._on_external_clip_import_verified(())
+
+    assert import_calls == []
+    assert any("赛事已切换" in str(item) for item in warnings)
+
+
+def test_external_clip_result_is_discarded_after_late_cancel(tmp_path, monkeypatch):
+    import_calls = []
+    messages = []
+
+    class _StatusBar:
+        def showMessage(self, message, timeout=0):
+            messages.append((message, timeout))
+
+    class _Window:
+        _on_external_clip_import_verified = MainWindow._on_external_clip_import_verified
+        _on_external_clip_import_cancelled = MainWindow._on_external_clip_import_cancelled
+
+        def __init__(self):
+            self._external_clip_import_context = {"race_id": "race-1"}
+            self._external_clip_import_thread = SimpleNamespace(
+                isInterruptionRequested=lambda: True
+            )
+            self._status_bar = _StatusBar()
+
+        def statusBar(self):
+            return self._status_bar
+
+    monkeypatch.setattr(
+        main_window,
+        "import_verified_external_clips",
+        lambda *args, **kwargs: import_calls.append((args, kwargs)),
+    )
+
+    _Window()._on_external_clip_import_verified((object(),))
+
+    assert import_calls == []
+    assert any("已取消" in str(item) for item in messages)
+
+
+def test_external_clip_result_is_applied_to_unchanged_race(tmp_path, monkeypatch):
+    import_calls = []
+    messages = []
+    timeline_store = object()
+    passage_store = SimpleNamespace(
+        events=lambda: (SimpleNamespace(race_id="race-1"),)
+    )
+
+    class _StatusBar:
+        def showMessage(self, message, timeout=0):
+            messages.append((message, timeout))
+
+    class _Window:
+        _on_external_clip_import_verified = MainWindow._on_external_clip_import_verified
+
+        def __init__(self):
+            self._race_ready = True
+            self.output_dir = tmp_path
+            self.video_timeline_store = timeline_store
+            self.passage_event_store = passage_store
+            self.passage_review_dialog = None
+            self._external_clip_import_context = {
+                "race_dir": tmp_path.absolute(),
+                "race_id": "race-1",
+                "timeline_store": timeline_store,
+                "passage_store": passage_store,
+            }
+            self._status_bar = _StatusBar()
+
+        def statusBar(self):
+            return self._status_bar
+
+    monkeypatch.setattr(
+        main_window,
+        "import_verified_external_clips",
+        lambda store, clips, *, expected_race_id: (
+            import_calls.append((store, clips, expected_race_id))
+            or SimpleNamespace(
+                created_count=2,
+                repaired_count=1,
+                duplicate_count=3,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.QMessageBox,
+        "information",
+        lambda *args: messages.append(args[1:]),
+    )
+
+    clips = (object(),)
+    _Window()._on_external_clip_import_verified(clips)
+
+    assert import_calls == [(timeline_store, clips, "race-1")]
+    assert any("已导入 2 个片段" in str(item) for item in messages)
 
 
 def test_vlm_config_dialog_restores_openai_option(qapp):

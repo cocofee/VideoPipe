@@ -102,6 +102,13 @@ try:
     from .passage_receiver import DEFAULT_HOST, DEFAULT_PORT, PassageEventReceiver, PassageEventStore
     from .passage_review import PassageReviewDialog, lookup_status_text
     from .video_timeline import VideoTimelineError, VideoTimelineStore
+    from .external_clip_import import (
+        ExternalClipImportCancelled,
+        ExternalClipImportError,
+        import_verified_external_clips,
+        load_external_clip_sidecar,
+        race_id_from_passage_store,
+    )
 except ImportError:
     import sys
     import os
@@ -127,6 +134,13 @@ except ImportError:
     from passage_receiver import DEFAULT_HOST, DEFAULT_PORT, PassageEventReceiver, PassageEventStore
     from passage_review import PassageReviewDialog, lookup_status_text
     from video_timeline import VideoTimelineError, VideoTimelineStore
+    from external_clip_import import (
+        ExternalClipImportCancelled,
+        ExternalClipImportError,
+        import_verified_external_clips,
+        load_external_clip_sidecar,
+        race_id_from_passage_store,
+    )
 
 
 class InteractiveVideoLabel(QLabel):
@@ -1465,6 +1479,41 @@ class ConnectionTester(QThread):
             self.finished.emit(False, f"测试发生异常: {str(e)}")
 
 
+class ExternalClipProbeThread(QThread):
+    """Validate external media without blocking the Qt event loop."""
+
+    progress = pyqtSignal(int, int, str)
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, sidecar_path: str, expected_race_id: str, parent=None):
+        super().__init__(parent)
+        self.sidecar_path = str(sidecar_path)
+        self.expected_race_id = str(expected_race_id)
+
+    def run(self):
+        try:
+            clips = load_external_clip_sidecar(
+                self.sidecar_path,
+                expected_race_id=self.expected_race_id,
+                progress_callback=self.progress.emit,
+                cancel_check=self.isInterruptionRequested,
+            )
+        except ExternalClipImportCancelled:
+            self.cancelled.emit()
+        except (ExternalClipImportError, VideoTimelineError) as error:
+            self.failed.emit(str(error))
+        except Exception as error:
+            logger.exception("[ExternalClipImport] media verification failed")
+            self.failed.emit(str(error))
+        else:
+            if self.isInterruptionRequested():
+                self.cancelled.emit()
+            else:
+                self.completed.emit(clips)
+
+
 class MultiCameraManagementDialog(QDialog):
     """多摄像头管理对话框"""
     def __init__(self, current_sources, parent=None):
@@ -2335,6 +2384,10 @@ class MainWindow(QMainWindow):
         self.passage_event_store: Optional[PassageEventStore] = None
         self.video_timeline_store: Optional[VideoTimelineStore] = None
         self.passage_review_dialog: Optional[PassageReviewDialog] = None
+        self._external_clip_import_thread: Optional[ExternalClipProbeThread] = None
+        self._external_clip_import_progress: Optional[QProgressDialog] = None
+        self._external_clip_import_context = None
+        self.external_clip_action: Optional[QAction] = None
         self._latest_passage_event = None
         self._passage_receiver_enabled = bool(config.get("passage_receiver_enabled", False))
         self._passage_receiver_host = str(
@@ -3803,6 +3856,7 @@ class MainWindow(QMainWindow):
                 event.timeline_timestamp_ms,
                 clock_offset_ms=self._passage_clock_offset_ms,
                 pre_roll_ms=self._passage_video_preroll_ms,
+                race_id=event.race_id,
             )
             video_status = lookup_status_text(lookup)
         self._set_passage_receiver_status(
@@ -3865,8 +3919,178 @@ class MainWindow(QMainWindow):
             self.config["passage_clock_offset_ms"] = self._passage_clock_offset_ms
             self._save_config()
 
+    def _import_external_clips(self):
+        thread = getattr(self, "_external_clip_import_thread", None)
+        if thread is not None and thread.isRunning():
+            QMessageBox.information(self, "正在导入", "高速摄像片段仍在验证中。")
+            return
+        if not self._race_ready:
+            QMessageBox.warning(self, "提示", "请先打开赛事。")
+            return
+        manager = getattr(self, "recording_manager", None)
+        if manager is not None and manager.is_recording:
+            QMessageBox.warning(
+                self,
+                "无法导入",
+                "请先停止当前录像，再导入高速摄像片段。",
+            )
+            return
+        if self.video_timeline_store is None or self.passage_event_store is None:
+            QMessageBox.warning(
+                self,
+                "无法导入",
+                "当前赛事的 CycleRace passage 或录像时间线不可用。",
+            )
+            return
+
+        sidecar_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入高速摄像片段",
+            str(self.output_dir),
+            "JSON sidecar (*.json);;All files (*.*)",
+        )
+        if not sidecar_path:
+            return
+        try:
+            race_id = race_id_from_passage_store(self.passage_event_store)
+        except (ExternalClipImportError, VideoTimelineError) as error:
+            QMessageBox.warning(self, "导入失败", str(error))
+            return
+        self._begin_external_clip_import(sidecar_path, race_id)
+
+    def _begin_external_clip_import(self, sidecar_path: str, race_id: str):
+        timeline_store = self.video_timeline_store
+        passage_store = self.passage_event_store
+        if timeline_store is None or passage_store is None:
+            QMessageBox.warning(self, "导入失败", "当前赛事存储已不可用。")
+            return
+
+        progress = QProgressDialog(
+            "正在验证高速摄像片段...",
+            "取消",
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle("导入高速摄像片段")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+
+        thread = ExternalClipProbeThread(sidecar_path, race_id, self)
+        self._external_clip_import_thread = thread
+        self._external_clip_import_progress = progress
+        self._external_clip_import_context = {
+            "race_dir": Path(self.output_dir).expanduser().absolute(),
+            "race_id": str(race_id),
+            "timeline_store": timeline_store,
+            "passage_store": passage_store,
+        }
+        action = getattr(self, "external_clip_action", None)
+        if action is not None:
+            action.setEnabled(False)
+
+        progress.canceled.connect(thread.requestInterruption)
+        thread.progress.connect(self._on_external_clip_import_progress)
+        thread.completed.connect(self._on_external_clip_import_verified)
+        thread.failed.connect(self._on_external_clip_import_failed)
+        thread.cancelled.connect(self._on_external_clip_import_cancelled)
+        thread.finished.connect(self._on_external_clip_import_finished)
+        progress.show()
+        thread.start()
+
+    def _on_external_clip_import_progress(self, completed, total, video_path):
+        progress = self._external_clip_import_progress
+        if progress is None:
+            return
+        progress.setRange(0, max(1, int(total)))
+        progress.setValue(int(completed))
+        progress.setLabelText(f"正在验证 {Path(video_path).name}")
+
+    def _on_external_clip_import_verified(self, clips):
+        context = self._external_clip_import_context
+        if context is None:
+            return
+        thread = getattr(self, "_external_clip_import_thread", None)
+        if thread is not None and thread.isInterruptionRequested():
+            self._on_external_clip_import_cancelled()
+            return
+        race_changed = (
+            not self._race_ready
+            or Path(self.output_dir).expanduser().absolute() != context["race_dir"]
+            or self.video_timeline_store is not context["timeline_store"]
+            or self.passage_event_store is not context["passage_store"]
+        )
+        if race_changed:
+            QMessageBox.warning(
+                self,
+                "导入取消",
+                "媒体验证期间赛事已切换，高速摄像片段未写入时间线。",
+            )
+            return
+        try:
+            current_race_id = race_id_from_passage_store(self.passage_event_store)
+        except (ExternalClipImportError, VideoTimelineError) as error:
+            QMessageBox.warning(self, "导入取消", str(error))
+            return
+
+        if current_race_id != context["race_id"]:
+            QMessageBox.warning(
+                self,
+                "导入取消",
+                "媒体验证期间赛事已切换，高速摄像片段未写入时间线。",
+            )
+            return
+
+        try:
+            result = import_verified_external_clips(
+                context["timeline_store"],
+                clips,
+                expected_race_id=context["race_id"],
+            )
+        except (ExternalClipImportError, VideoTimelineError) as error:
+            QMessageBox.warning(self, "导入失败", str(error))
+            return
+
+        dialog = self.passage_review_dialog
+        if dialog is not None:
+            dialog.refresh()
+        message = (
+            f"已导入 {result.created_count} 个片段，"
+            f"修复 {result.repaired_count} 个，"
+            f"跳过重复 {result.duplicate_count} 个。"
+        )
+        self.statusBar().showMessage(message, 5000)
+        QMessageBox.information(self, "导入完成", message)
+
+    def _on_external_clip_import_failed(self, message: str):
+        QMessageBox.warning(self, "导入失败", str(message))
+
+    def _on_external_clip_import_cancelled(self):
+        self.statusBar().showMessage("已取消高速摄像片段导入", 3000)
+
+    def _on_external_clip_import_finished(self):
+        thread = self.sender()
+        if thread is not self._external_clip_import_thread:
+            return
+        progress = self._external_clip_import_progress
+        if progress is not None:
+            progress.close()
+            progress.deleteLater()
+        self._external_clip_import_progress = None
+        self._external_clip_import_context = None
+        self._external_clip_import_thread = None
+        action = getattr(self, "external_clip_action", None)
+        if action is not None:
+            action.setEnabled(True)
+        thread.deleteLater()
+
     def _open_passage_location(self, event, location):
-        if location.status not in {"located", "unverified"}:
+        segment_race_id = str(getattr(location.segment, "race_id", "") or "").strip()
+        if segment_race_id and segment_race_id != event.race_id:
+            QMessageBox.warning(self, "无法打开", "该录像片段属于其他赛事。")
+            return
+        if location.status not in {"located", "near_boundary", "unverified"}:
             QMessageBox.warning(
                 self,
                 "无法打开",
@@ -4036,6 +4260,13 @@ class MainWindow(QMainWindow):
         passage_review_action.setStatusTip("按 CycleRace passage 时间定位赛事录像")
         passage_review_action.triggered.connect(self._show_passage_review)
         data_menu.addAction(passage_review_action)
+
+        self.external_clip_action = QAction("导入高速摄像片段...", self)
+        self.external_clip_action.setStatusTip(
+            "按北京时间 sidecar 将外部高速摄像片段加入当前赛事录像时间线"
+        )
+        self.external_clip_action.triggered.connect(self._import_external_clips)
+        data_menu.addAction(self.external_clip_action)
 
         init_race_action = QAction("新建赛事 (创建独立文件夹)...", self)
         init_race_action.setStatusTip("创建一个全新的赛事文件夹，所有数据独立存储")
@@ -6318,6 +6549,10 @@ class MainWindow(QMainWindow):
         """窗口关闭时清理资源（此时 Qt C++ 对象仍存活，可安全操作子线程）"""
         try:
             self._field_issue_closing = True
+            external_thread = getattr(self, "_external_clip_import_thread", None)
+            if external_thread is not None and external_thread.isRunning():
+                external_thread.requestInterruption()
+                external_thread.wait()
             MainWindow._stop_passage_receiver(self)
             field_issue_executor = getattr(self, "_field_issue_executor", None)
             if field_issue_executor is not None:

@@ -51,6 +51,8 @@ def _segment(
     ended_at_ms=20_000,
     timing_error_ms=1_500,
     verify_media=True,
+    clock_source=video_timeline.DEFAULT_CLOCK_SOURCE,
+    race_id="",
 ):
     path = race_dir / "videos" / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -60,7 +62,9 @@ def _segment(
         camera_index=camera_index,
         video_path=path,
         started_at_ms=started_at_ms,
+        clock_source=clock_source,
         timing_error_ms=timing_error_ms,
+        race_id=race_id,
     )
     if ended_at_ms is not None:
         finish_kwargs = {}
@@ -119,6 +123,81 @@ def test_reports_before_after_and_restart_gap(tmp_path):
     assert store.locate_passage(21_000).status == "after_recording"
     lookup = store.locate_passage(14_000)
     assert lookup.locations[0].video_path.name == "second.mkv"
+
+
+def test_reports_verified_clip_within_timing_error_as_near_boundary(tmp_path):
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _segment(
+        store,
+        tmp_path,
+        name="external-near-boundary.mkv",
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+        timing_error_ms=100,
+        clock_source="external_test_clock",
+    )
+
+    before = store.locate_passage(9_950)
+    after = store.locate_passage(20_050)
+
+    assert before.status == "near_boundary"
+    assert before.locations[0].status == "near_boundary"
+    assert before.locations[0].passage_position_ms == 0
+    assert after.status == "near_boundary"
+    assert after.locations[0].passage_position_ms == 10_000
+    assert store.locate_passage(9_899).status == "before_recording"
+
+
+def test_external_segment_is_filtered_by_race_identity(tmp_path):
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _segment(
+        store,
+        tmp_path,
+        name="race-1.mkv",
+        clock_source="external_test_clock",
+        race_id="race-1",
+    )
+
+    assert store.locate_passage(15_000, race_id="race-1").status == "located"
+    assert store.locate_passage(15_000, race_id="race-2").status == "race_mismatch"
+
+
+def test_schema_v1_live_segment_without_race_id_remains_compatible(tmp_path):
+    video_path = tmp_path / "videos" / "legacy.mkv"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"video")
+    journal = tmp_path / "video_timeline.jsonl"
+    records = [
+        {
+            "schema_version": 1,
+            "record_type": "segment_started",
+            "segment_id": "legacy-segment",
+            "source_id": "camera_01",
+            "camera_index": 1,
+            "video_path": "videos/legacy.mkv",
+            "started_at_ms": 10_000,
+            "clock_source": video_timeline.DEFAULT_CLOCK_SOURCE,
+            "timing_error_ms": 2_000,
+        },
+        {
+            "schema_version": 1,
+            "record_type": "segment_ended",
+            "segment_id": "legacy-segment",
+            "ended_at_ms": 20_000,
+            "end_reason": "stopped",
+            "media_duration_ms": 10_000,
+            "media_started_at_ms": 10_000,
+        },
+    ]
+    journal.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    store = VideoTimelineStore(journal)
+
+    assert store.segments()[0].race_id == ""
+    assert store.locate_passage(15_000, race_id="race-2").status == "located"
 
 
 def test_returns_one_location_per_camera(tmp_path):

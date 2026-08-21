@@ -226,6 +226,7 @@ class PassageEventStore:
         self._lock = threading.RLock()
         self._events: dict[str, PassageEvent] = {}
         self._event_order: list[str] = []
+        self._race_ids: set[str] = set()
         self._recovered_incomplete_tail = False
         self._load_existing()
 
@@ -269,6 +270,7 @@ class PassageEventStore:
             offset += len(raw_line)
 
     def _merge_loaded(self, event: PassageEvent, line_number: int) -> None:
+        self._race_ids.add(event.race_id)
         current = self._events.get(event.event_id)
         if current is None:
             self._event_order.append(event.event_id)
@@ -300,6 +302,16 @@ class PassageEventStore:
         if not isinstance(event, PassageEvent):
             raise TypeError("event must be a PassageEvent")
         with self._lock:
+            if len(self._race_ids) > 1:
+                raise PassageEventConflictError(
+                    "passage event journal contains multiple race_id values"
+                )
+            if self._race_ids and event.race_id not in self._race_ids:
+                active_race_id = next(iter(self._race_ids))
+                raise PassageEventConflictError(
+                    "passage event race_id does not match this race journal: "
+                    f"expected {active_race_id}"
+                )
             current = self._events.get(event.event_id)
             if current is not None:
                 if event.revision < current.revision:
@@ -354,6 +366,7 @@ class PassageEventStore:
             if current is None:
                 self._event_order.append(event.event_id)
             self._events[event.event_id] = event
+            self._race_ids.add(event.race_id)
             return PassageIngestResult.ACCEPTED
 
     def get(self, event_id: str) -> Optional[PassageEvent]:

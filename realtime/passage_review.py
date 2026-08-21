@@ -39,13 +39,15 @@ _STATUS_TEXT = {
     "before_recording": "早于录像",
     "after_recording": "晚于录像",
     "recording_gap": "录像分段间隙",
+    "race_mismatch": "录像属于其他赛事",
+    "near_boundary": "位于时间误差边界，可打开核验",
     "recording": "对应机位仍在录像",
     "missing_file": "录像文件缺失",
     "unverified": "录像可打开，但时间范围未验证",
     "outside_media": "Passage 超出录像真实媒体范围",
 }
 
-_OPENABLE_STATUSES = {"located", "unverified"}
+_OPENABLE_STATUSES = {"located", "near_boundary", "unverified"}
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
@@ -73,6 +75,10 @@ def lookup_status_text(lookup: PassageVideoLookup) -> str:
             else ""
         )
         return f"{len(located)} 个机位，近似 ±{uncertainty} ms{suffix}"
+    nearby = [item for item in lookup.locations if item.status == "near_boundary"]
+    if nearby:
+        uncertainty = max(item.timing_error_ms for item in nearby)
+        return f"{len(nearby)} 个机位位于误差边界，约 ±{uncertainty} ms"
     unverified = [item for item in lookup.locations if item.status == "unverified"]
     if unverified:
         return f"{len(unverified)} 个机位可打开，时间范围未验证"
@@ -170,6 +176,7 @@ class PassageReviewDialog(QDialog):
             event.timeline_timestamp_ms,
             clock_offset_ms=self.clock_offset_ms,
             pre_roll_ms=self.pre_roll_ms,
+            race_id=event.race_id,
         )
 
     def refresh(self) -> None:

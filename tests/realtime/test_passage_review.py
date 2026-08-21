@@ -130,3 +130,73 @@ def test_review_disables_open_when_passage_has_no_recording(qapp, tmp_path):
     assert dialog.table.item(0, 5).text() == "没有录像时间线"
     assert dialog.table.cellWidget(0, 6).isEnabled() is False
     dialog.close()
+
+
+def test_review_allows_near_boundary_clip_with_warning(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(passage_time_ms=9_950))
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    video_path = tmp_path / "videos" / "camera_01.mkv"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"video")
+    segment = timeline_store.start_segment(
+        source_id="camera_01",
+        camera_index=1,
+        video_path=video_path,
+        started_at_ms=10_000,
+        clock_source="external_test_clock",
+        timing_error_ms=100,
+        race_id="race-1",
+    )
+    timeline_store.finish_segment(
+        segment.segment_id,
+        ended_at_ms=20_000,
+        media_duration_ms=10_000,
+        media_started_at_ms=10_000,
+    )
+    opened = []
+    dialog = PassageReviewDialog(
+        passage_store,
+        timeline_store,
+        open_location=lambda event, location: opened.append((event, location)),
+    )
+    qapp.processEvents()
+
+    button = dialog.table.cellWidget(0, 6)
+    assert button.isEnabled()
+    assert "误差边界" in dialog.table.item(0, 5).text()
+    button.click()
+
+    assert opened[0][1].status == "near_boundary"
+    assert opened[0][1].playback_position_ms == 0
+    dialog.close()
+
+
+def test_review_rejects_external_clip_from_another_race(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event())
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    video_path = tmp_path / "videos" / "other-race.mkv"
+    video_path.parent.mkdir()
+    video_path.write_bytes(b"video")
+    segment = timeline_store.start_segment(
+        source_id="high_speed_01",
+        camera_index=1,
+        video_path=video_path,
+        started_at_ms=10_000,
+        clock_source="external_test_clock",
+        race_id="race-2",
+    )
+    timeline_store.finish_segment(
+        segment.segment_id,
+        ended_at_ms=20_000,
+        media_duration_ms=10_000,
+        media_started_at_ms=10_000,
+    )
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+
+    assert dialog.table.item(0, 5).text() == "录像属于其他赛事"
+    assert dialog.table.cellWidget(0, 6).isEnabled() is False
+    dialog.close()

@@ -137,6 +137,25 @@ def test_same_revision_with_different_content_is_rejected(running_receiver):
     assert store.get("race-1-stage-1-passage-7").bib == "23"
 
 
+def test_race_journal_rejects_passage_from_another_race(running_receiver):
+    receiver, store, accepted = running_receiver
+    assert post_json(receiver, passage_payload())[0] == 201
+
+    status, ack = post_json(
+        receiver,
+        passage_payload(
+            event_id="race-2-stage-1-passage-1",
+            race_id="race-2",
+            sequence=1,
+        ),
+    )
+
+    assert status == 409
+    assert ack["status"] == "rejected"
+    assert len(store) == 1
+    assert [event.race_id for event in accepted] == ["race-1"]
+
+
 def test_newer_revision_replaces_latest_and_stale_revision_is_duplicate(
     running_receiver,
 ):

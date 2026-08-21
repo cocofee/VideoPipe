@@ -2913,6 +2913,7 @@ class MainWindow(QMainWindow):
             self._init_video_labels()
 
     def _activate_race_dir(self, race_dir: Path):
+        self._close_passage_review()
         self.output_dir = race_dir.absolute()
         self.config['output_dir'] = str(self.output_dir)
         self.field_issue_log = FieldIssueLog(self.output_dir / "issues.jsonl")
@@ -3127,10 +3128,10 @@ class MainWindow(QMainWindow):
             "color: #667085; font-size: 12px; font-weight: 600;"
         )
         header_layout.addWidget(self.evidence_status_label)
-        self.passage_review_btn = QPushButton("通过记录")
+        self.passage_review_btn = QPushButton("终点核对")
         self.passage_review_btn.setObjectName("settings_btn")
         self.passage_review_btn.setEnabled(False)
-        self.passage_review_btn.setToolTip("查看 CycleRace passage 与对应录像位置")
+        self.passage_review_btn.setToolTip("按号码快速核对普通录像和高速摄像")
         self.passage_review_btn.clicked.connect(self._show_passage_review)
         header_layout.addWidget(self.passage_review_btn)
         self.external_clip_btn = QPushButton("导入高速")
@@ -4218,6 +4219,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法打开", "当前赛事的录像时间线不可用。")
             return
 
+        dialog = self.passage_review_dialog
+        if dialog is not None:
+            dialog.refresh()
+            if dialog.isMinimized():
+                dialog.showNormal()
+            else:
+                dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+
         dialog = PassageReviewDialog(
             self.passage_event_store,
             self.video_timeline_store,
@@ -4226,16 +4238,31 @@ class MainWindow(QMainWindow):
             pre_roll_ms=self._passage_video_preroll_ms,
             open_location=self._open_passage_location,
         )
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.finished.connect(
+            lambda _result, current=dialog: self._on_passage_review_finished(current)
+        )
         self.passage_review_dialog = dialog
-        try:
-            dialog.exec_()
-        finally:
-            self.passage_review_dialog = None
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
+    def _on_passage_review_finished(self, dialog):
+        if dialog is not self.passage_review_dialog:
+            return
         if dialog.clock_offset_ms != self._passage_clock_offset_ms:
             self._passage_clock_offset_ms = dialog.clock_offset_ms
             self.config["passage_clock_offset_ms"] = self._passage_clock_offset_ms
             self._save_config()
+        self.passage_review_dialog = None
+
+    def _close_passage_review(self):
+        dialog = self.passage_review_dialog
+        if dialog is None:
+            return
+        dialog.close()
+        if self.passage_review_dialog is dialog:
+            self.passage_review_dialog = None
 
     def _import_external_clips(self):
         thread = getattr(self, "_external_clip_import_thread", None)
@@ -4573,8 +4600,8 @@ class MainWindow(QMainWindow):
         playback_action.triggered.connect(self._on_playback_clicked)
         data_menu.addAction(playback_action)
 
-        passage_review_action = QAction("CycleRace 通过记录...", self)
-        passage_review_action.setStatusTip("按 CycleRace passage 时间定位赛事录像")
+        passage_review_action = QAction("终点核对...", self)
+        passage_review_action.setStatusTip("按号码快速核对普通录像和高速摄像")
         passage_review_action.triggered.connect(self._show_passage_review)
         data_menu.addAction(passage_review_action)
 
@@ -6983,6 +7010,7 @@ class MainWindow(QMainWindow):
         """窗口关闭时清理资源（此时 Qt C++ 对象仍存活，可安全操作子线程）"""
         try:
             self._field_issue_closing = True
+            MainWindow._close_passage_review(self)
             external_thread = getattr(self, "_external_clip_import_thread", None)
             if external_thread is not None and external_thread.isRunning():
                 external_thread.requestInterruption()

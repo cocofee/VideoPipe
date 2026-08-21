@@ -712,3 +712,119 @@ def test_passage_video_can_open_while_capture_is_running(qapp, tmp_path, monkeyp
     assert opened[0][2]["autoplay"] is False
     window._running = False
     window.close()
+
+
+def test_passage_review_is_non_modal_and_reuses_the_open_window(
+    monkeypatch,
+):
+    class _Signal:
+        def __init__(self):
+            self.callback = None
+
+        def connect(self, callback):
+            self.callback = callback
+
+        def emit(self, result=0):
+            if self.callback is not None:
+                self.callback(result)
+
+    class _PassageReviewDialog:
+        instances = []
+
+        def __init__(
+            self,
+            passage_store,
+            timeline_store,
+            parent=None,
+            *,
+            clock_offset_ms,
+            pre_roll_ms,
+            open_location,
+        ):
+            self.passage_store = passage_store
+            self.timeline_store = timeline_store
+            self.clock_offset_ms = clock_offset_ms
+            self.pre_roll_ms = pre_roll_ms
+            self.open_location = open_location
+            self.refresh_count = 0
+            self.show_count = 0
+            self.raise_count = 0
+            self.activate_count = 0
+            self.finished = _Signal()
+            self.minimized = False
+            type(self).instances.append(self)
+
+        def setAttribute(self, *_args):
+            return None
+
+        def refresh(self):
+            self.refresh_count += 1
+
+        def isMinimized(self):
+            return self.minimized
+
+        def showNormal(self):
+            self.minimized = False
+            self.show_count += 1
+
+        def show(self):
+            self.show_count += 1
+
+        def raise_(self):
+            self.raise_count += 1
+
+        def activateWindow(self):
+            self.activate_count += 1
+
+        def close(self):
+            self.finished.emit()
+
+    class _Window:
+        _show_passage_review = MainWindow._show_passage_review
+        _on_passage_review_finished = MainWindow._on_passage_review_finished
+        _close_passage_review = MainWindow._close_passage_review
+
+        def __init__(self):
+            self._race_ready = True
+            self.passage_event_store = object()
+            self.video_timeline_store = object()
+            self.passage_review_dialog = None
+            self._passage_clock_offset_ms = 0
+            self._passage_video_preroll_ms = 3_000
+            self.config = {}
+            self.saved = []
+
+        def _open_passage_location(self, *_args):
+            return None
+
+        def _save_config(self):
+            self.saved.append(True)
+
+    monkeypatch.setattr(main_window, "PassageReviewDialog", _PassageReviewDialog)
+    window = _Window()
+
+    window._show_passage_review()
+    dialog = _PassageReviewDialog.instances[0]
+
+    assert len(_PassageReviewDialog.instances) == 1
+    assert window.passage_review_dialog is dialog
+    assert dialog.show_count == 1
+    assert dialog.raise_count == 1
+    assert dialog.activate_count == 1
+
+    window._show_passage_review()
+    assert len(_PassageReviewDialog.instances) == 1
+    assert dialog.refresh_count == 1
+    assert dialog.raise_count == 2
+    assert dialog.activate_count == 2
+
+    dialog.clock_offset_ms = 750
+    dialog.close()
+    assert window.passage_review_dialog is None
+    assert window._passage_clock_offset_ms == 750
+    assert window.saved == [True]
+
+    window._show_passage_review()
+    assert window.passage_review_dialog is _PassageReviewDialog.instances[1]
+    window._close_passage_review()
+    assert window.passage_review_dialog is None

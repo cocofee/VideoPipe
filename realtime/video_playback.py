@@ -89,7 +89,13 @@ class PlaybackVideoLabel(QLabel):
 
     def set_frame(self, image: QImage) -> None:
         self._frame = QPixmap.fromImage(image)
+        self.setText("")
         self._render_frame()
+
+    def clear_frame(self, message: str = "") -> None:
+        self._frame = None
+        self.clear()
+        self.setText(str(message or ""))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -303,6 +309,7 @@ class TargetTimelineSlider(QSlider):
 class VideoPlaybackWorker(QThread):
     metadata_ready = pyqtSignal(int, float, int, int, int)
     frame_ready = pyqtSignal(QImage, int, int)
+    full_resolution_ready = pyqtSignal(QImage, int, int)
     playback_finished = pyqtSignal()
     playback_error = pyqtSignal(str)
 
@@ -322,6 +329,7 @@ class VideoPlaybackWorker(QThread):
         self._speed = 1.0
         self._direction = 1
         self._seek_frame: Optional[int] = None
+        self._full_resolution_frame: Optional[int] = None
         self._step_frames = 0
         self._anchor_reset = True
         self._current_frame_index = -1
@@ -383,14 +391,26 @@ class VideoPlaybackWorker(QThread):
             self._step_frames += int(frame_delta)
             self._condition.notify_all()
 
+    def request_full_resolution(self, frame_index: Optional[int] = None) -> None:
+        with self._condition:
+            target = self._current_frame_index if frame_index is None else int(frame_index)
+            if target < 0:
+                return
+            self._full_resolution_frame = self._clamp_frame(target)
+            self._condition.notify_all()
+
     def stop(self) -> None:
         with self._condition:
             self._stop_requested = True
             self._condition.notify_all()
 
-    def _image_from_frame(self, frame) -> QImage:
+    def _image_from_frame(self, frame, *, full_resolution: bool = False) -> QImage:
         height, width = frame.shape[:2]
-        scale = min(1.0, 1280.0 / max(1, width), 720.0 / max(1, height))
+        scale = (
+            1.0
+            if full_resolution
+            else min(1.0, 1280.0 / max(1, width), 720.0 / max(1, height))
+        )
         if scale < 1.0:
             frame = cv2.resize(
                 frame,
@@ -451,6 +471,24 @@ class VideoPlaybackWorker(QThread):
         self._emit_image(image, target)
         return True, capture_next_frame
 
+    def _decode_full_resolution(
+        self,
+        capture,
+        target: int,
+        capture_next_frame: int,
+    ) -> tuple[bool, int]:
+        if target != capture_next_frame:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, target)
+            capture_next_frame = target
+        ok, frame = capture.read()
+        if not ok:
+            return False, capture_next_frame
+        capture_next_frame = int(capture.get(cv2.CAP_PROP_POS_FRAMES) or target + 1)
+        image = self._image_from_frame(frame, full_resolution=True)
+        position_ms = int(max(0, target) * 1000.0 / self._fps)
+        self.full_resolution_ready.emit(image, position_ms, target)
+        return True, capture_next_frame
+
     def run(self) -> None:
         capture = self._capture_factory(str(self.video_path))
         try:
@@ -487,6 +525,8 @@ class VideoPlaybackWorker(QThread):
                         break
                     seek_frame = self._seek_frame
                     self._seek_frame = None
+                    full_resolution_frame = self._full_resolution_frame
+                    self._full_resolution_frame = None
                     step_frames = self._step_frames
                     self._step_frames = 0
                     playing = self._playing
@@ -505,6 +545,14 @@ class VideoPlaybackWorker(QThread):
                     if ok:
                         last_frame_index = target
                     anchor_clock = time.monotonic()
+                    continue
+
+                if full_resolution_frame is not None:
+                    _, capture_next_frame = self._decode_full_resolution(
+                        capture,
+                        self._clamp_frame(full_resolution_frame),
+                        capture_next_frame,
+                    )
                     continue
 
                 if step_frames:

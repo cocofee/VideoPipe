@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
@@ -46,11 +46,15 @@ _STATUS_TEXT = {
 }
 
 _OPENABLE_STATUSES = {"located", "unverified"}
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def format_passage_time(timestamp_ms: int) -> str:
     try:
-        value = datetime.fromtimestamp(int(timestamp_ms) / 1000.0).astimezone()
+        value = datetime.fromtimestamp(
+            int(timestamp_ms) / 1000.0,
+            tz=BEIJING_TIMEZONE,
+        )
     except (OSError, OverflowError, ValueError):
         return f"{int(timestamp_ms)} ms"
     return value.strftime("%H:%M:%S.%f")[:-3]
@@ -163,7 +167,7 @@ class PassageReviewDialog(QDialog):
 
     def _lookup(self, event: PassageEvent) -> PassageVideoLookup:
         return self.timeline_store.locate_passage(
-            event.passage_time_ms,
+            event.timeline_timestamp_ms,
             clock_offset_ms=self.clock_offset_ms,
             pre_roll_ms=self.pre_roll_ms,
         )
@@ -185,7 +189,7 @@ class PassageReviewDialog(QDialog):
                 identity,
                 event.group_id,
                 str(event.lap),
-                format_passage_time(event.passage_time_ms),
+                format_passage_time(event.timeline_timestamp_ms),
                 lookup_status_text(lookup),
             )
             for column, value in enumerate(values):

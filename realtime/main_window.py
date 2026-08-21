@@ -3800,7 +3800,7 @@ class MainWindow(QMainWindow):
             video_status = "录像时间线不可用"
         else:
             lookup = timeline.locate_passage(
-                event.passage_time_ms,
+                event.timeline_timestamp_ms,
                 clock_offset_ms=self._passage_clock_offset_ms,
                 pre_roll_ms=self._passage_video_preroll_ms,
             )

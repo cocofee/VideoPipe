@@ -51,8 +51,14 @@ revision are available in the status tooltip.
 
 ## Video timeline lookup
 
-`passage_time_ms` is a Unix epoch timestamp in milliseconds from the CycleRace
-computer. VideoPipe records each RTSP recording segment in:
+`passage_time_ms` retains CycleRace's official milliseconds since local
+midnight. When the competition has a valid same-day `stage.date`, CycleRace
+also sends the optional `passage_timestamp_ms` field as Unix epoch milliseconds
+for that Beijing passage time (`UTC+08:00`). VideoPipe uses the absolute field
+for video lookup when present and falls back to `passage_time_ms` for legacy
+senders. The review table always renders absolute passage timestamps in fixed
+Beijing time, regardless of the VideoPipe computer's local timezone setting.
+VideoPipe records each RTSP recording segment in:
 
 ```text
 <race directory>/video_timeline.jsonl
@@ -74,7 +80,7 @@ outside the media range and is not presented as a located frame.
 Two-computer clocks must be calibrated explicitly. VideoPipe applies:
 
 ```text
-VideoPipe timestamp = passage_time_ms + passage_clock_offset_ms
+VideoPipe timestamp = preferred passage timestamp + passage_clock_offset_ms
 ```
 
 The default offset is `0`. The review window always displays the active offset

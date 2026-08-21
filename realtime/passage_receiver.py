@@ -80,6 +80,15 @@ def _integer_field(
     return value
 
 
+def _optional_integer_field(
+    payload: Mapping[str, Any],
+    name: str,
+) -> Optional[int]:
+    if name not in payload or payload[name] is None:
+        return None
+    return _integer_field(payload, name)
+
+
 @dataclass(frozen=True, slots=True)
 class PassageEvent:
     """Stable CycleRace -> VideoPipe protocol v1 payload."""
@@ -98,6 +107,7 @@ class PassageEvent:
     revision: int = 1
     schema_version: int = SCHEMA_VERSION
     message_type: str = MESSAGE_TYPE
+    passage_timestamp_ms: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -113,6 +123,13 @@ class PassageEvent:
             raise PassageEventError("chip_id or bib is required")
         if self.passage_time_ms < 0:
             raise PassageEventError("passage_time_ms must be non-negative")
+        if (
+            self.passage_timestamp_ms is not None
+            and self.passage_timestamp_ms < 0
+        ):
+            raise PassageEventError(
+                "passage_timestamp_ms must be non-negative when provided"
+            )
         if self.lap < 0:
             raise PassageEventError("lap must be non-negative")
         if not self.source.strip():
@@ -121,6 +138,12 @@ class PassageEvent:
             raise PassageEventError("emitted_at_ms must be non-negative")
         if self.revision <= 0:
             raise PassageEventError("revision must be positive")
+
+    @property
+    def timeline_timestamp_ms(self) -> int:
+        if self.passage_timestamp_ms is not None:
+            return int(self.passage_timestamp_ms)
+        return int(self.passage_time_ms)
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "PassageEvent":
@@ -141,6 +164,10 @@ class PassageEvent:
             source=_string_field(payload, "source"),
             emitted_at_ms=_integer_field(payload, "emitted_at_ms", default=0),
             revision=_integer_field(payload, "revision", default=1),
+            passage_timestamp_ms=_optional_integer_field(
+                payload,
+                "passage_timestamp_ms",
+            ),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -160,6 +187,7 @@ class PassageEvent:
             "source": payload["source"],
             "emitted_at_ms": payload["emitted_at_ms"],
             "revision": payload["revision"],
+            "passage_timestamp_ms": payload["passage_timestamp_ms"],
         }
 
 

@@ -16,7 +16,7 @@ def qapp():
     yield app
 
 
-def _event(passage_time_ms=15_000):
+def _event(passage_time_ms=15_000, passage_timestamp_ms=None):
     return PassageEvent(
         event_id="passage-1",
         race_id="race-1",
@@ -28,12 +28,15 @@ def _event(passage_time_ms=15_000):
         passage_time_ms=passage_time_ms,
         lap=2,
         emitted_at_ms=passage_time_ms + 100,
+        passage_timestamp_ms=passage_timestamp_ms,
     )
 
 
 def test_review_opens_located_video_at_preroll_position(qapp, tmp_path):
     passage_store = PassageEventStore(tmp_path / "passages.jsonl")
-    passage_store.append(_event())
+    passage_store.append(
+        _event(passage_time_ms=5_000, passage_timestamp_ms=15_000)
+    )
     timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
     video_path = tmp_path / "videos" / "camera_01.mkv"
     video_path.parent.mkdir()
@@ -73,6 +76,23 @@ def test_review_opens_located_video_at_preroll_position(qapp, tmp_path):
     assert opened[0][1].video_path == video_path.absolute()
     assert opened[0][1].passage_position_ms == 5_500
     assert opened[0][1].playback_position_ms == 2_500
+    dialog.close()
+
+
+def test_review_displays_absolute_passage_in_beijing_time(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(
+            passage_time_ms=48_179_215,
+            passage_timestamp_ms=1_786_252_979_215,
+        )
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+
+    assert dialog.table.item(0, 4).text() == "13:22:59.215"
     dialog.close()
 
 

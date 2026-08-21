@@ -6,7 +6,8 @@ from realtime.video_timeline import VideoTimelineStore
 
 
 def test_http_passage_is_durably_mapped_to_video_preroll(tmp_path):
-    passage_time_ms = 1_787_217_138_520
+    passage_time_ms = 48_179_215
+    passage_timestamp_ms = 1_786_252_979_215
     video_path = tmp_path / "videos" / "camera_01.mkv"
     video_path.parent.mkdir()
     video_path.write_bytes(b"video")
@@ -16,14 +17,14 @@ def test_http_passage_is_durably_mapped_to_video_preroll(tmp_path):
         source_id="camera_01",
         camera_index=1,
         video_path=video_path,
-        started_at_ms=passage_time_ms - 8_000,
+        started_at_ms=passage_timestamp_ms - 8_000,
         timing_error_ms=1_500,
     )
     timeline.finish_segment(
         segment.segment_id,
-        ended_at_ms=passage_time_ms + 8_000,
+        ended_at_ms=passage_timestamp_ms + 8_000,
         media_duration_ms=16_000,
-        media_started_at_ms=passage_time_ms - 8_000,
+        media_started_at_ms=passage_timestamp_ms - 8_000,
     )
 
     lookups = []
@@ -34,7 +35,7 @@ def test_http_passage_is_durably_mapped_to_video_preroll(tmp_path):
         passage_store,
         on_accepted=lambda event: lookups.append(
             timeline.locate_passage(
-                event.passage_time_ms,
+                event.timeline_timestamp_ms,
                 clock_offset_ms=250,
                 pre_roll_ms=3_000,
             )
@@ -53,9 +54,10 @@ def test_http_passage_is_durably_mapped_to_video_preroll(tmp_path):
             "chip_id": "chip-23",
             "bib": "23",
             "passage_time_ms": passage_time_ms,
+            "passage_timestamp_ms": passage_timestamp_ms,
             "lap": 1,
             "source": "cyclerace",
-            "emitted_at_ms": passage_time_ms + 100,
+            "emitted_at_ms": passage_timestamp_ms + 100,
             "revision": 1,
         }
         request = Request(

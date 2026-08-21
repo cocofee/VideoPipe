@@ -81,6 +81,51 @@ def test_accepts_and_deduplicates_one_revision(running_receiver):
     assert len(store.journal_path.read_text(encoding="utf-8").splitlines()) == 1
 
 
+def test_optional_field_preserves_positional_constructor_contract():
+    event = PassageEvent(
+        "event-1",
+        "race-1",
+        "stage-1",
+        "group-1",
+        7,
+        "chip-23",
+        "23",
+        123_456,
+        2,
+        "cyclerace",
+        456_789,
+        3,
+        1,
+        "passage",
+    )
+
+    assert event.lap == 2
+    assert event.message_type == "passage"
+    assert event.passage_timestamp_ms is None
+    assert event.timeline_timestamp_ms == 123_456
+
+
+def test_optional_absolute_passage_timestamp_is_preserved(running_receiver):
+    receiver, store, accepted = running_receiver
+    absolute_timestamp_ms = 1_786_252_979_215
+
+    status, ack = post_json(
+        receiver,
+        passage_payload(
+            passage_time_ms=48_179_215,
+            passage_timestamp_ms=absolute_timestamp_ms,
+        ),
+    )
+
+    assert status == 201
+    assert ack["status"] == "accepted"
+    event = store.get("race-1-stage-1-passage-7")
+    assert event.passage_time_ms == 48_179_215
+    assert event.passage_timestamp_ms == absolute_timestamp_ms
+    assert event.timeline_timestamp_ms == absolute_timestamp_ms
+    assert accepted == [event]
+
+
 def test_same_revision_with_different_content_is_rejected(running_receiver):
     receiver, store, _ = running_receiver
     assert post_json(receiver, passage_payload())[0] == 201
@@ -122,6 +167,7 @@ def test_newer_revision_replaces_latest_and_stale_revision_is_duplicate(
         passage_payload(sequence="7"),
         passage_payload(chip_id="", bib=""),
         passage_payload(passage_time_ms=-1),
+        passage_payload(passage_timestamp_ms=-1),
         passage_payload(lap=-1),
         passage_payload(revision=0),
     ],

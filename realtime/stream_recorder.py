@@ -16,8 +16,18 @@ from urllib.parse import urlsplit
 
 try:
     from .runtime_paths import application_dir, resource_dir
+    from .video_timeline import (
+        DEFAULT_TIMING_ERROR_MS,
+        VideoTimelineStore,
+        probe_video_duration_ms,
+    )
 except ImportError:
     from runtime_paths import application_dir, resource_dir
+    from video_timeline import (
+        DEFAULT_TIMING_ERROR_MS,
+        VideoTimelineStore,
+        probe_video_duration_ms,
+    )
 
 
 _RTSP_CREDENTIAL_PATTERN = re.compile(
@@ -354,6 +364,9 @@ class ManualRecordingManager:
         max_restart_attempts: int = 3,
         restart_window_seconds: float = 60.0,
         monotonic: Callable[[], float] = time.monotonic,
+        clock: Optional[Callable[[], datetime]] = None,
+        timeline_store: Optional[VideoTimelineStore] = None,
+        timeline_timing_error_ms: int = DEFAULT_TIMING_ERROR_MS,
     ):
         self.sources = list(sources)
         self.output_dir = Path(output_dir)
@@ -362,10 +375,70 @@ class ManualRecordingManager:
         self.max_restart_attempts = max(1, int(max_restart_attempts))
         self.restart_window_seconds = max(1.0, float(restart_window_seconds))
         self._monotonic = monotonic
+        self._clock = clock or (lambda: datetime.now().astimezone())
+        self.timeline_store = timeline_store
+        self.timeline_timing_error_ms = max(0, int(timeline_timing_error_ms))
         self._recorders: list[FfmpegStreamRecorder] = []
         self._started_at: Optional[datetime] = None
         self._restart_attempts: dict[int, deque[float]] = {}
         self._last_recovery_notice: Optional[str] = None
+        self._timeline_segment_ids: dict[int, str] = {}
+        self._timeline_warning: Optional[str] = None
+
+    @staticmethod
+    def _datetime_ms(value: datetime) -> int:
+        if value.tzinfo is None:
+            value = value.astimezone()
+        return int(round(value.timestamp() * 1000.0))
+
+    def _record_timeline_start(self, recorder: FfmpegStreamRecorder) -> None:
+        if self.timeline_store is None or recorder.output_path is None:
+            return
+        started_at = recorder.started_at or self._clock()
+        try:
+            segment = self.timeline_store.start_segment(
+                source_id=f"camera_{recorder.camera_index:02d}",
+                camera_index=recorder.camera_index,
+                video_path=recorder.output_path,
+                started_at_ms=self._datetime_ms(started_at),
+                timing_error_ms=self.timeline_timing_error_ms,
+            )
+        except Exception as exc:
+            self._timeline_warning = (
+                f"机位 {recorder.camera_index} 录像已开始，但时间线写入失败: "
+                f"{sanitize_recording_message(exc)}"
+            )
+            return
+        self._timeline_segment_ids[recorder.camera_index] = segment.segment_id
+
+    def _record_timeline_end(
+        self,
+        recorder: FfmpegStreamRecorder,
+        end_reason: str,
+    ) -> None:
+        if self.timeline_store is None:
+            return
+        camera_index = recorder.camera_index
+        segment_id = self._timeline_segment_ids.pop(camera_index, None)
+        if segment_id is None:
+            return
+        media_duration_ms = (
+            probe_video_duration_ms(recorder.output_path)
+            if recorder.output_path is not None
+            else None
+        )
+        try:
+            self.timeline_store.finish_segment(
+                segment_id,
+                ended_at_ms=self._datetime_ms(self._clock()),
+                end_reason=end_reason,
+                media_duration_ms=media_duration_ms,
+            )
+        except Exception as exc:
+            self._timeline_warning = (
+                f"机位 {camera_index} 录像已保存，但时间线收尾失败: "
+                f"{sanitize_recording_message(exc)}"
+            )
 
     @property
     def is_recording(self) -> bool:
@@ -416,12 +489,14 @@ class ManualRecordingManager:
                 )
                 recorder.start()
                 started.append(recorder)
+                self._record_timeline_start(recorder)
         except Exception as exc:
             for recorder in started:
                 try:
                     recorder.stop()
                 except Exception:
                     pass
+                self._record_timeline_end(recorder, "start_rollback")
             raise RecordingError(sanitize_recording_message(exc)) from exc
 
         self._recorders = started
@@ -455,7 +530,9 @@ class ManualRecordingManager:
                 )
 
             try:
+                self._record_timeline_end(recorder, "unexpected_exit")
                 output_path = recorder.restart()
+                self._record_timeline_start(recorder)
             except Exception as exc:
                 return (
                     f"机位 {recorder.camera_index}: {error}; "
@@ -474,6 +551,11 @@ class ManualRecordingManager:
         self._last_recovery_notice = None
         return notice
 
+    def consume_timeline_warning(self) -> Optional[str]:
+        warning = self._timeline_warning
+        self._timeline_warning = None
+        return warning
+
     def stop(self) -> tuple[Path, ...]:
         recorders = list(self._recorders)
         paths = self.output_paths
@@ -482,10 +564,14 @@ class ManualRecordingManager:
 
         errors = []
         for recorder in recorders:
+            end_reason = "stopped"
             try:
                 recorder.stop()
             except RecordingError as exc:
+                end_reason = "stop_error"
                 errors.append(f"机位 {recorder.camera_index}: {exc}")
+            finally:
+                self._record_timeline_end(recorder, end_reason)
         if errors:
             raise RecordingError("; ".join(errors))
         return paths

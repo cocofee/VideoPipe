@@ -48,3 +48,37 @@ video evidence without changing detection, OCR, or evidence semantics.
 The main window shows the listener state and the number of unique passage
 events received for the active race. The latest bib/chip, group, lap, and
 revision are available in the status tooltip.
+
+## Video timeline lookup
+
+`passage_time_ms` is a Unix epoch timestamp in milliseconds from the CycleRace
+computer. VideoPipe records each RTSP recording segment in:
+
+```text
+<race directory>/video_timeline.jsonl
+```
+
+The segment journal remains separate from `crossing_events`. It records the
+VideoPipe system-clock start and end of each camera file, including automatic
+FFmpeg restart segments. When a segment ends, VideoPipe also probes its frame
+count and FPS with OpenCV and stores the verified media duration and derived
+media start time. The review window maps a passage to every camera segment
+whose media range contains the adjusted timestamp, then opens the video a few
+seconds before the estimated position.
+
+Older timeline records without media duration remain openable, but the review
+window labels their range as unverified. A timestamp that only falls inside the
+FFmpeg process interval but outside the verified media interval is reported as
+outside the media range and is not presented as a located frame.
+
+Two-computer clocks must be calibrated explicitly. VideoPipe applies:
+
+```text
+VideoPipe timestamp = passage_time_ms + passage_clock_offset_ms
+```
+
+The default offset is `0`. The review window always displays the active offset
+and the configured segment timing uncertainty. This is an approximate video
+navigation aid: FFmpeg process start is not guaranteed to equal the first
+captured frame, and neither the offset nor the located frame changes official
+CycleRace timing or results.

@@ -12,6 +12,7 @@ from realtime.stream_recorder import (
     find_ffmpeg_executable,
     sanitize_recording_message,
 )
+from realtime.video_timeline import VideoTimelineStore
 
 
 class _InspectableBytesIO(BytesIO):
@@ -285,3 +286,94 @@ def test_manager_requires_an_rtsp_source(tmp_path):
 
     with pytest.raises(RecordingError, match="RTSP"):
         manager.start()
+
+
+def test_manager_persists_restart_segments_in_video_timeline(tmp_path, monkeypatch):
+    timeline = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    utc = timezone.utc
+    end_times = iter(
+        [
+            datetime(2026, 8, 20, 12, 0, 5, tzinfo=utc),
+            datetime(2026, 8, 20, 12, 0, 10, tzinfo=utc),
+        ]
+    )
+    media_durations = {
+        "camera_01_first.mkv": 4_000,
+        "camera_01_second.mkv": 4_500,
+    }
+    monkeypatch.setattr(
+        stream_recorder,
+        "probe_video_duration_ms",
+        lambda path: media_durations[path.name],
+    )
+
+    class _Recorder:
+        def __init__(self, source, output_dir, *, camera_index, ffmpeg_path):
+            self.source = source
+            self.output_dir = output_dir
+            self.camera_index = camera_index
+            self.output_path = None
+            self.output_paths = ()
+            self.started_at = datetime(2026, 8, 20, 12, 0, 0, tzinfo=utc)
+            self.is_running = False
+            self.size_bytes = 0
+            self.failed = False
+
+        def _write(self, name):
+            self.output_path = self.output_dir / name
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            self.output_path.write_bytes(b"video")
+            self.output_paths = (*self.output_paths, self.output_path)
+            self.size_bytes = sum(path.stat().st_size for path in self.output_paths)
+            self.is_running = True
+            return self.output_path
+
+        def start(self):
+            return self._write("camera_01_first.mkv")
+
+        def check_error(self):
+            if not self.failed:
+                return None
+            self.failed = False
+            self.is_running = False
+            return "connection lost"
+
+        def restart(self):
+            self.started_at = datetime(2026, 8, 20, 12, 0, 5, tzinfo=utc)
+            return self._write("camera_01_second.mkv")
+
+        def stop(self):
+            self.is_running = False
+            return self.output_path
+
+    manager = ManualRecordingManager(
+        ["rtsp://camera/live"],
+        tmp_path / "videos",
+        recorder_factory=_Recorder,
+        timeline_store=timeline,
+        timeline_timing_error_ms=1_250,
+        clock=lambda: next(end_times),
+    )
+    manager.start()
+    manager._recorders[0].failed = True
+
+    assert manager.check_error() is None
+    manager.stop()
+
+    segments = timeline.segments()
+    assert [segment.video_path for segment in segments] == [
+        "videos/camera_01_first.mkv",
+        "videos/camera_01_second.mkv",
+    ]
+    assert [segment.end_reason for segment in segments] == [
+        "unexpected_exit",
+        "stopped",
+    ]
+    assert segments[0].ended_at_ms == 1_787_227_205_000
+    assert segments[0].media_duration_ms == 4_000
+    assert segments[0].media_started_at_ms == 1_787_227_201_000
+    assert segments[1].started_at_ms == 1_787_227_205_000
+    assert segments[1].ended_at_ms == 1_787_227_210_000
+    assert segments[1].media_duration_ms == 4_500
+    assert segments[1].media_started_at_ms == 1_787_227_205_500
+    assert all(segment.timing_error_ms == 1_250 for segment in segments)

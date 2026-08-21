@@ -1,5 +1,6 @@
 import json
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -7,6 +8,7 @@ import pytest
 from PyQt5.QtGui import QColor, QPixmap
 from PyQt5.QtWidgets import QApplication, QDialog, QFileDialog, QLabel
 
+import realtime.main_window as main_window
 from realtime.event_list_widget import EventListWidget
 from realtime.live_event_review import LiveEventReview
 from realtime.main_window import MainWindow, NewRaceDialog, VLMConfigDialog
@@ -355,4 +357,132 @@ def test_explicit_runtime_source_and_profile_survive_race_config(qapp, tmp_path,
     assert window.config["sport_profile"] == "speed_skating"
     assert window.model_path == current_model
     assert window.config["model_path"] == current_model
+    window.close()
+
+
+def test_race_config_refreshes_passage_video_timing_fields(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(MainWindow, "_prompt_race_selection", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_init_ocr_runtime", lambda self: None)
+    configured_race = tmp_path / "configured"
+    configured_race.mkdir()
+    (configured_race / "config.json").write_text(
+        json.dumps(
+            {
+                "passage_clock_offset_ms": 850,
+                "passage_video_preroll_ms": 4_500,
+                "video_timeline_timing_error_ms": 1_250,
+            }
+        ),
+        encoding="utf-8",
+    )
+    default_race = tmp_path / "default"
+    default_race.mkdir()
+    (default_race / "config.json").write_text("{}", encoding="utf-8")
+    window = MainWindow(
+        {
+            "source": "unused.mp4",
+            "output_dir": str(tmp_path),
+            "yolo_only_mode": True,
+            "live_monitor_enabled": False,
+        }
+    )
+
+    window._apply_race_config(configured_race)
+    assert window._passage_clock_offset_ms == 850
+    assert window._passage_video_preroll_ms == 4_500
+    assert window._video_timeline_timing_error_ms == 1_250
+
+    window._apply_race_config(default_race)
+    assert window._passage_clock_offset_ms == 0
+    assert window._passage_video_preroll_ms == 3_000
+    assert window._video_timeline_timing_error_ms == 2_000
+    window.close()
+
+
+def test_recording_timeline_warning_remains_visible_after_poll(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(MainWindow, "_prompt_race_selection", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_init_ocr_runtime", lambda self: None)
+    window = MainWindow(
+        {
+            "source": "unused.mp4",
+            "output_dir": str(tmp_path),
+            "yolo_only_mode": True,
+            "live_monitor_enabled": False,
+        }
+    )
+
+    class _Manager:
+        is_recording = True
+        elapsed_seconds = 4.0
+        total_size_bytes = 1024
+
+        def __init__(self):
+            self.warning = "机位 1 录像已开始，但时间线写入失败: disk error"
+
+        def check_error(self):
+            return None
+
+        def consume_recovery_notice(self):
+            return None
+
+        def consume_timeline_warning(self):
+            warning = self.warning
+            self.warning = None
+            return warning
+
+    manager = _Manager()
+    window.recording_manager = manager
+
+    window._poll_recording_status()
+    assert window.recording_status_label.text() == "录像: 时间线异常"
+    assert "disk error" in window.recording_status_label.toolTip()
+
+    window._poll_recording_status()
+    assert window.recording_status_label.text() == "录像: 时间线异常"
+    window.recording_manager = None
+    window.close()
+
+
+def test_passage_video_can_open_while_capture_is_running(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(MainWindow, "_prompt_race_selection", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_init_ocr_runtime", lambda self: None)
+    opened = []
+
+    class _PlaybackDialog:
+        def __init__(self, video_path, parent, **kwargs):
+            opened.append((video_path, parent, kwargs))
+
+        def exec_(self):
+            return 0
+
+    monkeypatch.setattr(main_window, "VideoPlaybackDialog", _PlaybackDialog)
+    window = MainWindow(
+        {
+            "source": "unused.mp4",
+            "output_dir": str(tmp_path),
+            "yolo_only_mode": True,
+            "live_monitor_enabled": False,
+        }
+    )
+    video_path = tmp_path / "camera_01.mkv"
+    video_path.write_bytes(b"video")
+    event = SimpleNamespace(bib="23", chip_id="chip-23")
+    location = SimpleNamespace(
+        status="located",
+        video_path=video_path,
+        playback_position_ms=2_500,
+        passage_position_ms=5_500,
+        timing_error_ms=1_000,
+        segment=SimpleNamespace(camera_index=1),
+    )
+    window._running = True
+
+    window._open_passage_location(event, location)
+
+    assert opened[0][0] == video_path
+    assert opened[0][2]["initial_position_ms"] == 2_500
+    assert opened[0][2]["target_position_ms"] == 5_500
+    assert "机位 1" in opened[0][2]["context_text"]
+    assert opened[0][2]["autoplay"] is False
+    window._running = False
     window.close()

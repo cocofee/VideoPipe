@@ -132,6 +132,7 @@ class _FakeDialogWorker(QObject):
         super().__init__(parent)
         self.speed_calls = []
         self.pause_calls = 0
+        self.seek_calls = []
 
     def start(self):
         self.metadata_ready.emit(10_000, 50.0, 640, 360, 500)
@@ -146,7 +147,7 @@ class _FakeDialogWorker(QObject):
         pass
 
     def seek(self, _milliseconds):
-        pass
+        self.seek_calls.append(_milliseconds)
 
     def jump(self, _delta_ms):
         pass
@@ -179,6 +180,58 @@ def test_space_pauses_and_resumes_selected_slow_speed(qapp):
     qapp.processEvents()
     assert dialog._playing is True
     assert dialog.worker.speed_calls[-1] == 0.25
+    dialog.close()
+
+
+def test_dialog_starts_paused_at_requested_passage_position(qapp):
+    dialog = VideoPlaybackDialog(
+        Path("recording.mkv"),
+        worker_factory=_FakeDialogWorker,
+        initial_position_ms=4_250,
+        autoplay=False,
+    )
+    qapp.processEvents()
+
+    assert dialog._playing is False
+    assert dialog.worker.pause_calls == 1
+    assert dialog.worker.seek_calls == [4_250]
+    assert dialog.timeline.value() == 4_250
+    assert dialog.current_time_label.text() == "00:00:04.250"
+    dialog.close()
+
+
+def test_dialog_marks_passage_target_and_updates_relative_time(qapp):
+    dialog = VideoPlaybackDialog(
+        Path("recording.mkv"),
+        worker_factory=_FakeDialogWorker,
+        initial_position_ms=4_250,
+        target_position_ms=7_250,
+        context_text="号码 23 | 机位 1",
+        autoplay=False,
+    )
+    qapp.processEvents()
+
+    assert dialog.timeline.target_position_ms == 7_250
+    assert "Passage 目标 00:00:07.250" in dialog.target_status_label.text()
+    assert "目标前 3.000 秒" in dialog.target_status_label.text()
+    dialog._on_slider_moved(8_250)
+    assert "已过目标 1.000 秒" in dialog.target_status_label.text()
+    dialog.close()
+
+
+def test_dialog_reports_target_beyond_real_media_duration(qapp):
+    dialog = VideoPlaybackDialog(
+        Path("recording.mkv"),
+        worker_factory=_FakeDialogWorker,
+        initial_position_ms=9_000,
+        target_position_ms=12_000,
+        autoplay=False,
+    )
+    qapp.processEvents()
+
+    assert dialog.timeline.target_position_ms == 12_000
+    assert "Passage 目标 00:00:12.000" in dialog.target_status_label.text()
+    assert "超出录像时长 2.000 秒" in dialog.target_status_label.text()
     dialog.close()
 
 

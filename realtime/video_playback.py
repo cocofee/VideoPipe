@@ -11,10 +11,13 @@ from typing import Callable, Optional
 import cv2
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import (
+    QColor,
     QImage,
     QKeySequence,
     QKeyEvent,
     QMouseEvent,
+    QPainter,
+    QPen,
     QPixmap,
     QWheelEvent,
 )
@@ -28,6 +31,8 @@ from PyQt5.QtWidgets import (
     QShortcut,
     QSizePolicy,
     QSlider,
+    QStyle,
+    QStyleOptionSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -248,6 +253,51 @@ class SpringShuttleSlider(QWidget):
         button = self._buttons.get(selected)
         if button is not None:
             button.setChecked(True)
+
+
+class TargetTimelineSlider(QSlider):
+    """Timeline slider with a non-interactive passage target marker."""
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.target_position_ms: Optional[int] = None
+
+    def set_target_position(self, position_ms: Optional[int]) -> None:
+        self.target_position_ms = (
+            None if position_ms is None else max(0, int(position_ms))
+        )
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        target = self.target_position_ms
+        if (
+            target is None
+            or self.maximum() <= self.minimum()
+            or target < self.minimum()
+            or target > self.maximum()
+        ):
+            return
+
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(
+            QStyle.CC_Slider,
+            option,
+            QStyle.SC_SliderGroove,
+            self,
+        )
+        position = QStyle.sliderPositionFromValue(
+            self.minimum(),
+            self.maximum(),
+            target,
+            max(1, groove.width()),
+            option.upsideDown,
+        )
+        x = groove.left() + position
+        painter = QPainter(self)
+        painter.setPen(QPen(QColor("#ffb020"), 2))
+        painter.drawLine(x, groove.top() - 5, x, groove.bottom() + 5)
 
 
 class VideoPlaybackWorker(QThread):
@@ -525,6 +575,10 @@ class VideoPlaybackDialog(QDialog):
         parent=None,
         *,
         worker_factory: Callable[..., VideoPlaybackWorker] = VideoPlaybackWorker,
+        initial_position_ms: Optional[int] = None,
+        target_position_ms: Optional[int] = None,
+        context_text: str = "",
+        autoplay: bool = True,
     ):
         super().__init__(parent)
         self.video_path = Path(video_path)
@@ -532,8 +586,15 @@ class VideoPlaybackDialog(QDialog):
         self._fps = 25.0
         self._frame_count = 0
         self._current_frame_index = 0
-        self._playing = True
+        self._playing = bool(autoplay)
         self._last_playback_speed = 1.0
+        self._initial_position_ms = (
+            None if initial_position_ms is None else max(0, int(initial_position_ms))
+        )
+        self._target_position_ms = (
+            None if target_position_ms is None else max(0, int(target_position_ms))
+        )
+        self._context_text = str(context_text or "").strip()
         self._slider_dragging = False
         self._resume_after_seek = False
         self._resume_speed_after_seek = 1.0
@@ -549,7 +610,10 @@ class VideoPlaybackDialog(QDialog):
         self.worker.frame_ready.connect(self._on_frame_ready)
         self.worker.playback_finished.connect(self._on_playback_finished)
         self.worker.playback_error.connect(self._on_playback_error)
+        if not self._playing:
+            self.worker.pause()
         self.worker.start()
+        self._set_playing(self._playing)
 
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.space_shortcut.setContext(Qt.WindowShortcut)
@@ -610,13 +674,24 @@ class VideoPlaybackDialog(QDialog):
         metadata_layout.addWidget(self.duration_label)
         deck_layout.addLayout(metadata_layout)
 
-        self.timeline = QSlider(Qt.Horizontal)
+        self.target_status_label = QLabel()
+        self.target_status_label.setStyleSheet(
+            "color: #ffcf70; font-size: 13px; font-weight: 700;"
+        )
+        self.target_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.target_status_label.setVisible(
+            self._target_position_ms is not None or bool(self._context_text)
+        )
+        deck_layout.addWidget(self.target_status_label)
+
+        self.timeline = TargetTimelineSlider(Qt.Horizontal)
         self.timeline.setObjectName("playbackTimeline")
         self.timeline.setRange(0, 0)
         self.timeline.setFixedHeight(26)
         self.timeline.sliderPressed.connect(self._on_slider_pressed)
         self.timeline.sliderReleased.connect(self._on_slider_released)
         self.timeline.sliderMoved.connect(self._on_slider_moved)
+        self.timeline.set_target_position(self._target_position_ms)
         deck_layout.addWidget(self.timeline)
 
         transport = QHBoxLayout()
@@ -733,11 +808,19 @@ class VideoPlaybackDialog(QDialog):
         self._fps = max(0.1, float(fps))
         self._frame_count = max(0, int(frame_count))
         self.timeline.setRange(0, self._duration_ms)
+        self.timeline.set_target_position(self._target_position_ms)
         self.duration_label.setText(f"总时长 {format_playback_time(self._duration_ms)}")
         self.frame_label.setText(f"帧 0 / {self._frame_count}")
         self.setWindowTitle(
             f"裁判回放 - {self.video_path.name} | {width}x{height} | {fps:.2f} FPS"
         )
+        if self._initial_position_ms is not None:
+            target_ms = min(self._initial_position_ms, self._duration_ms)
+            self._initial_position_ms = None
+            self.timeline.setValue(target_ms)
+            self.current_time_label.setText(format_playback_time(target_ms))
+            self.worker.seek(target_ms)
+        self._update_target_status(self.timeline.value())
 
     def _on_frame_ready(self, image: QImage, position_ms: int, frame_index: int) -> None:
         self._current_frame_index = frame_index
@@ -745,6 +828,7 @@ class VideoPlaybackDialog(QDialog):
         if not self._slider_dragging:
             self.timeline.setValue(min(position_ms, self._duration_ms))
             self.current_time_label.setText(format_playback_time(position_ms))
+            self._update_target_status(position_ms)
         self.frame_label.setText(f"帧 {frame_index + 1} / {self._frame_count}")
 
     def _on_slider_pressed(self) -> None:
@@ -757,6 +841,30 @@ class VideoPlaybackDialog(QDialog):
 
     def _on_slider_moved(self, value: int) -> None:
         self.current_time_label.setText(format_playback_time(value))
+        self._update_target_status(value)
+
+    def _update_target_status(self, current_position_ms: int) -> None:
+        parts = []
+        if self._context_text:
+            parts.append(self._context_text)
+        target_ms = self._target_position_ms
+        if target_ms is not None:
+            target_text = f"Passage 目标 {format_playback_time(target_ms)}"
+            if self._duration_ms > 0 and target_ms > self._duration_ms:
+                excess_ms = target_ms - self._duration_ms
+                target_text += f"（超出录像时长 {excess_ms / 1000.0:.3f} 秒）"
+            else:
+                delta_ms = int(current_position_ms) - target_ms
+                if delta_ms < 0:
+                    target_text += f"，目标前 {-delta_ms / 1000.0:.3f} 秒"
+                elif delta_ms > 0:
+                    target_text += f"，已过目标 {delta_ms / 1000.0:.3f} 秒"
+                else:
+                    target_text += "，位于目标"
+            parts.append(target_text)
+        text = " | ".join(parts)
+        self.target_status_label.setText(text)
+        self.target_status_label.setToolTip(text)
 
     def _on_slider_released(self) -> None:
         self._slider_dragging = False

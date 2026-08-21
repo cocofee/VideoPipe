@@ -100,6 +100,9 @@ class _Harness:
         self.sources = ["rtsp://camera/live"]
         self.output_dir = tmp_path
         self.recording_manager = None
+        self.video_timeline_store = object()
+        self._recording_error_message = ""
+        self._recording_timeline_warning = ""
         self.record_btn = _Button()
         self.recording_status_label = _Label()
         self._recording_poll_timer = _Timer()
@@ -137,6 +140,25 @@ def test_manual_recording_ui_starts_and_stops_manager(monkeypatch, tmp_path):
     assert window._recording_poll_timer.active is False
     assert window.record_btn.text == "开始录像"
     assert paths == (tmp_path / "videos" / "camera_01_20260808_120000.mkv",)
+
+
+def test_manual_recording_warns_when_video_timeline_is_unavailable(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        main_window,
+        "ManualRecordingManager",
+        lambda _sources, output_dir: _Manager(output_dir),
+    )
+    window = _Harness(tmp_path)
+    window.video_timeline_store = None
+
+    window._start_manual_recording()
+
+    assert window.recording_status_label.text == "录像: 时间线异常"
+    assert "passage 无法自动定位" in window.recording_status_label.tooltip
+    window._stop_manual_recording()
 
 
 def test_manual_recording_requires_running_detection(monkeypatch, tmp_path):

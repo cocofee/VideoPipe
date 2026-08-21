@@ -100,6 +100,8 @@ try:
     from .stream_recorder import ManualRecordingManager, RecordingError, is_rtsp_source
     from .video_playback import VideoPlaybackDialog, find_recordings
     from .passage_receiver import DEFAULT_HOST, DEFAULT_PORT, PassageEventReceiver, PassageEventStore
+    from .passage_review import PassageReviewDialog, lookup_status_text
+    from .video_timeline import VideoTimelineError, VideoTimelineStore
 except ImportError:
     import sys
     import os
@@ -123,6 +125,8 @@ except ImportError:
     from stream_recorder import ManualRecordingManager, RecordingError, is_rtsp_source
     from video_playback import VideoPlaybackDialog, find_recordings
     from passage_receiver import DEFAULT_HOST, DEFAULT_PORT, PassageEventReceiver, PassageEventStore
+    from passage_review import PassageReviewDialog, lookup_status_text
+    from video_timeline import VideoTimelineError, VideoTimelineStore
 
 
 class InteractiveVideoLabel(QLabel):
@@ -2315,6 +2319,7 @@ class MainWindow(QMainWindow):
         self.recorder: Optional[EventRecorder] = None
         self.recording_manager: Optional[ManualRecordingManager] = None
         self._recording_error_message = ""
+        self._recording_timeline_warning = ""
         self._auto_record_live_sources = bool(config.get("auto_record_live_sources", True))
         self.config["auto_record_live_sources"] = self._auto_record_live_sources
         self.viewer_dialog: Optional[ImageViewerDialog] = None
@@ -2328,6 +2333,8 @@ class MainWindow(QMainWindow):
 
         self.passage_receiver: Optional[PassageEventReceiver] = None
         self.passage_event_store: Optional[PassageEventStore] = None
+        self.video_timeline_store: Optional[VideoTimelineStore] = None
+        self.passage_review_dialog: Optional[PassageReviewDialog] = None
         self._latest_passage_event = None
         self._passage_receiver_enabled = bool(config.get("passage_receiver_enabled", False))
         self._passage_receiver_host = str(
@@ -2342,6 +2349,7 @@ class MainWindow(QMainWindow):
         self.config["passage_receiver_enabled"] = self._passage_receiver_enabled
         self.config["passage_receiver_host"] = self._passage_receiver_host
         self.config["passage_receiver_port"] = self._passage_receiver_port
+        self._sync_passage_video_config()
 
         # 配置
         # source 现在可以是一个列表，支持多路
@@ -2501,6 +2509,31 @@ class MainWindow(QMainWindow):
         self.finish_line_enabled = {int(k): bool(v) for k, v in self.finish_line_enabled.items()}
         self.roi_enabled = {int(k): bool(v) for k, v in self.roi_enabled.items()}
 
+    def _sync_passage_video_config(self):
+        try:
+            clock_offset_ms = int(self.config.get("passage_clock_offset_ms", 0))
+        except (TypeError, ValueError):
+            clock_offset_ms = 0
+        try:
+            pre_roll_ms = max(
+                0, int(self.config.get("passage_video_preroll_ms", 3_000))
+            )
+        except (TypeError, ValueError):
+            pre_roll_ms = 3_000
+        try:
+            timing_error_ms = max(
+                0, int(self.config.get("video_timeline_timing_error_ms", 2_000))
+            )
+        except (TypeError, ValueError):
+            timing_error_ms = 2_000
+
+        self._passage_clock_offset_ms = clock_offset_ms
+        self._passage_video_preroll_ms = pre_roll_ms
+        self._video_timeline_timing_error_ms = timing_error_ms
+        self.config["passage_clock_offset_ms"] = clock_offset_ms
+        self.config["passage_video_preroll_ms"] = pre_roll_ms
+        self.config["video_timeline_timing_error_ms"] = timing_error_ms
+
     def _apply_race_config(self, race_dir: Path):
         runtime_config = {
             key: self.config.get(key)
@@ -2521,6 +2554,13 @@ class MainWindow(QMainWindow):
             )
         if self._runtime_sport_profile_override is not None:
             runtime_config["sport_profile"] = self._runtime_sport_profile_override
+        self.config.update(
+            {
+                "passage_clock_offset_ms": 0,
+                "passage_video_preroll_ms": 3_000,
+                "video_timeline_timing_error_ms": 2_000,
+            }
+        )
         config_file = race_dir / "config.json"
         if config_file.exists():
             try:
@@ -2534,6 +2574,7 @@ class MainWindow(QMainWindow):
                 logger.warning(f"加载保存配置失败: {e}")
         self.config.update(runtime_config)
         self.config['output_dir'] = str(race_dir)
+        self._sync_passage_video_config()
         self.sport_profile = normalize_sport_profile(self.config.get('sport_profile', 'cycling'))
         self.config['sport_profile'] = self.sport_profile
         self._gate_guard_enabled = True
@@ -2581,6 +2622,7 @@ class MainWindow(QMainWindow):
             self.live_event_review.set_database(self.database)
             self.live_event_review.set_output_dir(self.output_dir)
             self.live_event_review.clear_event()
+        self._load_video_timeline()
         self._start_passage_receiver()
         if self._yolo_only_mode:
             self.ocr_manager = None
@@ -2597,6 +2639,8 @@ class MainWindow(QMainWindow):
             self.field_issue_action.setEnabled(True)
         if hasattr(self, "race_name_label"):
             self.race_name_label.setText(race_dir.name)
+        if hasattr(self, "passage_review_btn"):
+            self.passage_review_btn.setEnabled(True)
         self.statusBar().showMessage(f"当前赛事: {race_dir.name}")
 
     def _prompt_race_selection(self):
@@ -2765,6 +2809,12 @@ class MainWindow(QMainWindow):
         self.cyclerace_status_label = QLabel("CycleRace: 等待赛事")
         self.cyclerace_status_label.setStyleSheet("color: #667085; font-size: 12px; font-weight: 600;")
         header_layout.addWidget(self.cyclerace_status_label)
+        self.passage_review_btn = QPushButton("通过记录")
+        self.passage_review_btn.setObjectName("settings_btn")
+        self.passage_review_btn.setEnabled(False)
+        self.passage_review_btn.setToolTip("查看 CycleRace passage 与对应录像位置")
+        self.passage_review_btn.clicked.connect(self._show_passage_review)
+        header_layout.addWidget(self.passage_review_btn)
 
         self.capture_state_label = QLabel("采集未开始")
         self.capture_state_label.setObjectName("capture_state")
@@ -3639,14 +3689,49 @@ class MainWindow(QMainWindow):
         else:
             self.event_list.refresh_data()
 
+    def _load_video_timeline(self):
+        self.video_timeline_store = None
+        try:
+            store = VideoTimelineStore(self.output_dir / "video_timeline.jsonl")
+            recovered_open_segments = store.recover_open_segments()
+        except VideoTimelineError as exc:
+            self._recording_timeline_warning = f"录像时间线不可用: {exc}"
+            logger.error("[Main] 加载录像时间线失败: %s", exc)
+            self.statusBar().showMessage(f"录像时间线不可用: {exc}")
+            self._refresh_recording_ui()
+            return
+        self.video_timeline_store = store
+        self._recording_timeline_warning = ""
+        self._refresh_recording_ui()
+        if store.recovered_incomplete_tail:
+            logger.warning("[Main] 已恢复录像时间线未完整尾部")
+        if recovered_open_segments:
+            logger.warning(
+                "[Main] 已收尾 %s 个上次异常退出遗留的录像段",
+                recovered_open_segments,
+            )
+
     def _start_passage_receiver(self):
         MainWindow._stop_passage_receiver(self, reset_status=False)
         self._latest_passage_event = None
+        journal_path = self.output_dir / "cyclerace_passage_events.jsonl"
+        try:
+            store = PassageEventStore(journal_path)
+        except Exception as exc:
+            self._set_passage_receiver_status(
+                "CycleRace: 存储失败",
+                "#b54747",
+                str(exc),
+            )
+            logger.exception("[Main] 加载 CycleRace passage 存储失败: %s", exc)
+            return
+        self.passage_event_store = store
+        recovered = "；已恢复未完整尾部" if store.recovered_incomplete_tail else ""
         if not self._passage_receiver_enabled:
             self._set_passage_receiver_status(
                 "CycleRace: 未启用",
                 "#667085",
-                "当前赛事未启用 CycleRace passage 接收",
+                f"当前赛事未启用 CycleRace passage 接收；已保存 {len(store)} 条{recovered}",
             )
             return
         if not (1 <= self._passage_receiver_port <= 65535):
@@ -3658,10 +3743,8 @@ class MainWindow(QMainWindow):
             logger.error("[Main] CycleRace passage 接收端口无效: %s", self._passage_receiver_port)
             return
 
-        journal_path = self.output_dir / "cyclerace_passage_events.jsonl"
         receiver = None
         try:
-            store = PassageEventStore(journal_path)
             receiver = PassageEventReceiver(
                 self._passage_receiver_host,
                 self._passage_receiver_port,
@@ -3669,9 +3752,7 @@ class MainWindow(QMainWindow):
                 on_accepted=self._on_passage_received,
             )
             receiver.start()
-            self.passage_event_store = store
             self.passage_receiver = receiver
-            recovered = "；已恢复未完整尾部" if store.recovered_incomplete_tail else ""
             self._set_passage_receiver_status(
                 f"CycleRace: 监听 {receiver.listen_port}",
                 "#247a52",
@@ -3681,7 +3762,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             if receiver is not None:
                 receiver.stop()
-            self.passage_event_store = None
             self.passage_receiver = None
             self._set_passage_receiver_status(
                 "CycleRace: 监听失败",
@@ -3715,16 +3795,30 @@ class MainWindow(QMainWindow):
         store = self.passage_event_store
         count = len(store) if store is not None else 0
         identity = event.bib.strip() or event.chip_id.strip() or "未知"
+        timeline = self.video_timeline_store
+        if timeline is None:
+            video_status = "录像时间线不可用"
+        else:
+            lookup = timeline.locate_passage(
+                event.passage_time_ms,
+                clock_offset_ms=self._passage_clock_offset_ms,
+                pre_roll_ms=self._passage_video_preroll_ms,
+            )
+            video_status = lookup_status_text(lookup)
         self._set_passage_receiver_status(
             f"CycleRace: 已接收 {count}",
             "#247a52",
             f"最近通过: {identity}；组别 {event.group_id}；圈次 {event.lap}；"
-            f"revision {event.revision}",
+            f"revision {event.revision}；{video_status}；"
+            f"时钟偏移 {self._passage_clock_offset_ms:+d} ms",
         )
         self.statusBar().showMessage(
             f"收到 CycleRace 通过记录: {identity}（第 {event.sequence} 条）",
             3000,
         )
+        dialog = self.passage_review_dialog
+        if dialog is not None:
+            dialog.refresh()
         logger.info(
             "[Main] 收到 CycleRace passage: event_id=%s, bib=%s, sequence=%s, revision=%s",
             event.event_id,
@@ -3740,6 +3834,67 @@ class MainWindow(QMainWindow):
         label.setText(text)
         label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
         label.setToolTip(tooltip)
+
+    def _show_passage_review(self):
+        if not self._race_ready:
+            QMessageBox.warning(self, "提示", "请先打开赛事。")
+            return
+        if self.passage_event_store is None:
+            QMessageBox.warning(self, "无法打开", "CycleRace passage 存储不可用。")
+            return
+        if self.video_timeline_store is None:
+            QMessageBox.warning(self, "无法打开", "当前赛事的录像时间线不可用。")
+            return
+
+        dialog = PassageReviewDialog(
+            self.passage_event_store,
+            self.video_timeline_store,
+            self,
+            clock_offset_ms=self._passage_clock_offset_ms,
+            pre_roll_ms=self._passage_video_preroll_ms,
+            open_location=self._open_passage_location,
+        )
+        self.passage_review_dialog = dialog
+        try:
+            dialog.exec_()
+        finally:
+            self.passage_review_dialog = None
+
+        if dialog.clock_offset_ms != self._passage_clock_offset_ms:
+            self._passage_clock_offset_ms = dialog.clock_offset_ms
+            self.config["passage_clock_offset_ms"] = self._passage_clock_offset_ms
+            self._save_config()
+
+    def _open_passage_location(self, event, location):
+        if location.status not in {"located", "unverified"}:
+            QMessageBox.warning(
+                self,
+                "无法打开",
+                f"当前录像定位状态不可打开: {location.status}",
+            )
+            return
+        if not location.video_path.is_file():
+            QMessageBox.warning(self, "录像缺失", str(location.video_path))
+            return
+
+        identity = event.bib.strip() or event.chip_id.strip() or "未知"
+        self.statusBar().showMessage(
+            f"打开机位 {location.segment.camera_index}：{identity} passage "
+            f"约在 {location.passage_position_ms / 1000.0:.3f}s，"
+            f"误差至少 ±{location.timing_error_ms}ms"
+        )
+        playback = VideoPlaybackDialog(
+            location.video_path,
+            self,
+            initial_position_ms=location.playback_position_ms,
+            target_position_ms=location.passage_position_ms,
+            context_text=(
+                f"{identity} | 机位 {location.segment.camera_index} | "
+                f"定位误差至少 ±{location.timing_error_ms} ms"
+            ),
+            autoplay=False,
+        )
+        playback.exec_()
 
     def _on_roi_toggle(self, source_id: int, state: int):
         """处理 ROI 开关切换"""
@@ -3876,6 +4031,11 @@ class MainWindow(QMainWindow):
         playback_action.setStatusTip("打开当前赛事 videos 目录中的录像")
         playback_action.triggered.connect(self._on_playback_clicked)
         data_menu.addAction(playback_action)
+
+        passage_review_action = QAction("CycleRace 通过记录...", self)
+        passage_review_action.setStatusTip("按 CycleRace passage 时间定位赛事录像")
+        passage_review_action.triggered.connect(self._show_passage_review)
+        data_menu.addAction(passage_review_action)
 
         init_race_action = QAction("新建赛事 (创建独立文件夹)...", self)
         init_race_action.setStatusTip("创建一个全新的赛事文件夹，所有数据独立存储")
@@ -4492,6 +4652,9 @@ class MainWindow(QMainWindow):
             self.recorder = None
 
         MainWindow._stop_passage_receiver(self)
+        self.video_timeline_store = None
+        if hasattr(self, "passage_review_btn"):
+            self.passage_review_btn.setEnabled(False)
 
         if self.ocr_manager is not None:
             try:
@@ -4874,6 +5037,13 @@ class MainWindow(QMainWindow):
         minutes, secs = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
+    def _capture_recording_timeline_warning(self, manager) -> Optional[str]:
+        consume_warning = getattr(manager, "consume_timeline_warning", None)
+        warning = consume_warning() if callable(consume_warning) else None
+        if warning:
+            self._recording_timeline_warning = str(warning)
+        return warning
+
     def _refresh_recording_ui(self):
         manager = self.recording_manager
         active = bool(manager and manager.is_recording)
@@ -4891,7 +5061,21 @@ class MainWindow(QMainWindow):
 
         if not hasattr(self, "recording_status_label"):
             return
-        if active:
+        recording_error = getattr(self, "_recording_error_message", "")
+        timeline_warning = getattr(self, "_recording_timeline_warning", "")
+        if recording_error and not active:
+            self.recording_status_label.setText("录像: 异常")
+            self.recording_status_label.setToolTip(recording_error)
+            self.recording_status_label.setStyleSheet(
+                "margin-right: 12px; color: #cf1322; font-weight: bold; font-size: 13px;"
+            )
+        elif timeline_warning:
+            self.recording_status_label.setText("录像: 时间线异常")
+            self.recording_status_label.setToolTip(timeline_warning)
+            self.recording_status_label.setStyleSheet(
+                "margin-right: 12px; color: #b54708; font-weight: bold; font-size: 13px;"
+            )
+        elif active:
             self.recording_status_label.setToolTip("")
             duration = self._format_recording_duration(manager.elapsed_seconds)
             size_mb = manager.total_size_bytes / (1024 * 1024)
@@ -4900,14 +5084,7 @@ class MainWindow(QMainWindow):
                 "margin-right: 12px; color: #cf1322; font-weight: bold; font-size: 13px;"
             )
         else:
-            recording_error = getattr(self, "_recording_error_message", "")
-            if recording_error:
-                self.recording_status_label.setText("录像: 异常")
-                self.recording_status_label.setToolTip(recording_error)
-                self.recording_status_label.setStyleSheet(
-                    "margin-right: 12px; color: #cf1322; font-weight: bold; font-size: 13px;"
-                )
-                return
+            self.recording_status_label.setToolTip("")
             self.recording_status_label.setText("录像: 待机")
             self.recording_status_label.setStyleSheet(
                 "margin-right: 12px; color: #666; font-weight: bold; font-size: 13px;"
@@ -4956,6 +5133,12 @@ class MainWindow(QMainWindow):
             self.sources,
             self.output_dir / "videos",
         )
+        if hasattr(manager, "timeline_store"):
+            manager.timeline_store = getattr(self, "video_timeline_store", None)
+        if hasattr(manager, "timeline_timing_error_ms"):
+            manager.timeline_timing_error_ms = getattr(
+                self, "_video_timeline_timing_error_ms", 2_000
+            )
         try:
             paths = manager.start()
         except RecordingError as exc:
@@ -4971,12 +5154,25 @@ class MainWindow(QMainWindow):
 
         self.recording_manager = manager
         self._recording_error_message = ""
+        if getattr(self, "video_timeline_store", None) is None:
+            self._recording_timeline_warning = (
+                "录像已开始，但当前赛事录像时间线不可用，"
+                "CycleRace passage 无法自动定位到本次录像。"
+            )
+        else:
+            self._recording_timeline_warning = ""
+        timeline_warning = MainWindow._capture_recording_timeline_warning(self, manager)
         self._recording_poll_timer.start()
         self._refresh_recording_ui()
+        if timeline_warning:
+            logger.warning(f"[Recording] {timeline_warning}")
         names = ", ".join(path.name for path in paths)
         mode = "自动" if automatic else "手动"
         logger.info(f"[Recording] 已开始{mode}录像: {names}")
-        self.statusBar().showMessage(f"{mode}录像已开始，保存到: {self.output_dir / 'videos'}")
+        message = f"{mode}录像已开始，保存到: {self.output_dir / 'videos'}"
+        if self._recording_timeline_warning:
+            message = f"{message}；{self._recording_timeline_warning}"
+        self.statusBar().showMessage(message)
 
     def _stop_manual_recording(self, *, show_message: bool = True):
         manager = self.recording_manager
@@ -4998,6 +5194,10 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "录像收尾异常", str(exc))
             return tuple()
 
+        timeline_warning = MainWindow._capture_recording_timeline_warning(self, manager)
+        if timeline_warning:
+            logger.warning(f"[Recording] {timeline_warning}")
+
         self._refresh_recording_ui()
         names = ", ".join(path.name for path in paths)
         duration = self._format_recording_duration(elapsed)
@@ -5006,7 +5206,10 @@ class MainWindow(QMainWindow):
             f"[Recording] 录像已保存: {names} ({duration}, {size_mb:.1f} MB)"
         )
         if show_message:
-            self.statusBar().showMessage(f"录像已保存: {names}")
+            message = f"录像已保存: {names}"
+            if self._recording_timeline_warning:
+                message = f"{message}；{self._recording_timeline_warning}"
+            self.statusBar().showMessage(message)
         return paths
 
     def _poll_recording_status(self):
@@ -5024,6 +5227,9 @@ class MainWindow(QMainWindow):
                 manager.stop()
             except RecordingError:
                 pass
+            timeline_warning = MainWindow._capture_recording_timeline_warning(self, manager)
+            if timeline_warning:
+                logger.warning(f"[Recording] {timeline_warning}")
             self.recording_manager = None
             self._recording_poll_timer.stop()
             self._refresh_recording_ui()
@@ -5035,6 +5241,10 @@ class MainWindow(QMainWindow):
         if notice:
             logger.warning(f"[Recording] {notice}")
             self.statusBar().showMessage(notice)
+        timeline_warning = MainWindow._capture_recording_timeline_warning(self, manager)
+        if timeline_warning:
+            logger.warning(f"[Recording] {timeline_warning}")
+            self.statusBar().showMessage(timeline_warning)
         self._refresh_recording_ui()
 
     def start_when_race_ready(self):

@@ -225,6 +225,41 @@ def test_main_window_uses_live_console_structure(qapp, tmp_path, monkeypatch):
     assert "打开已有赛事..." in data_actions
     assert "录像回放..." in data_actions
     assert "导入高速摄像片段..." in data_actions
+    assert window.external_clip_btn.text() == "导入高速"
+    assert window.external_clip_btn.isEnabled() is False
+    assert window.external_clip_action.isEnabled() is False
+    assert window.evidence_status_label.text() == "录像证据: 等待赛事"
+
+    window._race_ready = True
+    window.passage_event_store = object()
+    window.video_timeline_store = SimpleNamespace(
+        segments=lambda: (
+            SimpleNamespace(clock_source="videopipe_system_clock"),
+            SimpleNamespace(clock_source="external_clip_sidecar_beijing"),
+            SimpleNamespace(clock_source="external_clip_sidecar_beijing"),
+        )
+    )
+    window._refresh_evidence_ui()
+    assert window.evidence_status_label.text() == "录像证据: 普通 1 段 | 高速 2 段"
+    assert "普通录像使用 VideoPipe 系统时钟" in window.evidence_status_label.toolTip()
+    assert "高速摄像使用北京时间 sidecar" in window.evidence_status_label.toolTip()
+    assert window.external_clip_btn.isEnabled()
+    assert window.external_clip_action.isEnabled()
+
+    window.recording_manager = SimpleNamespace(is_recording=True)
+    window._refresh_evidence_ui()
+    assert window.external_clip_btn.isEnabled() is False
+    assert window.external_clip_action.isEnabled() is False
+
+    window.recording_manager = None
+    window._external_clip_import_thread = SimpleNamespace(isRunning=lambda: True)
+    window._refresh_evidence_ui()
+    assert window.external_clip_btn.isEnabled() is False
+    assert window.external_clip_action.isEnabled() is False
+    window._external_clip_import_thread = None
+    window._race_ready = False
+    window.passage_event_store = None
+    window.video_timeline_store = None
 
     visible_text = [label.text() for label in window.findChildren(QLabel)]
     assert not any(text.startswith("RANK ") for text in visible_text)

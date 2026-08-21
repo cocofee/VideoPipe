@@ -45,6 +45,18 @@ def _resolve_git_commit(path: str):
         return None
     return result.stdout.strip() or None
 
+
+def _normalize_camera_clock_management_urls(value, source_count: int) -> list[str]:
+    if isinstance(value, str):
+        urls = [value]
+    elif isinstance(value, (list, tuple)):
+        urls = list(value)
+    else:
+        urls = []
+    normalized = [str(item or "").strip() for item in urls[:source_count]]
+    normalized.extend("" for _ in range(max(0, source_count - len(normalized))))
+    return normalized
+
 # 将当前目录和项目根目录添加到 sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
@@ -102,7 +114,9 @@ try:
     from .passage_receiver import DEFAULT_HOST, DEFAULT_PORT, PassageEventReceiver, PassageEventStore
     from .passage_review import PassageReviewDialog, lookup_status_text
     from .video_timeline import VideoTimelineError, VideoTimelineStore
+    from .camera_clock import camera_clock_check_required, check_hikvision_camera_clock
     from .external_clip_import import (
+        EXTERNAL_CLOCK_SOURCE,
         ExternalClipImportCancelled,
         ExternalClipImportError,
         import_verified_external_clips,
@@ -134,7 +148,9 @@ except ImportError:
     from passage_receiver import DEFAULT_HOST, DEFAULT_PORT, PassageEventReceiver, PassageEventStore
     from passage_review import PassageReviewDialog, lookup_status_text
     from video_timeline import VideoTimelineError, VideoTimelineStore
+    from camera_clock import camera_clock_check_required, check_hikvision_camera_clock
     from external_clip_import import (
+        EXTERNAL_CLOCK_SOURCE,
         ExternalClipImportCancelled,
         ExternalClipImportError,
         import_verified_external_clips,
@@ -1450,9 +1466,17 @@ class ConnectionTester(QThread):
     """异步测试摄像头连接"""
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, source):
+    def __init__(
+        self,
+        source,
+        *,
+        verify_hikvision_clock=False,
+        management_url="",
+    ):
         super().__init__()
         self.source = source
+        self.verify_hikvision_clock = bool(verify_hikvision_clock)
+        self.management_url = str(management_url or "").strip()
 
     def run(self):
         try:
@@ -1470,13 +1494,63 @@ class ConnectionTester(QThread):
                 ret, _ = cap.read()
                 cap.release()
                 if ret:
-                    self.finished.emit(True, "连接成功，画面读取正常")
+                    if self.verify_hikvision_clock:
+                        clock_check = check_hikvision_camera_clock(
+                            self.source,
+                            management_url=self.management_url,
+                        )
+                        if clock_check.ok:
+                            self.finished.emit(
+                                True,
+                                f"连接成功，画面读取正常；{clock_check.message}",
+                            )
+                        else:
+                            self.finished.emit(
+                                False,
+                                "画面读取正常，但相机时间核验失败："
+                                f"{clock_check.message}",
+                            )
+                    else:
+                        self.finished.emit(True, "连接成功，画面读取正常")
                 else:
                     self.finished.emit(False, "设备已打开但无法读取画面（可能是编码不支持或权限问题）")
             else:
                 self.finished.emit(False, "无法打开设备（请检查IP、密码或USB连接）")
         except Exception as e:
             self.finished.emit(False, f"测试发生异常: {str(e)}")
+
+
+class CameraClockPreflightThread(QThread):
+    """Verify all credentialed RTSP camera clocks before capture starts."""
+
+    completed = pyqtSignal(bool, str, object)
+
+    def __init__(self, targets, parent=None):
+        super().__init__(parent)
+        self.targets = tuple(targets)
+
+    def run(self):
+        signature = tuple(self.targets)
+        for camera_index, source, management_url in self.targets:
+            if self.isInterruptionRequested():
+                self.completed.emit(False, "相机时间核验已取消", signature)
+                return
+            result = check_hikvision_camera_clock(
+                source,
+                management_url=management_url,
+            )
+            if not result.ok:
+                self.completed.emit(
+                    False,
+                    f"机位 {camera_index + 1}：{result.message}",
+                    signature,
+                )
+                return
+        self.completed.emit(
+            True,
+            f"{len(self.targets)} 路相机时间核验通过",
+            signature,
+        )
 
 
 class ExternalClipProbeThread(QThread):
@@ -1516,7 +1590,13 @@ class ExternalClipProbeThread(QThread):
 
 class MultiCameraManagementDialog(QDialog):
     """多摄像头管理对话框"""
-    def __init__(self, current_sources, parent=None):
+    def __init__(
+        self,
+        current_sources,
+        parent=None,
+        *,
+        camera_clock_management_urls=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("多摄像头管理")
         self.setMinimumSize(700, 450)
@@ -1526,6 +1606,10 @@ class MultiCameraManagementDialog(QDialog):
             self.sources = [current_sources]
         else:
             self.sources = list(current_sources)
+        self.camera_clock_management_urls = _normalize_camera_clock_management_urls(
+            camera_clock_management_urls,
+            len(self.sources),
+        )
         self._init_ui()
 
     def _init_ui(self):
@@ -1600,38 +1684,60 @@ class MultiCameraManagementDialog(QDialog):
         dialog = CameraConfigDialog("", self)
         if dialog.exec_() == QDialog.Accepted:
             self.sources.append(dialog.result_source)
+            self.camera_clock_management_urls.append(
+                dialog.result_management_url
+            )
             self._refresh_table()
 
     def _edit_camera(self, index):
-        dialog = CameraConfigDialog(self.sources[index], self)
+        dialog = CameraConfigDialog(
+            self.sources[index],
+            self,
+            current_management_url=self.camera_clock_management_urls[index],
+        )
         if dialog.exec_() == QDialog.Accepted:
             self.sources[index] = dialog.result_source
+            self.camera_clock_management_urls[index] = dialog.result_management_url
             self._refresh_table()
 
     def _delete_camera(self, index):
         if index == 0: return
         self.sources.pop(index)
+        self.camera_clock_management_urls.pop(index)
         self._refresh_table()
 
     def get_result(self):
         return self.sources
 
+    def get_clock_management_urls(self):
+        return self.camera_clock_management_urls
+
 class CameraConfigDialog(QDialog):
     """摄像头配置对话框 - 支持模拟流、USB和大疆/海康网络摄像头"""
 
-    def __init__(self, current_source, parent=None):
+    def __init__(
+        self,
+        current_source,
+        parent=None,
+        *,
+        current_management_url="",
+    ):
         super().__init__(parent)
         self.setWindowTitle("摄像头配置")
-        self.setMinimumSize(500, 400)
+        self.setMinimumSize(680, 550)
         self.result_source = current_source
+        self.result_management_url = str(current_management_url or "").strip()
+        self._current_management_url = self.result_management_url
+        self._clock_check_passed = False
         self._init_ui()
         self._load_current(current_source)
+        self._load_management_url(self._current_management_url)
 
     def _init_ui(self):
         # 统一字体样式
         self.setStyleSheet("""
             QDialog { background-color: #ffffff; }
-            QLabel, QRadioButton, QLineEdit, QComboBox, QPushButton, QGroupBox {
+            QLabel, QRadioButton, QLineEdit, QComboBox, QSpinBox, QPushButton, QGroupBox {
                 font-size: 16px;
             }
             QGroupBox { font-weight: bold; }
@@ -1723,6 +1829,24 @@ class CameraConfigDialog(QDialog):
         
         rtsp_layout.addWidget(self.advance_rtsp_check)
         rtsp_layout.addWidget(self.rtsp_url_input)
+
+        management_box = QGroupBox("海康设备时间接口")
+        management_form = QFormLayout(management_box)
+        self.management_scheme_combo = QComboBox()
+        self.management_scheme_combo.addItem("HTTP", "http")
+        self.management_scheme_combo.addItem("HTTPS", "https")
+        self.management_port_spin = QSpinBox()
+        self.management_port_spin.setRange(1, 65535)
+        self.management_port_spin.setValue(80)
+        management_form.addRow("管理协议:", self.management_scheme_combo)
+        management_form.addRow("管理端口:", self.management_port_spin)
+        rtsp_layout.addWidget(management_box)
+
+        self.camera_time_status = QLabel("相机时间：尚未核验（允许误差 3 秒）")
+        self.camera_time_status.setStyleSheet(
+            "color: #b54708; font-size: 14px; font-weight: 600;"
+        )
+        rtsp_layout.addWidget(self.camera_time_status)
         self.stack.addWidget(self.page_rtsp)
 
         layout.addWidget(self.stack)
@@ -1731,9 +1855,23 @@ class CameraConfigDialog(QDialog):
         self.radio_mock.toggled.connect(lambda: self.stack.setCurrentIndex(0))
         self.radio_usb.toggled.connect(lambda: self.stack.setCurrentIndex(1))
         self.radio_rtsp.toggled.connect(lambda: self.stack.setCurrentIndex(2))
+        for control in (
+            self.hik_ip,
+            self.hik_user,
+            self.hik_pwd,
+            self.rtsp_url_input,
+        ):
+            control.textChanged.connect(self._reset_clock_check)
+        self.advance_rtsp_check.toggled.connect(self._reset_clock_check)
+        self.management_scheme_combo.currentIndexChanged.connect(
+            self._on_management_scheme_changed
+        )
+        self.management_port_spin.valueChanged.connect(self._reset_clock_check)
 
         # 3. 状态显示
         self.status_label = QLabel("等待测试...")
+        self.status_label.setWordWrap(True)
+        self.status_label.setMinimumHeight(44)
         self.status_label.setStyleSheet("color: #888; font-size: 16px;")
         layout.addWidget(self.status_label)
 
@@ -1764,19 +1902,42 @@ class CameraConfigDialog(QDialog):
         """异步测试连接"""
         source = self._get_current_source()
         if source is None: return
+        self._clock_check_passed = False
+        management_url = self._management_url_for_source(source)
         
         # 禁用按钮，显示进度
         self.status_label.setText("⏳ 正在尝试连接，请稍候...")
         self.status_label.setStyleSheet("color: #1890ff; font-weight: bold;")
         self._set_ui_enabled(False)
         
-        self.tester = ConnectionTester(source)
+        self.tester = ConnectionTester(
+            source,
+            verify_hikvision_clock=self._requires_camera_clock_check(source),
+            management_url=management_url,
+        )
         self.tester.finished.connect(self._on_test_finished)
         self.tester.start()
 
     def _on_test_finished(self, success, message):
         """测试完成后的回调"""
         self._set_ui_enabled(True)
+        requires_clock_check = self._requires_camera_clock_check()
+        self._clock_check_passed = bool(success and requires_clock_check)
+        if requires_clock_check and success:
+            self.camera_time_status.setText("相机时间：核验通过")
+            self.camera_time_status.setStyleSheet(
+                "color: #247a52; font-size: 14px; font-weight: 600;"
+            )
+        elif requires_clock_check:
+            self.camera_time_status.setText("相机时间：核验失败")
+            self.camera_time_status.setStyleSheet(
+                "color: #b54747; font-size: 14px; font-weight: 600;"
+            )
+        else:
+            self.camera_time_status.setText("相机时间：当前源不需要海康设备校时")
+            self.camera_time_status.setStyleSheet(
+                "color: #667085; font-size: 14px; font-weight: 600;"
+            )
         if success:
             self.status_label.setText(f"✅ {message}")
             self.status_label.setStyleSheet("color: #52c41a; font-weight: bold;")
@@ -1785,6 +1946,35 @@ class CameraConfigDialog(QDialog):
             self.status_label.setText(f"❌ {message}")
             self.status_label.setStyleSheet("color: #f5222d; font-weight: bold;")
             QMessageBox.critical(self, "失败", message)
+
+    def _requires_camera_clock_check(self, source=None):
+        if not self.radio_rtsp.isChecked():
+            return False
+        if source is None:
+            source = self._get_current_source(show_warning=False)
+        return camera_clock_check_required(source)
+
+    def _on_management_scheme_changed(self, *_args):
+        scheme = self.management_scheme_combo.currentData()
+        port = self.management_port_spin.value()
+        if scheme == "https" and port == 80:
+            self.management_port_spin.setValue(443)
+        elif scheme == "http" and port == 443:
+            self.management_port_spin.setValue(80)
+        self._reset_clock_check()
+
+    def _reset_clock_check(self, *_args):
+        self._clock_check_passed = False
+        if not hasattr(self, "camera_time_status"):
+            return
+        if self._requires_camera_clock_check():
+            text = "相机时间：尚未核验（允许误差 3 秒）"
+        else:
+            text = "相机时间：当前源不需要海康设备校时"
+        self.camera_time_status.setText(text)
+        self.camera_time_status.setStyleSheet(
+            "color: #b54708; font-size: 14px; font-weight: 600;"
+        )
 
     def _set_ui_enabled(self, enabled):
         """统一控制界面可用性"""
@@ -1797,7 +1987,7 @@ class CameraConfigDialog(QDialog):
             if btn.text() in ["测试连接", "保存配置", "取消"]:
                 btn.setEnabled(enabled)
 
-    def _get_current_source(self):
+    def _get_current_source(self, *, show_warning=True):
         """根据当前界面选择计算出source"""
         if self.radio_mock.isChecked():
             return self.mock_path.text().strip()
@@ -1805,7 +1995,10 @@ class CameraConfigDialog(QDialog):
             return self.usb_combo.currentData()
         else:
             if self.advance_rtsp_check.isChecked():
-                return self.rtsp_url_input.text().strip()
+                source = self.rtsp_url_input.text().strip()
+                if not source and show_warning:
+                    QMessageBox.warning(self, "提示", "请填写完整 RTSP 地址")
+                return source or None
             else:
                 # 自动生成海康地址
                 import urllib.parse
@@ -1813,17 +2006,33 @@ class CameraConfigDialog(QDialog):
                 user = self.hik_user.text().strip()
                 pwd = self.hik_pwd.text().strip()
                 if not ip or not pwd:
-                    QMessageBox.warning(self, "提示", "请填写海康相机的IP和密码")
+                    if show_warning:
+                        QMessageBox.warning(self, "提示", "请填写海康相机的IP和密码")
                     return None
                 
                 # 对用户名和密码进行URL编码
-                safe_user = urllib.parse.quote(user)
-                safe_pwd = urllib.parse.quote(pwd)
+                safe_user = urllib.parse.quote(user, safe="")
+                safe_pwd = urllib.parse.quote(pwd, safe="")
+                host = f"[{ip}]" if ":" in ip and not ip.startswith("[") else ip
                 
                 # 尝试两种常见的海康RTSP路径
                 # 1. 现代标准路径: /Streaming/Channels/101
                 # 2. 传统路径: /h264/ch1/main/av_stream
-                return f"rtsp://{safe_user}:{safe_pwd}@{ip}:554/Streaming/Channels/101"
+                return f"rtsp://{safe_user}:{safe_pwd}@{host}:554/Streaming/Channels/101"
+
+    def _management_url_for_source(self, source):
+        if not camera_clock_check_required(source):
+            return ""
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(source)
+        host = parsed.hostname
+        if not host:
+            return ""
+        host_for_url = f"[{host}]" if ":" in host else host
+        scheme = str(self.management_scheme_combo.currentData() or "http")
+        port = self.management_port_spin.value()
+        return f"{scheme}://{host_for_url}:{port}"
 
     def _refresh_usb_list(self):
         """刷新USB摄像头列表"""
@@ -1856,23 +2065,28 @@ class CameraConfigDialog(QDialog):
             idx = self.usb_combo.findData(source)
             if idx >= 0: self.usb_combo.setCurrentIndex(idx)
         elif isinstance(source, str):
-            if source.startswith("rtsp"):
+            if source.lower().startswith("rtsp://"):
                 self.radio_rtsp.setChecked(True)
                 self.stack.setCurrentIndex(2)
-                # 尝试解析RTSP地址回填到助手
+                # 使用结构化 URL 解析，避免已编码凭据再次保存时被二次编码。
                 try:
-                    # rtsp://user:pwd@ip:554/...
-                    parts = source.split("@")
-                    if len(parts) == 2:
-                        user_pwd = parts[0].replace("rtsp://", "").split(":")
-                        ip_port = parts[1].split("/")[0].split(":")
-                        if len(user_pwd) == 2:
-                            self.hik_user.setText(user_pwd[0])
-                            self.hik_pwd.setText(user_pwd[1])
-                        if len(ip_port) >= 1:
-                            self.hik_ip.setText(ip_port[0])
+                    from urllib.parse import unquote, urlsplit
+
+                    parsed = urlsplit(source)
+                    if not parsed.hostname:
+                        raise ValueError("RTSP 地址缺少主机名")
+                    self.hik_user.setText(unquote(parsed.username or ""))
+                    self.hik_pwd.setText(unquote(parsed.password or ""))
+                    self.hik_ip.setText(parsed.hostname)
                     self.rtsp_url_input.setText(source)
-                except:
+                    is_standard_hikvision = bool(
+                        parsed.path.rstrip("/") == "/Streaming/Channels/101"
+                        and parsed.port in {None, 554}
+                        and not parsed.query
+                        and not parsed.fragment
+                    )
+                    self.advance_rtsp_check.setChecked(not is_standard_hikvision)
+                except (TypeError, ValueError):
                     self.rtsp_url_input.setText(source)
                     self.advance_rtsp_check.setChecked(True)
             else:
@@ -1880,11 +2094,38 @@ class CameraConfigDialog(QDialog):
                 self.stack.setCurrentIndex(0)
                 self.mock_path.setText(source)
 
+    def _load_management_url(self, management_url):
+        if not management_url:
+            return
+        try:
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(management_url)
+            index = self.management_scheme_combo.findData(parsed.scheme.lower())
+            if index < 0 or not parsed.hostname:
+                return
+            self.management_scheme_combo.setCurrentIndex(index)
+            default_port = 443 if parsed.scheme.lower() == "https" else 80
+            self.management_port_spin.setValue(parsed.port or default_port)
+        except (TypeError, ValueError):
+            return
+        self._reset_clock_check()
+
     def _on_save(self):
         """保存并关闭"""
-        self.result_source = self._get_current_source()
-        if self.result_source is not None:
-            self.accept()
+        source = self._get_current_source()
+        if source is None:
+            return
+        if self._requires_camera_clock_check(source) and not self._clock_check_passed:
+            QMessageBox.warning(
+                self,
+                "相机时间未核验",
+                "请先点击“测试连接”，确认画面和相机时间均正常。",
+            )
+            return
+        self.result_source = source
+        self.result_management_url = self._management_url_for_source(source)
+        self.accept()
 
 class StartTimeDialog(QDialog):
     """发枪时间设置对话框"""
@@ -2415,6 +2656,13 @@ class MainWindow(QMainWindow):
             self.sources = list(sources) if sources else []
         if not self.sources:
             self.sources = [config.get('source', 'rtsp://localhost:8554/test')]
+        self.camera_clock_management_urls = _normalize_camera_clock_management_urls(
+            config.get("camera_clock_management_urls"),
+            len(self.sources),
+        )
+        self.config["camera_clock_management_urls"] = list(
+            self.camera_clock_management_urls
+        )
         self.model_path = config.get('model_path')
         self.race_root = Path(config.get("output_dir") or (Path.cwd() / "RaceData")).expanduser().absolute()
         self.output_dir = self.race_root.absolute()
@@ -2526,6 +2774,8 @@ class MainWindow(QMainWindow):
         self._frame_count = 0
         self._initialized = False  # 是否已初始化组件
         self._session_event_count = 0  # 本次会话过线数
+        self._camera_clock_preflight_thread: Optional[CameraClockPreflightThread] = None
+        self._camera_clock_verified_signature = None
 
         self._init_ui()
         self._load_initial_config()
@@ -2612,6 +2862,7 @@ class MainWindow(QMainWindow):
                 "passage_clock_offset_ms": 0,
                 "passage_video_preroll_ms": 3_000,
                 "video_timeline_timing_error_ms": 2_000,
+                "camera_clock_management_urls": [],
             }
         )
         config_file = race_dir / "config.json"
@@ -2642,6 +2893,14 @@ class MainWindow(QMainWindow):
             self.sources = list(sources) if sources else []
         if not self.sources:
             self.sources = [self.config.get('source', 'rtsp://localhost:8554/test')]
+        self.camera_clock_management_urls = _normalize_camera_clock_management_urls(
+            self.config.get("camera_clock_management_urls"),
+            len(self.sources),
+        )
+        self.config["camera_clock_management_urls"] = list(
+            self.camera_clock_management_urls
+        )
+        self._camera_clock_verified_signature = None
         self.model_path = self.config.get('model_path')
         requested_ocr_engine = (self.config.get('ocr_engine') or 'paddleocr').lower()
         if requested_ocr_engine != 'paddleocr':
@@ -2694,6 +2953,7 @@ class MainWindow(QMainWindow):
             self.race_name_label.setText(race_dir.name)
         if hasattr(self, "passage_review_btn"):
             self.passage_review_btn.setEnabled(True)
+        self._refresh_evidence_ui()
         self.statusBar().showMessage(f"当前赛事: {race_dir.name}")
 
     def _prompt_race_selection(self):
@@ -2862,12 +3122,23 @@ class MainWindow(QMainWindow):
         self.cyclerace_status_label = QLabel("CycleRace: 等待赛事")
         self.cyclerace_status_label.setStyleSheet("color: #667085; font-size: 12px; font-weight: 600;")
         header_layout.addWidget(self.cyclerace_status_label)
+        self.evidence_status_label = QLabel("录像证据: 等待赛事")
+        self.evidence_status_label.setStyleSheet(
+            "color: #667085; font-size: 12px; font-weight: 600;"
+        )
+        header_layout.addWidget(self.evidence_status_label)
         self.passage_review_btn = QPushButton("通过记录")
         self.passage_review_btn.setObjectName("settings_btn")
         self.passage_review_btn.setEnabled(False)
         self.passage_review_btn.setToolTip("查看 CycleRace passage 与对应录像位置")
         self.passage_review_btn.clicked.connect(self._show_passage_review)
         header_layout.addWidget(self.passage_review_btn)
+        self.external_clip_btn = QPushButton("导入高速")
+        self.external_clip_btn.setObjectName("settings_btn")
+        self.external_clip_btn.setEnabled(False)
+        self.external_clip_btn.setToolTip("按北京时间 sidecar 导入高速摄像片段")
+        self.external_clip_btn.clicked.connect(self._import_external_clips)
+        header_layout.addWidget(self.external_clip_btn)
 
         self.capture_state_label = QLabel("采集未开始")
         self.capture_state_label.setObjectName("capture_state")
@@ -3742,6 +4013,51 @@ class MainWindow(QMainWindow):
         else:
             self.event_list.refresh_data()
 
+    def _refresh_evidence_ui(self):
+        timeline = getattr(self, "video_timeline_store", None)
+        recording = getattr(self, "recording_manager", None)
+        recording_active = bool(recording and recording.is_recording)
+        import_active = getattr(self, "_external_clip_import_thread", None) is not None
+
+        if not getattr(self, "_race_ready", False):
+            status_text = "录像证据: 等待赛事"
+        elif timeline is None:
+            status_text = "录像证据: 时间线不可用"
+        else:
+            segments = timeline.segments()
+            high_speed_count = sum(
+                segment.clock_source == EXTERNAL_CLOCK_SOURCE
+                for segment in segments
+            )
+            standard_count = len(segments) - high_speed_count
+            status_text = (
+                f"录像证据: 普通 {standard_count} 段 | 高速 {high_speed_count} 段"
+            )
+            if recording_active:
+                status_text += " | 普通录制中"
+            if import_active:
+                status_text += " | 高速导入中"
+
+        label = getattr(self, "evidence_status_label", None)
+        if label is not None:
+            label.setText(status_text)
+            label.setToolTip(
+                "普通录像使用 VideoPipe 系统时钟；"
+                "高速摄像使用北京时间 sidecar；两者仅作为辅助证据。"
+            )
+
+        can_import = bool(
+            getattr(self, "_race_ready", False)
+            and timeline is not None
+            and getattr(self, "passage_event_store", None) is not None
+            and not recording_active
+            and not import_active
+        )
+        for control_name in ("external_clip_btn", "external_clip_action"):
+            control = getattr(self, control_name, None)
+            if control is not None:
+                control.setEnabled(can_import)
+
     def _load_video_timeline(self):
         self.video_timeline_store = None
         try:
@@ -3752,10 +4068,12 @@ class MainWindow(QMainWindow):
             logger.error("[Main] 加载录像时间线失败: %s", exc)
             self.statusBar().showMessage(f"录像时间线不可用: {exc}")
             self._refresh_recording_ui()
+            self._refresh_evidence_ui()
             return
         self.video_timeline_store = store
         self._recording_timeline_warning = ""
         self._refresh_recording_ui()
+        self._refresh_evidence_ui()
         if store.recovered_incomplete_tail:
             logger.warning("[Main] 已恢复录像时间线未完整尾部")
         if recovered_open_segments:
@@ -3986,9 +4304,7 @@ class MainWindow(QMainWindow):
             "timeline_store": timeline_store,
             "passage_store": passage_store,
         }
-        action = getattr(self, "external_clip_action", None)
-        if action is not None:
-            action.setEnabled(False)
+        self._refresh_evidence_ui()
 
         progress.canceled.connect(thread.requestInterruption)
         thread.progress.connect(self._on_external_clip_import_progress)
@@ -4055,6 +4371,9 @@ class MainWindow(QMainWindow):
         dialog = self.passage_review_dialog
         if dialog is not None:
             dialog.refresh()
+        refresh_evidence = getattr(self, "_refresh_evidence_ui", None)
+        if callable(refresh_evidence):
+            refresh_evidence()
         message = (
             f"已导入 {result.created_count} 个片段，"
             f"修复 {result.repaired_count} 个，"
@@ -4080,9 +4399,7 @@ class MainWindow(QMainWindow):
         self._external_clip_import_progress = None
         self._external_clip_import_context = None
         self._external_clip_import_thread = None
-        action = getattr(self, "external_clip_action", None)
-        if action is not None:
-            action.setEnabled(True)
+        self._refresh_evidence_ui()
         thread.deleteLater()
 
     def _open_passage_location(self, event, location):
@@ -4265,6 +4582,7 @@ class MainWindow(QMainWindow):
         self.external_clip_action.setStatusTip(
             "按北京时间 sidecar 将外部高速摄像片段加入当前赛事录像时间线"
         )
+        self.external_clip_action.setEnabled(False)
         self.external_clip_action.triggered.connect(self._import_external_clips)
         data_menu.addAction(self.external_clip_action)
 
@@ -4405,14 +4723,27 @@ class MainWindow(QMainWindow):
 
     def _config_camera(self):
         """打开摄像头配置对话框 (支持多机位)"""
-        dialog = MultiCameraManagementDialog(self.sources, self)
+        dialog = MultiCameraManagementDialog(
+            self.sources,
+            self,
+            camera_clock_management_urls=self.camera_clock_management_urls,
+        )
         if dialog.exec_() == QDialog.Accepted:
             new_sources = dialog.get_result()
-            if new_sources != self.sources:
+            new_management_urls = dialog.get_clock_management_urls()
+            if (
+                new_sources != self.sources
+                or new_management_urls != self.camera_clock_management_urls
+            ):
                 self.sources = new_sources
+                self.camera_clock_management_urls = new_management_urls
+                self._camera_clock_verified_signature = None
                 
                 # 保存到 config
                 self.config['sources'] = self.sources
+                self.config["camera_clock_management_urls"] = list(
+                    self.camera_clock_management_urls
+                )
                 if self.sources:
                     self.config['source'] = self.sources[0] # 保持兼容性
                 self._save_config()
@@ -4854,6 +5185,8 @@ class MainWindow(QMainWindow):
 
     def _release_current_race(self):
         """Stop race-bound workers and close the current database before switching."""
+        MainWindow._cancel_camera_clock_preflight(self)
+        self._camera_clock_verified_signature = None
         if self.recording_manager is not None:
             self._stop_manual_recording(show_message=False)
 
@@ -4910,6 +5243,9 @@ class MainWindow(QMainWindow):
         self.field_issue_log = None
         self._initialized = False
         self._race_ready = False
+        refresh_evidence = getattr(self, "_refresh_evidence_ui", None)
+        if callable(refresh_evidence):
+            refresh_evidence()
         self._session_event_count = 0
         self._latest_frame_observations.clear()
         self._live_monitor_samples.clear()
@@ -5278,6 +5614,9 @@ class MainWindow(QMainWindow):
     def _refresh_recording_ui(self):
         manager = self.recording_manager
         active = bool(manager and manager.is_recording)
+        refresh_evidence = getattr(self, "_refresh_evidence_ui", None)
+        if callable(refresh_evidence):
+            refresh_evidence()
 
         if hasattr(self, "record_btn"):
             self.record_btn.setText("停止录像" if active else "开始录像")
@@ -5347,6 +5686,16 @@ class MainWindow(QMainWindow):
         if not self._running:
             if not automatic:
                 QMessageBox.warning(self, "提示", "请先启动AI检测，再开始录像。")
+            return
+
+        if not MainWindow._camera_clock_session_is_verified(self):
+            message = "当前摄像头未通过本次采集的时间核验，请停止并重新开始采集。"
+            self._recording_error_message = message
+            logger.warning(f"[Recording] {message}")
+            if automatic:
+                self.statusBar().showMessage(message)
+            else:
+                QMessageBox.warning(self, "录像失败", message)
             return
 
         rtsp_sources = [source for source in self.sources if is_rtsp_source(source)]
@@ -5487,11 +5836,94 @@ class MainWindow(QMainWindow):
         if self.isVisible():
             QTimer.singleShot(100, self.start_when_race_ready)
 
+    def _camera_clock_targets(self):
+        sources = list(getattr(self, "sources", ()) or ())
+        management_urls = _normalize_camera_clock_management_urls(
+            getattr(self, "camera_clock_management_urls", None),
+            len(sources),
+        )
+        return tuple(
+            (index, source, management_urls[index])
+            for index, source in enumerate(sources)
+            if camera_clock_check_required(source)
+        )
+
+    def _camera_clock_session_is_verified(self):
+        signature = MainWindow._camera_clock_targets(self)
+        if not signature:
+            return True
+        return getattr(self, "_camera_clock_verified_signature", None) == signature
+
+    def _cancel_camera_clock_preflight(self):
+        thread = getattr(self, "_camera_clock_preflight_thread", None)
+        if thread is None:
+            return
+        try:
+            thread.completed.disconnect(self._on_camera_clock_preflight_finished)
+        except (TypeError, RuntimeError):
+            pass
+        if thread.isRunning():
+            thread.requestInterruption()
+            thread.wait(4_000)
+        thread.deleteLater()
+        self._camera_clock_preflight_thread = None
+
+    def _on_camera_clock_preflight_finished(self, success, message, signature):
+        thread = self._camera_clock_preflight_thread
+        self._camera_clock_preflight_thread = None
+        if thread is not None:
+            thread.deleteLater()
+        if hasattr(self, "start_btn"):
+            self.start_btn.setEnabled(True)
+
+        current_signature = MainWindow._camera_clock_targets(self)
+        if success and tuple(signature) != current_signature:
+            success = False
+            message = "摄像头配置在校时期间发生变化，请重新开始采集。"
+
+        if not success:
+            self._camera_clock_verified_signature = None
+            logger.error("[CameraClock] 启动前核验失败: %s", message)
+            self.statusBar().showMessage(f"相机时间核验失败：{message}")
+            QMessageBox.critical(self, "无法开始采集", message)
+            return
+
+        self._camera_clock_verified_signature = current_signature
+        logger.info("[CameraClock] %s", message)
+        self.statusBar().showMessage(message)
+        self._start_capture()
+
     def _start(self):
         """启动 (支持多机位)"""
         if not self._race_ready:
             QMessageBox.warning(self, "提示", "请先选择或创建赛事。")
             self._prompt_race_selection()
+            return
+
+        thread = getattr(self, "_camera_clock_preflight_thread", None)
+        if thread is not None and thread.isRunning():
+            self.statusBar().showMessage("正在核验相机时间，请稍候。")
+            return
+
+        targets = MainWindow._camera_clock_targets(self)
+        if not targets:
+            self._camera_clock_verified_signature = tuple()
+            self._start_capture()
+            return
+
+        self._camera_clock_verified_signature = None
+        self.start_btn.setEnabled(False)
+        self.statusBar().showMessage(
+            f"正在核验 {len(targets)} 路相机时间，请稍候。"
+        )
+        thread = CameraClockPreflightThread(targets, self)
+        self._camera_clock_preflight_thread = thread
+        thread.completed.connect(self._on_camera_clock_preflight_finished)
+        thread.start()
+
+    def _start_capture(self):
+        """Start capture after the camera clock preflight has passed."""
+        if self._running:
             return
         logger.info(f"正在启动 AI 引擎，机位数量: {len(self.sources)}")
         if not self._init_components():
@@ -5548,6 +5980,8 @@ class MainWindow(QMainWindow):
 
     def _stop(self):
         """停止 (支持多机位)"""
+        MainWindow._cancel_camera_clock_preflight(self)
+        self._camera_clock_verified_signature = None
         self._running = False
 
         for preview_thread in self.preview_threads.values():

@@ -177,6 +177,34 @@ def test_manual_recording_requires_running_detection(monkeypatch, tmp_path):
     assert warnings == [("提示", "请先启动AI检测，再开始录像。")]
 
 
+def test_manual_recording_requires_current_camera_clock_preflight(
+    monkeypatch,
+    tmp_path,
+):
+    warnings = []
+    monkeypatch.setattr(
+        main_window.QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+    window = _Harness(tmp_path)
+    window.sources = [
+        "rtsp://admin:secret@192.0.2.5:554/Streaming/Channels/101"
+    ]
+    window.camera_clock_management_urls = ["http://192.0.2.5:80"]
+    window._camera_clock_verified_signature = None
+
+    window._start_manual_recording()
+
+    assert window.recording_manager is None
+    assert warnings == [
+        (
+            "录像失败",
+            "当前摄像头未通过本次采集的时间核验，请停止并重新开始采集。",
+        )
+    ]
+
+
 def test_auto_recording_starts_without_modal_dialog(monkeypatch, tmp_path):
     warnings = []
     monkeypatch.setattr(

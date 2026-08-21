@@ -12,7 +12,6 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -23,15 +22,23 @@ from PyQt5.QtWidgets import (
 )
 
 try:
+    from .external_clip_import import EXTERNAL_CLOCK_SOURCE
     from .passage_receiver import PassageEvent, PassageEventStore
     from .video_timeline import (
+        DEFAULT_CLOCK_SOURCE,
         PassageVideoLocation,
         PassageVideoLookup,
         VideoTimelineStore,
     )
 except ImportError:
+    from external_clip_import import EXTERNAL_CLOCK_SOURCE
     from passage_receiver import PassageEvent, PassageEventStore
-    from video_timeline import PassageVideoLocation, PassageVideoLookup, VideoTimelineStore
+    from video_timeline import (
+        DEFAULT_CLOCK_SOURCE,
+        PassageVideoLocation,
+        PassageVideoLookup,
+        VideoTimelineStore,
+    )
 
 
 _STATUS_TEXT = {
@@ -66,14 +73,19 @@ def lookup_status_text(lookup: PassageVideoLookup) -> str:
     located = [item for item in lookup.locations if item.status == "located"]
     if located:
         uncertainty = max(item.timing_error_ms for item in located)
+        nearby = [item for item in lookup.locations if item.status == "near_boundary"]
         unverified_count = sum(
             item.status == "unverified" for item in lookup.locations
         )
-        suffix = (
-            f"，另有 {unverified_count} 个机位时间范围未验证"
-            if unverified_count
-            else ""
-        )
+        suffixes = []
+        if nearby:
+            nearby_uncertainty = max(item.timing_error_ms for item in nearby)
+            suffixes.append(
+                f"另有 {len(nearby)} 个机位位于误差边界（约 ±{nearby_uncertainty} ms）"
+            )
+        if unverified_count:
+            suffixes.append(f"另有 {unverified_count} 个机位时间范围未验证")
+        suffix = f"，{'；'.join(suffixes)}" if suffixes else ""
         return f"{len(located)} 个机位，近似 ±{uncertainty} ms{suffix}"
     nearby = [item for item in lookup.locations if item.status == "near_boundary"]
     if nearby:
@@ -83,6 +95,37 @@ def lookup_status_text(lookup: PassageVideoLookup) -> str:
     if unverified:
         return f"{len(unverified)} 个机位可打开，时间范围未验证"
     return _STATUS_TEXT.get(lookup.status, lookup.status)
+
+
+def location_source_text(location: PassageVideoLocation) -> str:
+    media_type = (
+        "高速摄像"
+        if location.segment.clock_source == EXTERNAL_CLOCK_SOURCE
+        else "普通录像"
+    )
+    return (
+        f"{media_type} · 机位 {location.segment.camera_index} · "
+        f"{location.segment.source_id}"
+    )
+
+
+def location_status_text(location: PassageVideoLocation) -> str:
+    position = f"{location.passage_position_ms / 1000.0:.3f} s"
+    if location.status == "located":
+        return f"已定位 · {position} · ±{location.timing_error_ms} ms"
+    if location.status == "near_boundary":
+        return f"误差边界 · {position} · ±{location.timing_error_ms} ms"
+    if location.status == "unverified":
+        return f"可打开 · 时间范围未验证 · {position}"
+    return _STATUS_TEXT.get(location.status, location.status)
+
+
+def location_clock_text(location: PassageVideoLocation) -> str:
+    if location.segment.clock_source == EXTERNAL_CLOCK_SOURCE:
+        return "北京时间 sidecar"
+    if location.segment.clock_source == DEFAULT_CLOCK_SOURCE:
+        return "VideoPipe 系统时钟"
+    return location.segment.clock_source
 
 
 class PassageReviewDialog(QDialog):
@@ -108,8 +151,8 @@ class PassageReviewDialog(QDialog):
         self._open_location = open_location
 
         self.setWindowTitle("CycleRace 通过记录")
-        self.resize(1060, 620)
-        self.setMinimumSize(820, 480)
+        self.resize(1280, 620)
+        self.setMinimumSize(1000, 480)
         self._init_ui()
         self.refresh()
 
@@ -137,9 +180,19 @@ class PassageReviewDialog(QDialog):
         controls.addWidget(refresh_btn)
         layout.addLayout(controls)
 
-        self.table = QTableWidget(0, 7, self)
+        self.table = QTableWidget(0, 9, self)
         self.table.setHorizontalHeaderLabels(
-            ["序号", "号码 / 芯片", "组别", "圈次", "Passage 时间", "录像定位", "操作"]
+            [
+                "序号",
+                "号码 / 芯片",
+                "组别",
+                "圈次",
+                "Passage 时间",
+                "证据来源",
+                "定位状态",
+                "时钟来源",
+                "操作",
+            ]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -152,8 +205,10 @@ class PassageReviewDialog(QDialog):
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.Stretch)
+        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
         self.table.cellDoubleClicked.connect(self._open_row)
         layout.addWidget(self.table, 1)
 
@@ -181,15 +236,24 @@ class PassageReviewDialog(QDialog):
 
     def refresh(self) -> None:
         events = self.passage_store.events()
-        self.table.setRowCount(len(events))
+        rows = []
         located_count = 0
-        for row, event in enumerate(events):
+        openable_count = 0
+        for event in events:
             lookup = self._lookup(event)
             available = [
                 item for item in lookup.locations if item.status in _OPENABLE_STATUSES
             ]
             if available:
                 located_count += 1
+                openable_count += len(available)
+            if lookup.locations:
+                rows.extend((event, lookup, location) for location in lookup.locations)
+            else:
+                rows.append((event, lookup, None))
+
+        self.table.setRowCount(len(rows))
+        for row, (event, lookup, location) in enumerate(rows):
             identity = event.bib.strip() or event.chip_id.strip() or "未知"
             values = (
                 str(event.sequence),
@@ -197,7 +261,9 @@ class PassageReviewDialog(QDialog):
                 event.group_id,
                 str(event.lap),
                 format_passage_time(event.timeline_timestamp_ms),
-                lookup_status_text(lookup),
+                location_source_text(location) if location is not None else "无匹配证据",
+                location_status_text(location) if location is not None else lookup_status_text(lookup),
+                location_clock_text(location) if location is not None else "--",
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -205,26 +271,42 @@ class PassageReviewDialog(QDialog):
                     item.setTextAlignment(Qt.AlignCenter)
                 if column == 0:
                     item.setData(Qt.UserRole, event.event_id)
+                    item.setData(
+                        Qt.UserRole + 1,
+                        location.segment.segment_id if location is not None else "",
+                    )
                 self.table.setItem(row, column, item)
 
-            open_btn = QPushButton("打开证据")
-            open_btn.setEnabled(bool(available))
-            open_btn.clicked.connect(
-                lambda _checked=False, event_id=event.event_id: self._open_event(event_id)
+            open_btn = QPushButton("打开")
+            open_btn.setEnabled(
+                location is not None and location.status in _OPENABLE_STATUSES
             )
-            self.table.setCellWidget(row, 6, open_btn)
+            open_btn.clicked.connect(
+                lambda _checked=False,
+                event_id=event.event_id,
+                segment_id=(location.segment.segment_id if location is not None else ""):
+                self._open_event_location(event_id, segment_id)
+            )
+            self.table.setCellWidget(row, 8, open_btn)
 
         self.summary_label.setText(
-            f"共 {len(events)} 条 passage，{located_count} 条可定位；"
+            f"共 {len(events)} 条 passage，{located_count} 条可定位，"
+            f"{openable_count} 份可打开证据；"
             f"当前时钟偏移 {self.clock_offset_ms:+d} ms"
         )
 
     def _open_row(self, row: int, _column: int) -> None:
         item = self.table.item(row, 0)
         if item is not None:
-            self._open_event(str(item.data(Qt.UserRole) or ""))
+            self._open_event_location(
+                str(item.data(Qt.UserRole) or ""),
+                str(item.data(Qt.UserRole + 1) or ""),
+            )
 
     def _open_event(self, event_id: str) -> None:
+        self._open_event_location(event_id, "")
+
+    def _open_event_location(self, event_id: str, segment_id: str) -> None:
         event = self.passage_store.get(event_id)
         if event is None:
             self.refresh()
@@ -237,23 +319,18 @@ class PassageReviewDialog(QDialog):
             QMessageBox.information(self, "无法定位", lookup_status_text(lookup))
             return
 
-        location = available[0]
-        if len(available) > 1:
-            labels = [
-                f"机位 {item.segment.camera_index}: {item.video_path.name}"
+        location = next(
+            (
+                item
                 for item in available
-            ]
-            selected, accepted = QInputDialog.getItem(
-                self,
-                "选择机位",
-                "可用录像",
-                labels,
-                0,
-                False,
-            )
-            if not accepted:
-                return
-            location = available[labels.index(selected)]
+                if not segment_id or item.segment.segment_id == segment_id
+            ),
+            None,
+        )
+        if location is None:
+            QMessageBox.information(self, "无法定位", "该证据已变化，请刷新后重试。")
+            self.refresh()
+            return
 
         if self._open_location is not None:
             self._open_location(event, location)

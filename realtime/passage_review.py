@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from PyQt5.QtCore import QPoint, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap, QTransform
@@ -470,10 +470,6 @@ class EvidenceImageView(QGraphicsView):
             self.frame_step_requested.emit(-1 if event.key() == Qt.Key_Left else 1)
             event.accept()
             return
-        if event.key() in (Qt.Key_Up, Qt.Key_Down):
-            self.passage_step_requested.emit(-1 if event.key() == Qt.Key_Up else 1)
-            event.accept()
-            return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             self.marker_confirm_requested.emit()
             event.accept()
@@ -688,6 +684,17 @@ class PassageEvidencePane(QFrame):
     @property
     def has_pending_marker(self) -> bool:
         return self._pending_marker is not None
+
+    def matches_passage_context(
+        self,
+        event: PassageEvent,
+        location: Optional[PassageVideoLocation],
+    ) -> bool:
+        return (
+            self._event is not None
+            and self._event.event_id == event.event_id
+            and self._location == location
+        )
 
     def begin_marking(self) -> None:
         if self._worker is None or not self.video_view.has_frame:
@@ -1156,6 +1163,10 @@ class PassageReviewDialog(QDialog):
         self._sync_timer.setInterval(30)
         self._sync_timer.timeout.connect(self._on_sync_tick)
         self._maximized_pane: Optional[PassageEvidencePane] = None
+        self._available_evidence_count = 0
+        self._located_event_ids: set[str] = set()
+        self._fully_ready_event_ids: set[str] = set()
+        self._confirmed_event_ids: set[str] = set()
 
         self.setWindowTitle("终点多源核对")
         self.resize(1400, 860)
@@ -1164,6 +1175,20 @@ class PassageReviewDialog(QDialog):
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.space_shortcut.setContext(Qt.WindowShortcut)
         self.space_shortcut.activated.connect(self._toggle_both)
+        self.previous_passage_shortcut = QShortcut(
+            QKeySequence(Qt.Key_PageUp), self
+        )
+        self.previous_passage_shortcut.setContext(Qt.WindowShortcut)
+        self.previous_passage_shortcut.activated.connect(
+            lambda: self._move_selection(-1)
+        )
+        self.next_passage_shortcut = QShortcut(
+            QKeySequence(Qt.Key_PageDown), self
+        )
+        self.next_passage_shortcut.setContext(Qt.WindowShortcut)
+        self.next_passage_shortcut.activated.connect(
+            lambda: self._move_selection(1)
+        )
         self.refresh()
 
     def _init_ui(self) -> None:
@@ -1210,6 +1235,8 @@ class PassageReviewDialog(QDialog):
         self.stage_value = QLabel("--")
         self.group_value = QLabel("--")
         self.selected_identity_value = QLabel("--")
+        self.athlete_value = QLabel("--")
+        self.team_value = QLabel("--")
         self.selected_time_value = QLabel("--")
         self.selected_time_value.setStyleSheet("font-family: Consolas; font-weight: 700;")
         self.source_value = QLabel("--")
@@ -1218,6 +1245,8 @@ class PassageReviewDialog(QDialog):
         form.addRow("赛段", self.stage_value)
         form.addRow("当前组别", self.group_value)
         form.addRow("号码 / 芯片", self.selected_identity_value)
+        form.addRow("运动员", self.athlete_value)
+        form.addRow("队伍", self.team_value)
         form.addRow("北京时间", self.selected_time_value)
         form.addRow("证据状态", self.source_value)
         info_layout.addLayout(form)
@@ -1414,7 +1443,6 @@ class PassageReviewDialog(QDialog):
             event.race_id,
             self.clock_offset_ms,
             self.pre_roll_ms,
-            self._timeline_signature,
         )
         cached = self._lookup_cache.get(event.event_id)
         if cached is not None and cached[0] == key:
@@ -1478,24 +1506,94 @@ class PassageReviewDialog(QDialog):
             return 0
         return int(max(candidates)[1])
 
+    def _update_group_combo(self, events: tuple[PassageEvent, ...]) -> bool:
+        previous_group = str(self.group_combo.currentData() or "")
+        group_labels = {
+            event.group_id: event.group_name.strip() or event.group_id
+            for event in events
+        }
+        expected_items = [
+            (group_id, group_label)
+            for group_id, group_label in sorted(
+                group_labels.items(), key=lambda item: (item[1], item[0])
+            )
+        ]
+        current_items = [
+            (
+                str(self.group_combo.itemData(index) or ""),
+                self.group_combo.itemText(index),
+            )
+            for index in range(1, self.group_combo.count())
+        ]
+        if current_items == expected_items:
+            return False
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItem("全部组别", "")
+        for group_id, group_label in expected_items:
+            self.group_combo.addItem(group_label, group_id)
+        group_index = self.group_combo.findData(previous_group)
+        self.group_combo.setCurrentIndex(max(0, group_index))
+        self.group_combo.blockSignals(False)
+        return str(self.group_combo.currentData() or "") != previous_group
+
+    def _write_event_row(
+        self,
+        row: int,
+        event: PassageEvent,
+        lookup: PassageVideoLookup,
+    ) -> None:
+        regular = source_location(lookup, high_speed=False)
+        high_speed = source_location(lookup, high_speed=True)
+        readiness_status = review_status_text(lookup, regular, high_speed)
+        regular_association = self._source_association(
+            event.event_id, REGULAR_SOURCE, regular
+        )
+        high_speed_association = self._source_association(
+            event.event_id, HIGH_SPEED_SOURCE, high_speed
+        )
+        review_status = self._confirmation_status(
+            regular_association,
+            high_speed_association,
+            readiness_status,
+        )
+        self._record_summary_state(
+            event.event_id,
+            regular,
+            high_speed,
+            readiness_status,
+            regular_association,
+            high_speed_association,
+        )
+        identity = event.bib.strip() or event.chip_id.strip() or "未知"
+        values = (
+            str(event.sequence),
+            identity,
+            event.group_name.strip() or event.group_id,
+            str(event.lap),
+            format_passage_time(event.timeline_timestamp_ms),
+            compact_source_status(regular),
+            compact_source_status(high_speed),
+            review_status,
+        )
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            if column in {0, 3, 4, 5, 6, 7}:
+                item.setTextAlignment(Qt.AlignCenter)
+            if column == 0:
+                item.setData(Qt.UserRole, event.event_id)
+            if column in {5, 6, 7}:
+                item.setForeground(self._status_color(value))
+            self.table.setItem(row, column, item)
+
     def refresh(self) -> None:
         previous_event_id = self._selected_event_id
-        previous_group = str(self.group_combo.currentData() or "")
         events = self.passage_store.events()
         signature = self._timeline_cache_signature()
         if signature != self._timeline_signature:
             self._timeline_signature = signature
-            self._lookup_cache.clear()
 
-        groups = sorted({event.group_id for event in events})
-        self.group_combo.blockSignals(True)
-        self.group_combo.clear()
-        self.group_combo.addItem("全部组别", "")
-        for group in groups:
-            self.group_combo.addItem(group, group)
-        group_index = self.group_combo.findData(previous_group)
-        self.group_combo.setCurrentIndex(max(0, group_index))
-        self.group_combo.blockSignals(False)
+        self._update_group_combo(events)
         selected_group = str(self.group_combo.currentData() or "")
 
         self._visible_events = [
@@ -1510,55 +1608,13 @@ class PassageReviewDialog(QDialog):
 
         self.table.blockSignals(True)
         self.table.setRowCount(len(self._visible_events))
+        self._located_event_ids.clear()
+        self._fully_ready_event_ids.clear()
+        self._confirmed_event_ids.clear()
         selected_row = -1
-        located_count = 0
-        fully_ready_count = 0
-        confirmed_count = 0
         for row, event in enumerate(self._visible_events):
             lookup = self._lookups[event.event_id]
-            regular = source_location(lookup, high_speed=False)
-            high_speed = source_location(lookup, high_speed=True)
-            readiness_status = review_status_text(lookup, regular, high_speed)
-            regular_association = self._source_association(
-                event.event_id, REGULAR_SOURCE, regular
-            )
-            high_speed_association = self._source_association(
-                event.event_id, HIGH_SPEED_SOURCE, high_speed
-            )
-            review_status = self._confirmation_status(
-                regular_association,
-                high_speed_association,
-                readiness_status,
-            )
-            if any(
-                location is not None and location.status in _OPENABLE_STATUSES
-                for location in (regular, high_speed)
-            ):
-                located_count += 1
-            if readiness_status == "双源就绪":
-                fully_ready_count += 1
-            if regular_association is not None or high_speed_association is not None:
-                confirmed_count += 1
-            identity = event.bib.strip() or event.chip_id.strip() or "未知"
-            values = (
-                str(event.sequence),
-                identity,
-                event.group_id,
-                str(event.lap),
-                format_passage_time(event.timeline_timestamp_ms),
-                compact_source_status(regular),
-                compact_source_status(high_speed),
-                review_status,
-            )
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column in {0, 3, 4, 5, 6, 7}:
-                    item.setTextAlignment(Qt.AlignCenter)
-                if column == 0:
-                    item.setData(Qt.UserRole, event.event_id)
-                if column in {5, 6, 7}:
-                    item.setForeground(self._status_color(value))
-                self.table.setItem(row, column, item)
+            self._write_event_row(row, event, lookup)
             if event.event_id == previous_event_id:
                 selected_row = row
 
@@ -1569,15 +1625,105 @@ class PassageReviewDialog(QDialog):
             self.table.selectRow(selected_row)
         self.table.blockSignals(False)
 
-        self.summary_label.setText(
-            f"共 {len(events)} 条 passage，当前显示 {len(self._visible_events)} 条；"
-            f"{located_count} 条有可用证据，{fully_ready_count} 条双源就绪；"
-            f"{confirmed_count} 条已人工确认；"
-            f"时钟偏移 {self.clock_offset_ms:+d} ms"
-        )
+        self._render_summary()
         if selected_row >= 0:
             self._select_event(self._visible_events[selected_row].event_id)
         else:
+            self._clear_selection_details()
+
+    def refresh_events(self, event_ids: Iterable[str]) -> None:
+        changed_event_ids = {str(event_id) for event_id in event_ids if event_id}
+        if not changed_event_ids:
+            return
+        events = self.passage_store.events()
+        if self._update_group_combo(events):
+            self.refresh()
+            return
+        selected_group = str(self.group_combo.currentData() or "")
+        signature = self._timeline_cache_signature()
+        if signature != self._timeline_signature:
+            self._timeline_signature = signature
+        for event_id in changed_event_ids:
+            self._lookup_cache.pop(event_id, None)
+
+        event_by_id = {event.event_id: event for event in events}
+        ordered_changed_events = [
+            event for event in events if event.event_id in changed_event_ids
+        ]
+        selected_event_changed = self._selected_event_id in changed_event_ids
+        selected_event_id = self._selected_event_id
+
+        self.table.blockSignals(True)
+        for event_id in changed_event_ids:
+            event = event_by_id.get(event_id)
+            row = next(
+                (
+                    index
+                    for index, visible_event in enumerate(self._visible_events)
+                    if visible_event.event_id == event_id
+                ),
+                -1,
+            )
+            should_show = event is not None and (
+                not selected_group or event.group_id == selected_group
+            )
+            if row >= 0 and not should_show:
+                self.table.removeRow(row)
+                self._visible_events.pop(row)
+                self._lookups.pop(event_id, None)
+                self._discard_summary_state(event_id)
+
+        for event in ordered_changed_events:
+            if selected_group and event.group_id != selected_group:
+                continue
+            row = next(
+                (
+                    index
+                    for index, visible_event in enumerate(self._visible_events)
+                    if visible_event.event_id == event.event_id
+                ),
+                -1,
+            )
+            lookup = self._cached_lookup(event)
+            self._lookups[event.event_id] = lookup
+            if row < 0:
+                visible_order = [
+                    candidate.event_id
+                    for candidate in events
+                    if not selected_group or candidate.group_id == selected_group
+                ]
+                desired_row = visible_order.index(event.event_id)
+                row = min(desired_row, len(self._visible_events))
+                self._visible_events.insert(row, event)
+                self.table.insertRow(row)
+            else:
+                self._visible_events[row] = event
+            self._write_event_row(row, event, lookup)
+
+        selected_row = next(
+            (
+                index
+                for index, event in enumerate(self._visible_events)
+                if event.event_id == selected_event_id
+            ),
+            -1,
+        )
+        if selected_row >= 0:
+            self.table.setCurrentCell(selected_row, 0)
+            self.table.selectRow(selected_row)
+        elif self._visible_events:
+            selected_row = 0
+            selected_event_id = self._visible_events[0].event_id
+            self.table.setCurrentCell(selected_row, 0)
+            self.table.selectRow(selected_row)
+            selected_event_changed = True
+        self.table.blockSignals(False)
+
+        self._update_navigation_controls()
+        self._render_summary()
+        if selected_event_changed and selected_event_id:
+            self._select_event(selected_event_id)
+        elif not self._visible_events:
             self._clear_selection_details()
 
     @staticmethod
@@ -1607,58 +1753,78 @@ class PassageReviewDialog(QDialog):
         if event is None or lookup is None:
             self.refresh()
             return
-        self._set_sync_playing(False)
-        self._shared_delta_ms = 0
-        self._selected_event_id = event.event_id
         regular = source_location(lookup, high_speed=False)
         high_speed = source_location(lookup, high_speed=True)
+        preserve_media = (
+            self._selected_event_id == event.event_id
+            and self.regular_pane.matches_passage_context(event, regular)
+            and self.high_speed_pane.matches_passage_context(event, high_speed)
+        )
         regular_association = self._source_association(
             event.event_id, REGULAR_SOURCE, regular
         )
         high_speed_association = self._source_association(
             event.event_id, HIGH_SPEED_SOURCE, high_speed
         )
-        self._shared_delta_ms = self._saved_delta_ms(
-            regular,
-            high_speed,
-            regular_association,
-            high_speed_association,
-        )
+        if not preserve_media:
+            self._set_sync_playing(False)
+            self._shared_delta_ms = self._saved_delta_ms(
+                regular,
+                high_speed,
+                regular_association,
+                high_speed_association,
+            )
+        self._selected_event_id = event.event_id
         identity = event.bib.strip() or event.chip_id.strip() or "未知"
+        athlete_name = event.athlete_name.strip() or "--"
+        team_name = event.team_name.strip() or "--"
         passage_time = format_passage_time(event.timeline_timestamp_ms)
         status = self._confirmation_status(
             regular_association,
             high_speed_association,
             review_status_text(lookup, regular, high_speed),
         )
-        self.race_value.setText(event.race_id)
-        self.stage_value.setText(event.stage_id)
-        self.group_value.setText(event.group_id)
+        self.race_value.setText(event.race_name.strip() or event.race_id)
+        self.stage_value.setText(event.stage_name.strip() or event.stage_id)
+        self.group_value.setText(event.group_name.strip() or event.group_id)
         self.selected_identity_value.setText(identity)
+        self.athlete_value.setText(athlete_name)
+        self.team_value.setText(team_name)
         self.identity_search.setText(identity)
         self.selected_time_value.setText(passage_time)
         self.source_value.setText(status)
-        self.current_passage_label.setText(f"当前运动员 {identity}")
-        self.current_time_label.setText(
-            format_passage_time(event.timeline_timestamp_ms + self._shared_delta_ms)
+        athlete_summary = (
+            f"{identity} {event.athlete_name.strip()}".strip()
         )
-        self.regular_pane.set_passage(
-            event,
-            regular,
-            regular_association,
-            initial_delta_ms=self._shared_delta_ms,
-        )
-        self.high_speed_pane.set_passage(
-            event,
-            high_speed,
-            high_speed_association,
-            initial_delta_ms=self._shared_delta_ms,
-        )
-        self.play_both_btn.setText("▶")
-        self.previous_passage_btn.setEnabled(self.table.currentRow() > 0)
-        self.next_passage_btn.setEnabled(
-            0 <= self.table.currentRow() < self.table.rowCount() - 1
-        )
+        self.current_passage_label.setText(f"当前运动员 {athlete_summary}")
+        if not preserve_media:
+            self.current_time_label.setText(
+                format_passage_time(event.timeline_timestamp_ms + self._shared_delta_ms)
+            )
+            self.regular_pane.set_passage(
+                event,
+                regular,
+                regular_association,
+                initial_delta_ms=self._shared_delta_ms,
+            )
+            self.high_speed_pane.set_passage(
+                event,
+                high_speed,
+                high_speed_association,
+                initial_delta_ms=self._shared_delta_ms,
+            )
+            self.play_both_btn.setText("▶")
+        else:
+            if self.regular_pane.association != regular_association:
+                self.regular_pane.set_association(regular_association)
+            if self.high_speed_pane.association != high_speed_association:
+                self.high_speed_pane.set_association(high_speed_association)
+        self._update_navigation_controls()
+
+    def _update_navigation_controls(self) -> None:
+        row = self.table.currentRow()
+        self.previous_passage_btn.setEnabled(row > 0)
+        self.next_passage_btn.setEnabled(0 <= row < self.table.rowCount() - 1)
 
     def _clear_selection_details(self) -> None:
         self._set_sync_playing(False)
@@ -1669,6 +1835,8 @@ class PassageReviewDialog(QDialog):
             self.stage_value,
             self.group_value,
             self.selected_identity_value,
+            self.athlete_value,
+            self.team_value,
             self.selected_time_value,
             self.source_value,
         ):
@@ -1679,8 +1847,7 @@ class PassageReviewDialog(QDialog):
         self.high_speed_pane.shutdown()
         self.regular_pane.video_label.clear_frame("没有通过记录")
         self.high_speed_pane.video_label.clear_frame("没有通过记录")
-        self.previous_passage_btn.setEnabled(False)
-        self.next_passage_btn.setEnabled(False)
+        self._update_navigation_controls()
 
     def _begin_marking(self, pane: PassageEvidencePane) -> None:
         self._set_sync_playing(False)
@@ -1689,11 +1856,11 @@ class PassageReviewDialog(QDialog):
                 candidate.cancel_marker_edit()
         pane.begin_marking()
 
-    def _confirm_pending_marker(self, pane: PassageEvidencePane) -> None:
+    def _confirm_pending_marker(self, pane: PassageEvidencePane) -> bool:
         event = self.passage_store.get(self._selected_event_id)
         pending = pane.pending_confirmation()
         if event is None or pending is None:
-            return
+            return False
         identity = event.bib.strip() or event.chip_id.strip()
         try:
             association = self.association_store.confirm(
@@ -1709,20 +1876,112 @@ class PassageReviewDialog(QDialog):
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             QMessageBox.critical(self, "保存失败", f"无法保存证据标记：{error}")
-            return
+            return False
         confirmed_row = self.table.currentRow()
         pane.set_association(association)
         should_advance = (
             self.auto_advance_checkbox.isChecked()
             and self._all_available_sources_confirmed(event.event_id)
         )
-        self.refresh()
+        self._update_event_confirmation_status(event.event_id)
         if (
             should_advance
             and confirmed_row >= 0
             and confirmed_row < self.table.rowCount() - 1
         ):
             self._move_selection(1)
+        return True
+
+    def _update_event_confirmation_status(self, event_id: str) -> None:
+        lookup = self._lookups.get(event_id)
+        if lookup is None:
+            return
+        regular = source_location(lookup, high_speed=False)
+        high_speed = source_location(lookup, high_speed=True)
+        regular_association = self._source_association(
+            event_id, REGULAR_SOURCE, regular
+        )
+        high_speed_association = self._source_association(
+            event_id, HIGH_SPEED_SOURCE, high_speed
+        )
+        readiness_status = review_status_text(lookup, regular, high_speed)
+        status = self._confirmation_status(
+            regular_association,
+            high_speed_association,
+            readiness_status,
+        )
+        self._record_summary_state(
+            event_id,
+            regular,
+            high_speed,
+            readiness_status,
+            regular_association,
+            high_speed_association,
+        )
+        for row, event in enumerate(self._visible_events):
+            if event.event_id != event_id:
+                continue
+            item = self.table.item(row, 7)
+            if item is not None:
+                item.setText(status)
+                item.setForeground(self._status_color(status))
+            break
+        if event_id == self._selected_event_id:
+            self.source_value.setText(status)
+        self._render_summary()
+
+    def _record_summary_state(
+        self,
+        event_id: str,
+        regular: Optional[PassageVideoLocation],
+        high_speed: Optional[PassageVideoLocation],
+        readiness_status: str,
+        regular_association: Optional[PassageEvidenceAssociation],
+        high_speed_association: Optional[PassageEvidenceAssociation],
+    ) -> None:
+        self._set_membership(
+            self._located_event_ids,
+            event_id,
+            any(
+                location is not None and location.status in _OPENABLE_STATUSES
+                for location in (regular, high_speed)
+            ),
+        )
+        self._set_membership(
+            self._fully_ready_event_ids,
+            event_id,
+            readiness_status == "双源就绪",
+        )
+        self._set_membership(
+            self._confirmed_event_ids,
+            event_id,
+            regular_association is not None or high_speed_association is not None,
+        )
+
+    @staticmethod
+    def _set_membership(values: set[str], event_id: str, present: bool) -> None:
+        if present:
+            values.add(event_id)
+        else:
+            values.discard(event_id)
+
+    def _discard_summary_state(self, event_id: str) -> None:
+        self._located_event_ids.discard(event_id)
+        self._fully_ready_event_ids.discard(event_id)
+        self._confirmed_event_ids.discard(event_id)
+
+    def _render_summary(self) -> None:
+        located_count = len(self._located_event_ids)
+        fully_ready_count = len(self._fully_ready_event_ids)
+        confirmed_count = len(self._confirmed_event_ids)
+        self.summary_label.setText(
+            f"共 {len(self.passage_store)} 条 passage，"
+            f"当前显示 {len(self._visible_events)} 条；"
+            f"{located_count} 条有可用证据，{fully_ready_count} 条双源就绪；"
+            f"{confirmed_count} 条已人工确认；"
+            f"时钟偏移 {self.clock_offset_ms:+d} ms"
+        )
+        self._available_evidence_count = located_count
 
     def _all_available_sources_confirmed(self, event_id: str) -> bool:
         lookup = self._lookups.get(event_id)
@@ -1768,7 +2027,8 @@ class PassageReviewDialog(QDialog):
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             QMessageBox.critical(self, "删除失败", f"无法删除证据标记：{error}")
             return
-        self.refresh()
+        pane.set_association(None)
+        self._update_event_confirmation_status(association.passage_event_id)
 
     def _find_identity(self) -> None:
         value = self.identity_search.text().strip().casefold()
@@ -1791,11 +2051,17 @@ class PassageReviewDialog(QDialog):
             0,
             min(self.table.currentRow() + int(delta), self.table.rowCount() - 1),
         )
+        if row == self.table.currentRow():
+            return
+        event_id = self._visible_events[row].event_id
+        self.table.blockSignals(True)
         self.table.setCurrentCell(row, 0)
         self.table.selectRow(row)
+        self.table.blockSignals(False)
         item = self.table.item(row, 1)
         if item is not None:
             self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+        self._select_event(event_id)
 
     def _step_both(self, frame_delta: int) -> None:
         self._set_sync_playing(False)

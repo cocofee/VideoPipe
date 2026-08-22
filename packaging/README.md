@@ -1,5 +1,16 @@
 # Realtime Windows packages
 
+Build the production finish console without YOLO, OCR, Torch, or Paddle runtimes:
+
+```powershell
+.\packaging\build_finish_review.ps1
+```
+
+The output is `artifacts\dist\VideoPipeFinishConsole`. Operators select the
+USB/Type-C recording device and race directory from the application; CycleRace
+listening starts automatically, while recording starts only when the operator
+clicks `开始录像`.
+
 Build the event-driven recognition-only OCR package:
 
 ```powershell

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 from dataclasses import asdict, dataclass
 from enum import Enum
@@ -22,6 +23,9 @@ ACK_MESSAGE_TYPE = "passage_ack"
 DEFAULT_PATH = "/api/v1/passage-events"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 18765
+DEFAULT_DISCOVERY_PORT = 18766
+DISCOVERY_REQUEST = b"CYCLERACE_DISCOVER_VIDEOPIPE_V1"
+DISCOVERY_SERVICE = "videopipe-finish"
 MAX_BODY_BYTES = 1024 * 1024
 
 _MISSING = object()
@@ -108,6 +112,12 @@ class PassageEvent:
     schema_version: int = SCHEMA_VERSION
     message_type: str = MESSAGE_TYPE
     passage_timestamp_ms: Optional[int] = None
+    race_name: str = ""
+    stage_name: str = ""
+    group_name: str = ""
+    athlete_id: str = ""
+    athlete_name: str = ""
+    team_name: str = ""
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -168,6 +178,12 @@ class PassageEvent:
                 payload,
                 "passage_timestamp_ms",
             ),
+            race_name=_string_field(payload, "race_name", default=""),
+            stage_name=_string_field(payload, "stage_name", default=""),
+            group_name=_string_field(payload, "group_name", default=""),
+            athlete_id=_string_field(payload, "athlete_id", default=""),
+            athlete_name=_string_field(payload, "athlete_name", default=""),
+            team_name=_string_field(payload, "team_name", default=""),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -188,6 +204,12 @@ class PassageEvent:
             "emitted_at_ms": payload["emitted_at_ms"],
             "revision": payload["revision"],
             "passage_timestamp_ms": payload["passage_timestamp_ms"],
+            "race_name": payload["race_name"],
+            "stage_name": payload["stage_name"],
+            "group_name": payload["group_name"],
+            "athlete_id": payload["athlete_id"],
+            "athlete_name": payload["athlete_name"],
+            "team_name": payload["team_name"],
         }
 
 
@@ -425,6 +447,98 @@ class _PassageHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
+class PassageDiscoveryResponder:
+    """Answer CycleRace LAN discovery without requiring an IP address."""
+
+    def __init__(
+        self,
+        http_port: int,
+        *,
+        discovery_port: int = DEFAULT_DISCOVERY_PORT,
+        host_name: str | None = None,
+    ) -> None:
+        self.http_port = int(http_port)
+        self.discovery_port = int(discovery_port)
+        self.host_name = str(host_name or socket.gethostname()).strip() or "VideoPipe"
+        if not 1 <= self.http_port <= 65535:
+            raise ValueError("passage receiver port is out of range")
+        if self.discovery_port < 0 or self.discovery_port > 65535:
+            raise ValueError("discovery port is out of range")
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._socket: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((DEFAULT_HOST, self.discovery_port))
+                sock.settimeout(0.2)
+            except Exception:
+                sock.close()
+                raise
+            self._stop.clear()
+            thread = threading.Thread(
+                target=self._run,
+                args=(sock,),
+                name="CycleRacePassageDiscovery",
+                daemon=True,
+            )
+            self._socket = sock
+            self._thread = thread
+            thread.start()
+
+    def _run(self, sock: socket.socket) -> None:
+        payload = json.dumps(
+            {
+                "schema_version": 1,
+                "message_type": "discovery_response",
+                "service": DISCOVERY_SERVICE,
+                "host_name": self.host_name,
+                "port": self.http_port,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        while not self._stop.is_set():
+            try:
+                request, sender = sock.recvfrom(4096)
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            if request != DISCOVERY_REQUEST:
+                continue
+            try:
+                sock.sendto(payload, sender)
+            except OSError:
+                if not self._stop.is_set():
+                    logger.exception("Failed to answer CycleRace discovery")
+
+    def stop(self) -> None:
+        with self._lock:
+            sock = self._socket
+            thread = self._thread
+            self._socket = None
+            self._thread = None
+            self._stop.set()
+        if sock is not None:
+            sock.close()
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    @property
+    def listen_port(self) -> int:
+        with self._lock:
+            if self._socket is not None:
+                return int(self._socket.getsockname()[1])
+            return self.discovery_port
+
+
 def _handler_type(
     ingestor: PassageEventIngestor,
     request_path: str,
@@ -502,6 +616,7 @@ class PassageEventReceiver:
         *,
         request_path: str = DEFAULT_PATH,
         max_body_bytes: int = MAX_BODY_BYTES,
+        discovery_port: int | None = DEFAULT_DISCOVERY_PORT,
         on_accepted: Optional[Callable[[PassageEvent], None]] = None,
     ):
         host = str(host).strip()
@@ -515,15 +630,22 @@ class PassageEventReceiver:
             raise ValueError("passage receiver path must start with /")
         if int(max_body_bytes) <= 0:
             raise ValueError("max_body_bytes must be positive")
+        if discovery_port is not None and not 0 <= int(discovery_port) <= 65535:
+            raise ValueError("discovery port is out of range")
         self.host = host
         self.port = port
         self.request_path = request_path
         self.max_body_bytes = int(max_body_bytes)
+        self.discovery_port = (
+            None if discovery_port is None else int(discovery_port)
+        )
         self.store = store
         self.ingestor = PassageEventIngestor(store, on_accepted=on_accepted)
         self._lock = threading.RLock()
         self._server: Optional[_PassageHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        self._discovery: PassageDiscoveryResponder | None = None
+        self._discovery_error = ""
 
     def start(self) -> None:
         with self._lock:
@@ -544,6 +666,22 @@ class PassageEventReceiver:
             self._server = server
             self._thread = thread
             thread.start()
+            if self.discovery_port is not None:
+                discovery = PassageDiscoveryResponder(
+                    self.listen_port,
+                    discovery_port=self.discovery_port,
+                )
+                try:
+                    discovery.start()
+                except OSError as error:
+                    self._discovery_error = str(error)
+                    logger.warning(
+                        "CycleRace automatic discovery is unavailable: %s",
+                        error,
+                    )
+                else:
+                    self._discovery = discovery
+                    self._discovery_error = ""
             logger.info(
                 "CycleRace passage receiver listening on %s:%s%s",
                 self.host,
@@ -555,8 +693,12 @@ class PassageEventReceiver:
         with self._lock:
             server = self._server
             thread = self._thread
+            discovery = self._discovery
             self._server = None
             self._thread = None
+            self._discovery = None
+        if discovery is not None:
+            discovery.stop()
         if server is not None:
             server.shutdown()
             server.server_close()
@@ -577,12 +719,20 @@ class PassageEventReceiver:
         with self._lock:
             return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def discovery_error(self) -> str:
+        with self._lock:
+            return self._discovery_error
+
 
 __all__ = [
     "ACK_MESSAGE_TYPE",
+    "DEFAULT_DISCOVERY_PORT",
     "DEFAULT_HOST",
     "DEFAULT_PATH",
     "DEFAULT_PORT",
+    "DISCOVERY_REQUEST",
+    "DISCOVERY_SERVICE",
     "MESSAGE_TYPE",
     "PassageEvent",
     "PassageEventConflictError",
@@ -590,6 +740,7 @@ __all__ = [
     "PassageEventError",
     "PassageEventIngestor",
     "PassageEventReceiver",
+    "PassageDiscoveryResponder",
     "PassageEventStore",
     "PassageIngestResult",
     "PassageJournalError",

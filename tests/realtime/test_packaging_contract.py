@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -31,6 +30,42 @@ def test_realtime_packages_bundle_ffmpeg_for_manual_recording():
         spec = (ROOT / "packaging" / name).read_text(encoding="utf-8")
         assert "VIDEOPIPE_FFMPEG" in spec
         assert 'binaries.append((str(ffmpeg_path), "."))' in spec
+
+
+def test_finish_review_package_excludes_detection_and_ocr_runtimes():
+    spec = (ROOT / "packaging" / "VideoPipeFinishReview.spec").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'realtime" / "review_main.py"' in spec
+    assert 'name="VideoPipeFinishConsole"' in spec
+    assert "VIDEOPIPE_FFMPEG" in spec
+    assert "collect_data_files" not in spec
+    for package in (
+        "ultralytics",
+        "torch",
+        "torchvision",
+        "paddle",
+        "paddleocr",
+        "paddlex",
+        "onnxruntime",
+        "tensorrt",
+    ):
+        assert f'"{package}"' in spec
+
+
+def test_finish_review_has_a_dedicated_production_build_script():
+    script = (ROOT / "packaging" / "build_finish_review.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    build_index = script.index("python -m PyInstaller")
+    assert script.index("$ResolvedFfmpeg =") < build_index
+    assert '"VideoPipeFinishReview.spec"' in script
+    assert '$AppName = "VideoPipeFinishConsole"' in script
+    assert "Stage-DistributionInput -InputPath $ResolvedFfmpeg" in script
+    assert "$env:VIDEOPIPE_FFMPEG = $ResolvedFfmpeg" in script
+    assert 'assert_clean_distribution.ps1") -AppDir $AppDir' in script
 
 
 def test_build_script_validates_inputs_before_replacing_package():

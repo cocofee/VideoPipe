@@ -97,6 +97,11 @@ def _event(
     group_id="men-open",
     bib="23",
     chip_id="chip-23",
+    race_name="",
+    stage_name="",
+    group_name="",
+    athlete_name="",
+    team_name="",
 ):
     return PassageEvent(
         event_id=event_id,
@@ -110,6 +115,11 @@ def _event(
         lap=2,
         emitted_at_ms=passage_time_ms + 100,
         passage_timestamp_ms=passage_timestamp_ms,
+        race_name=race_name,
+        stage_name=stage_name,
+        group_name=group_name,
+        athlete_name=athlete_name,
+        team_name=team_name,
     )
 
 
@@ -380,6 +390,38 @@ def test_identity_search_selects_bib_15_without_recomputing_lookups(
     assert dialog.selected_identity_value.text() == "15"
     assert dialog.identity_search.text() == "15"
     assert len(locate_calls) == 2
+    dialog.close()
+
+
+def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(
+            bib="15",
+            chip_id="261623",
+            race_name="2026 城市自行车赛",
+            stage_name="第一赛段",
+            group_name="男子公开组",
+            athlete_name="张三",
+            team_name="示例车队",
+        )
+    )
+
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+    qapp.processEvents()
+
+    assert dialog.race_value.text() == "2026 城市自行车赛"
+    assert dialog.stage_value.text() == "第一赛段"
+    assert dialog.group_value.text() == "男子公开组"
+    assert dialog.selected_identity_value.text() == "15"
+    assert dialog.athlete_value.text() == "张三"
+    assert dialog.team_value.text() == "示例车队"
+    assert dialog.current_passage_label.text() == "当前运动员 15 张三"
+    assert dialog.group_combo.itemText(1) == "男子公开组"
+    assert dialog.group_combo.itemData(1) == "men-open"
     dialog.close()
 
 
@@ -877,7 +919,385 @@ def test_enter_stays_by_default_and_opt_in_auto_advance_moves_to_next_passage(
     assert dialog.selected_identity_value.text() == "15"
     assert dialog.identity_search.text() == "15"
 
-    QTest.keyClick(view, Qt.Key_Up)
+    QTest.keyClick(view, Qt.Key_PageUp)
+    qapp.processEvents()
+    assert dialog.table.currentRow() == 0
+    assert dialog._selected_event_id == "passage-12"
+    dialog.close()
+
+
+def test_confirm_updates_current_row_without_full_refresh_or_reseek(
+    qapp,
+    tmp_path,
+    fake_playback,
+    monkeypatch,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-12", passage_time_ms=15_000, bib="12")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    association_store = PassageEvidenceAssociationStore(
+        tmp_path / "passage_evidence_associations.jsonl"
+    )
+    dialog = PassageReviewDialog(
+        passage_store,
+        timeline_store,
+        association_store=association_store,
+    )
+    qapp.processEvents()
+    worker = fake_playback.instances[0]
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 5_000, 250)
+    qapp.processEvents()
+
+    refresh_calls = 0
+
+    def counted_refresh():
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    monkeypatch.setattr(dialog, "refresh", counted_refresh)
+    seek_calls_before = list(worker.seek_calls)
+    view = dialog.regular_pane.video_view
+    QTest.mouseClick(
+        view.viewport(),
+        Qt.LeftButton,
+        pos=view.viewport().rect().center(),
+    )
+    QTest.keyClick(view, Qt.Key_Return)
+    qapp.processEvents()
+
+    assert refresh_calls == 0
+    assert worker.seek_calls == seek_calls_before
+    assert association_store.get("passage-12", REGULAR_SOURCE) is not None
+    assert dialog.table.item(0, 7).text() == "录像确认"
+    assert dialog.source_value.text() == "录像确认"
+    dialog.close()
+
+
+def test_failed_confirmation_keeps_current_passage_and_pending_marker(
+    qapp,
+    tmp_path,
+    fake_playback,
+    monkeypatch,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-12", passage_time_ms=15_000, bib="12")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    association_store = PassageEvidenceAssociationStore(
+        tmp_path / "passage_evidence_associations.jsonl"
+    )
+    dialog = PassageReviewDialog(
+        passage_store,
+        timeline_store,
+        association_store=association_store,
+    )
+    qapp.processEvents()
+    worker = fake_playback.instances[0]
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 5_000, 250)
+    qapp.processEvents()
+    view = dialog.regular_pane.video_view
+    QTest.mouseClick(
+        view.viewport(),
+        Qt.LeftButton,
+        pos=view.viewport().rect().center(),
+    )
+    monkeypatch.setattr(
+        association_store,
+        "confirm",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+    messages = []
+    monkeypatch.setattr(
+        passage_review.QMessageBox,
+        "critical",
+        lambda *args: messages.append(args),
+    )
+
+    confirmed = dialog._confirm_pending_marker(dialog.regular_pane)
+
+    assert confirmed is False
+    assert dialog._selected_event_id == "passage-12"
+    assert dialog.regular_pane.has_pending_marker
+    assert association_store.get("passage-12", REGULAR_SOURCE) is None
+    assert messages
+    dialog.close()
+
+
+def test_confirm_and_advance_seeks_only_the_next_passage_once(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-12", sequence=1, passage_time_ms=15_000, bib="12")
+    )
+    passage_store.append(
+        _event(event_id="passage-15", sequence=2, passage_time_ms=16_000, bib="15")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    dialog.auto_advance_checkbox.setChecked(True)
+    qapp.processEvents()
+    worker = fake_playback.instances[0]
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 5_000, 250)
+    qapp.processEvents()
+
+    seek_count_before = len(worker.seek_calls)
+    view = dialog.regular_pane.video_view
+    QTest.mouseClick(
+        view.viewport(),
+        Qt.LeftButton,
+        pos=view.viewport().rect().center(),
+    )
+    QTest.keyClick(view, Qt.Key_Return)
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == "passage-15"
+    assert worker.seek_calls[seek_count_before:] == [6_000]
+    dialog.close()
+
+
+def test_refresh_after_new_passage_preserves_selected_video_position(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-12", sequence=1, passage_time_ms=15_000, bib="12")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    worker = fake_playback.instances[0]
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 5_120, 256)
+    qapp.processEvents()
+    seek_calls_before = list(worker.seek_calls)
+
+    passage_store.append(
+        _event(event_id="passage-15", sequence=2, passage_time_ms=16_000, bib="15")
+    )
+    dialog.refresh()
+    qapp.processEvents()
+
+    assert dialog.table.rowCount() == 2
+    assert dialog._selected_event_id == "passage-12"
+    assert worker.seek_calls == seek_calls_before
+    dialog.close()
+
+
+def test_incremental_refresh_appends_only_the_new_passage_row(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-12", sequence=1, passage_time_ms=15_000, bib="12")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    worker = fake_playback.instances[0]
+    first_row_item = dialog.table.item(0, 0)
+    seek_calls_before = list(worker.seek_calls)
+
+    passage_store.append(
+        _event(event_id="passage-15", sequence=2, passage_time_ms=16_000, bib="15")
+    )
+    dialog.refresh_events(("passage-15",))
+    qapp.processEvents()
+
+    assert dialog.table.rowCount() == 2
+    assert dialog.table.item(0, 0) is first_row_item
+    assert dialog.table.item(1, 1).text() == "15"
+    assert dialog._selected_event_id == "passage-12"
+    assert worker.seek_calls == seek_calls_before
+    assert dialog.next_passage_btn.isEnabled()
+    dialog.close()
+
+
+def test_overlapping_window_does_not_retarget_existing_passage(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-12", sequence=1, passage_time_ms=15_000, bib="12")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    first_segment = _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_first.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    first_location = passage_review.source_location(
+        dialog._lookups["passage-12"], high_speed=False
+    )
+    assert first_location is not None
+    assert first_location.segment.segment_id == first_segment.segment_id
+
+    passage_store.append(
+        _event(event_id="passage-15", sequence=2, passage_time_ms=16_000, bib="15")
+    )
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01_second.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=12_000,
+        ended_at_ms=22_000,
+    )
+    dialog.refresh_events(("passage-15",))
+    dialog.refresh()
+    qapp.processEvents()
+
+    retained_location = passage_review.source_location(
+        dialog._lookups["passage-12"], high_speed=False
+    )
+    assert retained_location is not None
+    assert retained_location.segment.segment_id == first_segment.segment_id
+    dialog.close()
+
+
+def test_confirmation_summary_work_is_bounded_by_changed_passage(
+    qapp,
+    tmp_path,
+    fake_playback,
+    monkeypatch,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    for index in range(1, 41):
+        passage_store.append(
+            _event(
+                event_id=f"passage-{index}",
+                sequence=index,
+                passage_time_ms=15_000 + index * 10,
+                bib=str(index),
+            )
+        )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    worker = fake_playback.instances[0]
+    frame = QImage(1280, 720, QImage.Format_RGB888)
+    frame.fill(0)
+    worker.frame_ready.emit(frame, 5_010, 251)
+    qapp.processEvents()
+    source_association_calls = 0
+    original_source_association = dialog._source_association
+
+    def counted_source_association(*args, **kwargs):
+        nonlocal source_association_calls
+        source_association_calls += 1
+        return original_source_association(*args, **kwargs)
+
+    monkeypatch.setattr(dialog, "_source_association", counted_source_association)
+    view = dialog.regular_pane.video_view
+    QTest.mouseClick(
+        view.viewport(),
+        Qt.LeftButton,
+        pos=view.viewport().rect().center(),
+    )
+    assert dialog._confirm_pending_marker(dialog.regular_pane) is True
+
+    assert source_association_calls <= 8
+    dialog.close()
+
+
+def test_page_shortcuts_move_selection_from_search_and_table_focus(
+    qapp,
+    tmp_path,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-12", sequence=1, passage_time_ms=15_000, bib="12")
+    )
+    passage_store.append(
+        _event(event_id="passage-15", sequence=2, passage_time_ms=16_000, bib="15")
+    )
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+    dialog.show()
+    dialog.activateWindow()
+    qapp.processEvents()
+
+    dialog.identity_search.setFocus()
+    QTest.keyClick(dialog.identity_search, Qt.Key_PageDown)
+    qapp.processEvents()
+    assert dialog.table.currentRow() == 1
+    assert dialog._selected_event_id == "passage-15"
+
+    dialog.table.setFocus()
+    QTest.keyClick(dialog.table, Qt.Key_PageUp)
     qapp.processEvents()
     assert dialog.table.currentRow() == 0
     assert dialog._selected_event_id == "passage-12"

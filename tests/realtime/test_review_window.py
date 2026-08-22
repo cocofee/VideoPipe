@@ -1,0 +1,513 @@
+import os
+from pathlib import Path
+from typing import ClassVar
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton
+
+from realtime import passage_review
+from realtime.passage_receiver import PassageEvent, PassageEventStore
+from realtime.review_recorder import make_directshow_source
+from realtime.review_window import (
+    FinishReviewLaunchDialog,
+    FinishReviewSettings,
+    FinishReviewWindow,
+)
+from realtime.video_timeline import VideoTimelineStore
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+class _FakePlaybackWorker(QObject):
+    metadata_ready = pyqtSignal(int, float, int, int, int)
+    frame_ready = pyqtSignal(object, int, int)
+    full_resolution_ready = pyqtSignal(object, int, int)
+    playback_finished = pyqtSignal()
+    playback_error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, video_path, parent=None):
+        super().__init__(parent)
+        self.video_path = Path(video_path)
+        self.running = False
+
+    def start(self):
+        self.running = True
+        self.metadata_ready.emit(6_000, 25.0, 640, 360, 150)
+
+    def isRunning(self):
+        return self.running
+
+    def pause(self):
+        pass
+
+    def seek(self, _position_ms):
+        pass
+
+    def set_shuttle_speed(self, _speed):
+        pass
+
+    def step(self, _frame_delta):
+        pass
+
+    def request_full_resolution(self, _frame_index=None):
+        pass
+
+    def stop(self):
+        if self.running:
+            self.running = False
+            self.finished.emit()
+
+    def wait(self, _timeout_ms):
+        return True
+
+
+@pytest.fixture(autouse=True)
+def fake_playback(monkeypatch):
+    monkeypatch.setattr(passage_review, "VideoPlaybackWorker", _FakePlaybackWorker)
+
+
+class _FakeRecorder:
+    instances: ClassVar[list["_FakeRecorder"]] = []
+
+    def __init__(self, source, output_dir, *, camera_index, **_kwargs):
+        self.source = source
+        self.output_dir = Path(output_dir)
+        self.camera_index = camera_index
+        self.is_running = False
+        self.stopped = False
+        type(self).instances.append(self)
+
+    def start(self):
+        buffer_dir = (
+            self.output_dir
+            / "review_buffer"
+            / f"camera_{self.camera_index:02d}"
+        )
+        buffer_dir.mkdir(parents=True, exist_ok=True)
+        entries = (
+            ("before.ts", "2026-08-22T11:59:58.000+00:00"),
+            ("finish.ts", "2026-08-22T12:00:00.000+00:00"),
+            ("after.ts", "2026-08-22T12:00:02.000+00:00"),
+        )
+        lines = ["#EXTM3U", "#EXT-X-VERSION:6"]
+        for filename, started_at in entries:
+            (buffer_dir / filename).write_bytes(b"video")
+            lines.extend(
+                [
+                    f"#EXT-X-PROGRAM-DATE-TIME:{started_at}",
+                    "#EXTINF:2.000,",
+                    filename,
+                ]
+            )
+        playlist = buffer_dir / "camera_01.m3u8"
+        playlist.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.is_running = True
+        return playlist
+
+    def check_error(self):
+        return None
+
+    def stop(self):
+        self.is_running = False
+        self.stopped = True
+
+
+class _FakeReceiver:
+    instances: ClassVar[list["_FakeReceiver"]] = []
+
+    def __init__(self, host, port, store, *, on_accepted):
+        self.host = host
+        self.port = port
+        self.listen_port = port or 18765
+        self.store = store
+        self.on_accepted = on_accepted
+        self.is_running = False
+        self.stopped = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+        self.stopped = True
+
+    def deliver(self, event):
+        self.store.append(event)
+        self.on_accepted(event)
+
+
+def _event(*, absolute=True):
+    return PassageEvent(
+        event_id="race-1-stage-1-passage-15",
+        race_id="race-1",
+        stage_id="stage-1",
+        group_id="men-open",
+        sequence=15,
+        chip_id="chip-15",
+        bib="15",
+        passage_time_ms=43_201_000,
+        passage_timestamp_ms=1_787_400_001_000 if absolute else None,
+        lap=1,
+        emitted_at_ms=1_787_400_001_100,
+        race_name="2026 城市自行车赛",
+        stage_name="第一赛段",
+        group_name="男子公开组",
+        athlete_name="张三",
+        team_name="示例车队",
+    )
+
+
+def _window(tmp_path):
+    _FakeRecorder.instances.clear()
+    _FakeReceiver.instances.clear()
+    return FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FakeReceiver,
+    )
+
+
+def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
+    window = _window(tmp_path)
+
+    window.start()
+    _FakeReceiver.instances[0].deliver(_event())
+    qapp.processEvents()
+
+    assert window.recorder.is_running
+    assert window.receiver.is_running
+    assert window.table.rowCount() == 1
+    assert window.table.item(0, 1).text() == "15"
+    assert window.race_value.text() == "2026 城市自行车赛"
+    assert window.stage_value.text() == "第一赛段"
+    assert window.group_value.text() == "男子公开组"
+    assert window.operator_identity_label.text() == "当前运动员：15 张三"
+    assert window.table.item(0, 5).text() == "已定位"
+    assert len(window.timeline_store.segments()) == 1
+    assert "可核对 1" in window.capture_status_label.text()
+
+    recorder = window.recorder
+    receiver = window.receiver
+    window.close()
+    qapp.processEvents()
+    assert recorder.stopped
+    assert receiver.stopped
+
+
+def test_received_passage_uses_incremental_table_refresh(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    window.start()
+    full_refresh_calls = 0
+
+    def counted_refresh():
+        nonlocal full_refresh_calls
+        full_refresh_calls += 1
+
+    monkeypatch.setattr(window, "refresh", counted_refresh)
+    _FakeReceiver.instances[0].deliver(_event())
+    qapp.processEvents()
+
+    assert full_refresh_calls == 0
+    assert window.table.rowCount() == 1
+    assert window.table.item(0, 1).text() == "15"
+    window.close()
+
+
+def test_confirm_and_next_does_not_advance_when_confirmation_fails(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    window.table.setRowCount(2)
+    window.table.setCurrentCell(0, 0)
+    window.regular_pane._pending_marker = (0.5, 0.5, 1, 100)
+    move_calls = []
+    monkeypatch.setattr(window, "_confirm_pending_marker", lambda _pane: False)
+    monkeypatch.setattr(window, "_move_selection", move_calls.append)
+
+    window._confirm_and_next()
+
+    assert move_calls == []
+    window.close()
+
+
+def test_legacy_time_of_day_is_not_matched_as_an_epoch(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start()
+
+    _FakeReceiver.instances[0].deliver(_event(absolute=False))
+    qapp.processEvents()
+
+    assert window.table.rowCount() == 1
+    assert len(window.timeline_store.segments()) == 0
+    assert "缺少绝对时间 1" in window.capture_status_label.text()
+
+    window.close()
+
+
+def test_finish_console_entry_does_not_import_detection_main_window():
+    root = Path(__file__).resolve().parents[2]
+    entry = (root / "realtime" / "review_main.py").read_text(encoding="utf-8")
+    window = (root / "realtime" / "review_window.py").read_text(encoding="utf-8")
+
+    for forbidden in ("main_window", "detector", "ocr_manager", "ultralytics"):
+        assert forbidden not in entry
+        assert forbidden not in window
+
+
+def test_device_settings_show_required_controls_without_receiver_values(qapp, tmp_path):
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="",
+            output_dir=tmp_path,
+            passage_host="0.0.0.0",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: (),
+    )
+
+    assert dialog.camera_status_label.text() == "未检测到USB/Type-C摄像头"
+    assert not dialog.start_button.isEnabled()
+    assert dialog.output_edit.isReadOnly()
+    visible_text = " ".join(
+        widget.text()
+        for widget_type in (QLabel, QLineEdit, QPushButton)
+        for widget in dialog.findChildren(widget_type)
+    )
+    assert "录像证据保存" in visible_text
+    assert "比赛数据" not in visible_text
+    assert "无需共享目录、无需填写IP" in visible_text
+    for forbidden in ("RTSP", "0.0.0.0", "18765", "端口", "机位"):
+        assert forbidden not in visible_text
+    dialog.close()
+
+
+def test_device_settings_select_preinstalled_usb_camera_without_manual_ip(
+    qapp,
+    tmp_path,
+):
+    source = make_directshow_source("DJI Osmo Action 5 Pro")
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source=source,
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: ("DJI Osmo Action 5 Pro",),
+    )
+
+    assert dialog.camera_status_label.text() == "已检测到摄像头，开始录像后验证画面"
+    assert dialog.start_button.isEnabled()
+    visible_text = " ".join(
+        widget.text()
+        for widget_type in (QLabel, QLineEdit, QPushButton)
+        for widget in dialog.findChildren(widget_type)
+    )
+    combo_text = " ".join(
+        widget.currentText() for widget in dialog.findChildren(QComboBox)
+    )
+    assert "DJI Osmo Action 5 Pro" in combo_text
+    assert "dshow" not in visible_text.lower()
+    assert dialog.settings.source == source
+    dialog.close()
+
+
+def test_device_settings_do_not_report_unplugged_saved_camera_as_detected(
+    qapp,
+    tmp_path,
+):
+    source = make_directshow_source("DJI Osmo Action 5 Pro")
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source=source,
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+        ),
+        device_provider=lambda: (),
+    )
+
+    assert dialog.camera_status_label.text() == "录像设备已配置，但当前未检测到"
+    assert dialog.start_button.isEnabled()
+    assert "当前未检测到" in dialog.device_combo.currentText()
+    assert dialog.settings.source == source
+    dialog.close()
+
+
+def test_runtime_status_hides_receiver_port(qapp, tmp_path):
+    window = _window(tmp_path)
+
+    window.start()
+
+    assert window.receiver_status_label.text() == "CycleRace: 等待数据"
+    assert "18765" not in window.receiver_status_label.text()
+    window.close()
+
+
+def test_historical_passages_do_not_report_current_session_reception(qapp, tmp_path):
+    store = PassageEventStore(tmp_path / "cyclerace_passage_events.jsonl")
+    store.append(_event())
+    window = _window(tmp_path)
+
+    window.start_receiver()
+    qapp.processEvents()
+
+    assert window.receiver_status_label.text() == (
+        "CycleRace: 等待本次数据，已加载历史 1 条"
+    )
+    assert "#a56300" in window.receiver_status_label.styleSheet()
+    window.close()
+
+
+def test_capture_error_remains_visible_while_recording(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start()
+
+    window._capture_error = "timeline publish failed"
+    window._update_runtime_status()
+
+    assert window.recorder.is_running
+    assert window.capture_status_label.text() == (
+        "证据处理异常：timeline publish failed"
+    )
+    assert window.capture_status_label.toolTip() == "timeline publish failed"
+    assert "#b54747" in window.capture_status_label.styleSheet()
+    window.close()
+
+
+def test_existing_timeline_evidence_is_counted_after_reopening(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "cyclerace_passage_events.jsonl")
+    passage_store.append(_event())
+    video_path = tmp_path / "race_video" / "camera_01.mkv"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    segment = timeline_store.start_segment(
+        source_id="camera_01",
+        camera_index=1,
+        video_path=video_path,
+        started_at_ms=1_787_400_000_000,
+        race_id="race-1",
+    )
+    timeline_store.finish_segment(
+        segment.segment_id,
+        ended_at_ms=1_787_400_004_000,
+        media_started_at_ms=1_787_400_000_000,
+        media_duration_ms=4_000,
+    )
+
+    window = _window(tmp_path)
+    qapp.processEvents()
+
+    assert "本次可核对 0" in window.capture_status_label.text()
+    assert "已有证据 1" in window.capture_status_label.text()
+    window.close()
+
+
+def test_recheck_retries_a_failed_cyclerace_receiver(qapp, tmp_path):
+    class _FailOnceReceiver(_FakeReceiver):
+        attempts = 0
+
+        def start(self):
+            type(self).attempts += 1
+            if type(self).attempts == 1:
+                raise OSError("address unavailable")
+            super().start()
+
+    _FailOnceReceiver.instances.clear()
+    _FailOnceReceiver.attempts = 0
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        recorder_factory=_FakeRecorder,
+        receiver_factory=_FailOnceReceiver,
+    )
+
+    with pytest.raises(OSError, match="address unavailable"):
+        window.start_receiver()
+    assert window.receiver_status_label.text() == "CycleRace: 异常"
+
+    window.recheck_button.click()
+    qapp.processEvents()
+
+    assert window.receiver is not None
+    assert window.receiver.is_running
+    assert window.receiver_status_label.text() == "CycleRace: 等待数据"
+    window.close()
+
+
+def test_formal_console_opens_before_recording_and_exposes_operator_controls(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+
+    window.start_receiver()
+    window.resize(1366, 768)
+    window.show()
+    qapp.processEvents()
+
+    assert window.windowTitle() == "VideoPipe 终点多源核对"
+    assert window.recorder is None
+    assert window.receiver.is_running
+    assert window.record_button.text() == "开始录像"
+    assert window.settings_button.text() == "设备设置"
+    assert window.import_high_speed_button.text() == "导入高速"
+    assert window.receiver_status_label.text() == "CycleRace: 等待数据"
+    assert window.capture_status_label.y() > window.camera_status_label.y()
+    assert window.capture_status_label.width() >= window.capture_status_label.sizeHint().width()
+
+    window.start_recording()
+    assert window.recorder.is_running
+    assert window.record_button.text() == "停止录像"
+    assert window.camera_status_label.text() in {
+        "录像设备: 正在检查",
+        "录像设备: 已连接",
+    }
+    window.close()
+
+
+def test_recording_health_scans_buffer_without_pending_passages(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    window.start_recording()
+    scan_calls = 0
+    original_scan = window._ring_buffer.scan
+
+    def counted_scan():
+        nonlocal scan_calls
+        scan_calls += 1
+        return original_scan()
+
+    monkeypatch.setattr(window._ring_buffer, "scan", counted_scan)
+
+    window._refresh_capture_windows()
+
+    assert scan_calls == 1
+    window.close()

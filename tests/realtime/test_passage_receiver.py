@@ -1,13 +1,17 @@
 import json
+import socket
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
 
 from realtime.passage_receiver import (
+    DISCOVERY_REQUEST,
+    DISCOVERY_SERVICE,
     PassageEvent,
     PassageEventReceiver,
     PassageEventStore,
+    PassageDiscoveryResponder,
 )
 
 
@@ -27,6 +31,12 @@ def passage_payload(**overrides):
         "source": "cyclerace",
         "emitted_at_ms": 1_787_217_138_700,
         "revision": 1,
+        "race_name": "2026 城市自行车赛",
+        "stage_name": "第一赛段",
+        "group_name": "男子公开组",
+        "athlete_id": "101",
+        "athlete_name": "张三",
+        "team_name": "示例车队",
     }
     payload.update(overrides)
     return payload
@@ -55,6 +65,7 @@ def running_receiver(tmp_path):
         "127.0.0.1",
         0,
         store,
+        discovery_port=None,
         on_accepted=accepted.append,
     )
     receiver.start()
@@ -62,6 +73,35 @@ def running_receiver(tmp_path):
         yield receiver, store, accepted
     finally:
         receiver.stop()
+
+
+def test_discovery_responder_reports_receiver_without_shared_path():
+    responder = PassageDiscoveryResponder(
+        18765,
+        discovery_port=0,
+        host_name="finish-laptop",
+    )
+    responder.start()
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client.settimeout(1.0)
+    try:
+        client.sendto(
+            DISCOVERY_REQUEST,
+            ("127.0.0.1", responder.listen_port),
+        )
+        raw, _sender = client.recvfrom(4096)
+    finally:
+        client.close()
+        responder.stop()
+
+    payload = json.loads(raw.decode("utf-8"))
+    assert payload == {
+        "schema_version": 1,
+        "message_type": "discovery_response",
+        "service": DISCOVERY_SERVICE,
+        "host_name": "finish-laptop",
+        "port": 18765,
+    }
 
 
 def test_accepts_and_deduplicates_one_revision(running_receiver):
@@ -123,6 +163,24 @@ def test_optional_absolute_passage_timestamp_is_preserved(running_receiver):
     assert event.passage_time_ms == 48_179_215
     assert event.passage_timestamp_ms == absolute_timestamp_ms
     assert event.timeline_timestamp_ms == absolute_timestamp_ms
+    assert accepted == [event]
+
+
+def test_cyclerace_display_metadata_is_persisted(running_receiver):
+    receiver, store, accepted = running_receiver
+
+    status, ack = post_json(receiver, passage_payload())
+
+    assert status == 201
+    assert ack["status"] == "accepted"
+    event = store.get("race-1-stage-1-passage-7")
+    assert event is not None
+    assert event.race_name == "2026 城市自行车赛"
+    assert event.stage_name == "第一赛段"
+    assert event.group_name == "男子公开组"
+    assert event.athlete_id == "101"
+    assert event.athlete_name == "张三"
+    assert event.team_name == "示例车队"
     assert accepted == [event]
 
 

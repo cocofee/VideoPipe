@@ -12,6 +12,7 @@ from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton
 
 from realtime import passage_review
+from realtime.auyat_rgb import AuyatScanResult
 from realtime.passage_receiver import PassageEvent, PassageEventStore, RaceFocus
 from realtime.race_metadata import (
     RaceAthleteMetadata,
@@ -249,6 +250,30 @@ def test_runtime_status_reports_loaded_race_metadata(qapp, tmp_path):
         "CycleRace: 已同步 11 / 1，等待通过"
     )
     assert "已读取 1 个组别" in window.receiver_status_label.toolTip()
+    window.close()
+
+
+def test_runtime_status_keeps_waiting_for_seal_visible_with_older_captures(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    high_speed_root = tmp_path / "vendor"
+    window.high_speed_dir = high_speed_root
+    window._high_speed_catalog.set_root(high_speed_root)
+    window._high_speed_scan_result = AuyatScanResult(
+        status="ready",
+        captures=(),
+        changed=False,
+        message="已连接，等待 1 个高速文件封口",
+        waiting_file_count=1,
+    )
+
+    window._update_runtime_status()
+
+    assert window.high_speed_status_label.text() == (
+        "高速摄像: 本机测试目录已连接，等待封口"
+    )
     window.close()
 
 

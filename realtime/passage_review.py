@@ -261,6 +261,8 @@ class EvidenceImageView(QGraphicsView):
     marker_delete_requested = pyqtSignal()
     frame_step_requested = pyqtSignal(int)
     passage_step_requested = pyqtSignal(int)
+    scrub_started = pyqtSignal()
+    scrub_delta_requested = pyqtSignal(int)
 
     MIN_SCALE = 0.25
     MAX_SCALE = 8.0
@@ -276,7 +278,7 @@ class EvidenceImageView(QGraphicsView):
         self.setAlignment(Qt.AlignCenter)
         self.setBackgroundBrush(QColor("#090b0d"))
         self.setFrameShape(QFrame.NoFrame)
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.NoDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setRenderHint(QPainter.SmoothPixmapTransform, True)
@@ -290,6 +292,9 @@ class EvidenceImageView(QGraphicsView):
         self._mouse_press_position: Optional[QPoint] = None
         self._mouse_dragged = False
         self._marker_dragging = False
+        self._video_scrubbing = False
+        self._pan_dragging = False
+        self._pan_last_position: Optional[QPoint] = None
         self._identity_badge = QLabel(self.viewport())
         self._identity_badge.setObjectName("evidenceIdentityBadge")
         self._identity_badge.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -393,10 +398,11 @@ class EvidenceImageView(QGraphicsView):
     def set_marker_mode(self, enabled: bool) -> None:
         self._marker_mode = bool(enabled) and self.has_frame
         self.viewport().setCursor(
-            Qt.OpenHandCursor if self._marker_mode else Qt.ArrowCursor
+            Qt.CrossCursor if self._marker_mode else Qt.ArrowCursor
         )
         self.setToolTip(
-            "单击放置判读线；拖动平移图片；Shift + 拖动连续移动判读线"
+            "单击放置判读线；左键横向拖动视频；"
+            "Shift + 左键拖动判读线；中键拖动画面"
             if self._marker_mode
             else ""
         )
@@ -456,9 +462,16 @@ class EvidenceImageView(QGraphicsView):
         super().wheelEvent(event)
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MiddleButton and self.has_frame:
+            self._pan_dragging = True
+            self._pan_last_position = event.pos()
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
             self._mouse_press_position = event.pos()
             self._mouse_dragged = False
+            self._video_scrubbing = False
             self._marker_dragging = bool(
                 self._marker_mode
                 and self.has_frame
@@ -468,9 +481,26 @@ class EvidenceImageView(QGraphicsView):
                 self._select_marker_position(event.pos())
                 event.accept()
                 return
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if (
+            self._pan_dragging
+            and self._pan_last_position is not None
+            and event.buttons() & Qt.MiddleButton
+        ):
+            delta = event.pos() - self._pan_last_position
+            self._pan_last_position = event.pos()
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x()
+            )
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y()
+            )
+            event.accept()
+            return
         if (
             self._mouse_press_position is not None
             and (event.pos() - self._mouse_press_position).manhattanLength() > 4
@@ -483,9 +513,31 @@ class EvidenceImageView(QGraphicsView):
             self._select_marker_position(event.pos())
             event.accept()
             return
+        if (
+            self._mouse_dragged
+            and self._mouse_press_position is not None
+            and event.buttons() & Qt.LeftButton
+        ):
+            if not self._video_scrubbing:
+                self._video_scrubbing = True
+                self.viewport().setCursor(Qt.SizeHorCursor)
+                self.scrub_started.emit()
+            self.scrub_delta_requested.emit(
+                event.pos().x() - self._mouse_press_position.x()
+            )
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MiddleButton and self._pan_dragging:
+            self._pan_dragging = False
+            self._pan_last_position = None
+            self.viewport().setCursor(
+                Qt.CrossCursor if self._marker_mode else Qt.ArrowCursor
+            )
+            event.accept()
+            return
         if (
             event.button() == Qt.LeftButton
             and self._mouse_press_position is not None
@@ -499,19 +551,29 @@ class EvidenceImageView(QGraphicsView):
             self._mouse_press_position = None
             self._mouse_dragged = False
             self._marker_dragging = False
+            video_scrubbing = self._video_scrubbing
+            self._video_scrubbing = False
+            self.viewport().setCursor(
+                Qt.CrossCursor if self._marker_mode else Qt.ArrowCursor
+            )
             if marker_dragging:
                 self._select_marker_position(event.pos())
                 self.setFocus(Qt.MouseFocusReason)
                 event.accept()
                 return
-            super().mouseReleaseEvent(event)
+            if video_scrubbing:
+                self.setFocus(Qt.MouseFocusReason)
+                event.accept()
+                return
             if was_click and self._marker_mode and self.has_frame:
                 self._select_marker_position(event.pos())
                 self.setFocus(Qt.MouseFocusReason)
+            event.accept()
             return
         self._mouse_press_position = None
         self._mouse_dragged = False
         self._marker_dragging = False
+        self._video_scrubbing = False
         super().mouseReleaseEvent(event)
 
     def _select_marker_position(self, viewport_position: QPoint) -> None:
@@ -635,6 +697,9 @@ class PassageEvidencePane(QFrame):
     confirmation_requested = pyqtSignal(object)
     cancel_requested = pyqtSignal(object)
     delete_requested = pyqtSignal(object)
+    scrub_started = pyqtSignal()
+
+    MAX_SCRUB_SPAN_MS = 6_000
 
     def __init__(self, title: str, source_kind: str, parent=None):
         super().__init__(parent)
@@ -658,6 +723,7 @@ class PassageEvidencePane(QFrame):
         self._current_position_ms = 0
         self._timeline_dragging = False
         self._last_full_resolution_request = -1
+        self._scrub_origin_delta_ms = 0
 
         self.setObjectName("passageEvidencePane")
         self.setFrameShape(QFrame.StyledPanel)
@@ -702,6 +768,10 @@ class PassageEvidencePane(QFrame):
         self.video_view.frame_step_requested.connect(self.step_requested.emit)
         self.video_view.passage_step_requested.connect(
             self.selection_step_requested.emit
+        )
+        self.video_view.scrub_started.connect(self._on_video_scrub_started)
+        self.video_view.scrub_delta_requested.connect(
+            self._on_video_scrub_delta
         )
         layout.addWidget(self.video_view, 1)
 
@@ -1118,6 +1188,27 @@ class PassageEvidencePane(QFrame):
             int(self.timeline.value()) - self._target_position_ms
         )
 
+    def _on_video_scrub_started(self) -> None:
+        self._scrub_origin_delta_ms = (
+            self._current_position_ms - self._target_position_ms
+        )
+        self.scrub_started.emit()
+
+    def _on_video_scrub_delta(self, horizontal_pixels: int) -> None:
+        viewport_width = max(1, self.video_view.viewport().width())
+        frame_ms = self.frame_duration_ms()
+        scrub_span_ms = max(
+            frame_ms,
+            min(self._duration_ms, self.MAX_SCRUB_SPAN_MS),
+        )
+        raw_delta_ms = (
+            int(horizontal_pixels) * scrub_span_ms / viewport_width
+        )
+        frame_delta = int(round(raw_delta_ms / frame_ms))
+        self.passage_delta_requested.emit(
+            self._scrub_origin_delta_ms + frame_delta * frame_ms
+        )
+
     def _on_playback_finished(self) -> None:
         if self.sender() is not self._worker:
             return
@@ -1510,6 +1601,7 @@ class PassageReviewDialog(QDialog):
             pane.step_requested.connect(self._step_both)
             pane.play_requested.connect(self._toggle_both)
             pane.passage_delta_requested.connect(self._seek_both_delta)
+            pane.scrub_started.connect(lambda: self._set_sync_playing(False))
             pane.selection_step_requested.connect(self._move_selection)
             pane.maximize_requested.connect(self._toggle_maximized_pane)
             pane.marking_requested.connect(self._begin_marking)

@@ -894,7 +894,7 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
     dialog.close()
 
 
-def test_left_drag_pans_image_without_placing_marker_while_click_places_marker(
+def test_left_drag_scrubs_video_middle_drag_pans_and_click_places_marker(
     qapp,
     tmp_path,
     fake_playback,
@@ -926,24 +926,43 @@ def test_left_drag_pans_image_without_placing_marker_while_click_places_marker(
     vertical_scrollbar = view.verticalScrollBar()
     before_pan = (horizontal_scrollbar.value(), vertical_scrollbar.value())
     center = view.viewport().rect().center()
-    drag_target = center + QPoint(60, 40)
+    scrub_target = center + QPoint(60, 0)
 
     QTest.mousePress(view.viewport(), Qt.LeftButton, pos=center)
     move_event = QMouseEvent(
         QEvent.MouseMove,
-        QPointF(drag_target),
-        QPointF(view.viewport().mapToGlobal(drag_target)),
+        QPointF(scrub_target),
+        QPointF(view.viewport().mapToGlobal(scrub_target)),
         Qt.NoButton,
         Qt.LeftButton,
         Qt.NoModifier,
     )
     QApplication.sendEvent(view.viewport(), move_event)
-    QTest.mouseRelease(view.viewport(), Qt.LeftButton, pos=drag_target)
+    QTest.mouseRelease(view.viewport(), Qt.LeftButton, pos=scrub_target)
+    qapp.processEvents()
+
+    assert dialog._shared_delta_ms > 0
+    assert worker.seek_calls[-1] == 5_000 + dialog._shared_delta_ms
+    assert (horizontal_scrollbar.value(), vertical_scrollbar.value()) == before_pan
+    assert not dialog.regular_pane.has_pending_marker
+    assert view._marker is None
+
+    pan_target = center + QPoint(60, 40)
+    QTest.mousePress(view.viewport(), Qt.MiddleButton, pos=center)
+    pan_event = QMouseEvent(
+        QEvent.MouseMove,
+        QPointF(pan_target),
+        QPointF(view.viewport().mapToGlobal(pan_target)),
+        Qt.NoButton,
+        Qt.MiddleButton,
+        Qt.NoModifier,
+    )
+    QApplication.sendEvent(view.viewport(), pan_event)
+    QTest.mouseRelease(view.viewport(), Qt.MiddleButton, pos=pan_target)
     qapp.processEvents()
 
     assert (horizontal_scrollbar.value(), vertical_scrollbar.value()) != before_pan
     assert not dialog.regular_pane.has_pending_marker
-    assert view._marker is None
 
     QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=center)
     assert dialog.regular_pane.has_pending_marker

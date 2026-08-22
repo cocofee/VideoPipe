@@ -450,6 +450,44 @@ def test_identity_search_selects_bib_15_without_recomputing_lookups(
     dialog.close()
 
 
+def test_identity_search_selects_latest_matching_passage(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(
+            event_id="passage-130-old",
+            sequence=1,
+            passage_time_ms=10_000,
+            bib="130",
+            chip_id="chip-130",
+        )
+    )
+    passage_store.append(
+        _event(
+            event_id="passage-130-latest",
+            sequence=2,
+            passage_time_ms=20_000,
+            bib="130",
+            chip_id="chip-130",
+        )
+    )
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+
+    dialog.identity_search.setText("130")
+    dialog._find_identity()
+    qapp.processEvents()
+
+    assert dialog._selected_event_id == "passage-130-latest"
+    assert dialog.table.currentRow() == next(
+        index
+        for index, event in enumerate(dialog._visible_events)
+        if event.event_id == "passage-130-latest"
+    )
+    dialog.close()
+
+
 def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
     passage_store = PassageEventStore(tmp_path / "passages.jsonl")
     passage_store.append(

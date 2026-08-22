@@ -2583,6 +2583,7 @@ class PassageReviewDialog(QDialog):
         value = self.identity_search.text().strip().casefold()
         if not value:
             return
+        matches = []
         for row, event in enumerate(self._visible_events):
             metadata_athlete = self._metadata_athlete_for_event(event)
             athlete_name = event.athlete_name.strip() or (
@@ -2593,12 +2594,22 @@ class PassageReviewDialog(QDialog):
                 event.chip_id.strip().casefold(),
                 athlete_name.casefold(),
             }:
-                self.table.setCurrentCell(row, 0)
-                self.table.selectRow(row)
-                item = self.table.item(row, 1)
-                if item is not None:
-                    self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
-                return
+                matches.append((row, event))
+        if matches:
+            row, _event = max(
+                matches,
+                key=lambda match: (
+                    match[1].timeline_timestamp_ms,
+                    match[1].sequence,
+                    match[1].revision,
+                ),
+            )
+            self.table.setCurrentCell(row, 0)
+            self.table.selectRow(row)
+            item = self.table.item(row, 1)
+            if item is not None:
+                self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+            return
         metadata = self._current_metadata()
         if metadata is not None:
             selected_group = str(self.group_combo.currentData() or "")

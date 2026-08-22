@@ -260,6 +260,8 @@ class _CachedRgbFile:
     captures: Optional[tuple[AuyatRgbCapture, ...]]
     channel_order: str
     error: str = ""
+    scanned_records: int = 0
+    open_capture: Optional[tuple[int, int]] = None
 
 
 class AuyatRgbPlaybackWorker(QThread):
@@ -510,7 +512,7 @@ class AuyatRgbScanWorker(QThread):
 
 
 class AuyatRgbCatalog:
-    """Thread-safe catalog of closed captures in a vendor Photo directory."""
+    """Thread-safe catalog of completed captures in a vendor Photo directory."""
 
     def __init__(
         self,
@@ -526,7 +528,6 @@ class AuyatRgbCatalog:
         self._generation = 0
         self._captures: tuple[AuyatRgbCapture, ...] = ()
         self._file_cache: dict[Path, _CachedRgbFile] = {}
-        self._pending_signatures: dict[Path, tuple[int, int]] = {}
         self._status = "unavailable" if self._root is None else "checking"
         self._message = ""
         self._waiting_file_count = 0
@@ -575,7 +576,6 @@ class AuyatRgbCatalog:
             self._generation += 1
             self._captures = ()
             self._file_cache.clear()
-            self._pending_signatures.clear()
             self._status = "unavailable" if resolved is None else "checking"
             self._message = ""
             self._waiting_file_count = 0
@@ -590,7 +590,6 @@ class AuyatRgbCatalog:
             self._generation += 1
             self._captures = ()
             self._file_cache.clear()
-            self._pending_signatures.clear()
             self._status = "unavailable" if self._root is None else "checking"
             self._message = ""
             self._waiting_file_count = 0
@@ -604,7 +603,6 @@ class AuyatRgbCatalog:
             self._target_dates = resolved
             self._generation += 1
             self._captures = ()
-            self._pending_signatures.clear()
             self._status = "unavailable" if self._root is None else "checking"
             self._message = ""
             self._waiting_file_count = 0
@@ -643,9 +641,7 @@ class AuyatRgbCatalog:
 
         try:
             paths = tuple(
-                path
-                for path in sorted(photo_dir.glob("*.RGB"), key=lambda item: item.name)
-                if not SNAPSHOT_SUFFIX.search(path.name)
+                sorted(photo_dir.glob("*.RGB"), key=lambda item: item.name)
             )
         except OSError as error:
             return self._publish(
@@ -670,11 +666,6 @@ class AuyatRgbCatalog:
                 for path, cached in self._file_cache.items()
                 if path in current_paths
             }
-            self._pending_signatures = {
-                path: signature
-                for path, signature in self._pending_signatures.items()
-                if path in current_paths
-            }
         for path in paths:
             _raise_if_cancelled(cancel_requested)
             if not self._is_current_generation(generation):
@@ -684,7 +675,6 @@ class AuyatRgbCatalog:
                 signature = (int(stat.st_size), int(stat.st_mtime_ns))
                 with self._lock:
                     cached = self._file_cache.get(path)
-                    pending_signature = self._pending_signatures.get(path)
                 matching_cache = bool(
                     cached is not None
                     and cached.signature == signature
@@ -729,27 +719,26 @@ class AuyatRgbCatalog:
                         cache_changed = True
                     continue
 
-                stable = pending_signature == signature
                 if matching_cache and cached is not None and cached.captures is not None:
                     parsed = cached.captures
-                elif not stable:
-                    waiting_file_count += 1
-                    parsed = (
-                        cached.captures
-                        if cached is not None
+                    scanned_records = cached.scanned_records
+                    open_capture = cached.open_capture
+                else:
+                    can_resume = bool(
+                        cached is not None
+                        and cached.capture_date == capture_date
                         and cached.channel_order == channel_order
                         and cached.captures is not None
-                        else ()
+                        and cached.scanned_records > 0
+                        and signature[0] > cached.signature[0]
                     )
-                    with self._lock:
-                        if generation != self._generation:
-                            return self.snapshot()
-                        self._pending_signatures[path] = signature
-                else:
-                    parsed = scan_rgb_file(
+                    parsed, scanned_records, open_capture = _scan_rgb_file(
                         path,
                         channel_order=channel_order,
                         cancel_requested=cancel_requested,
+                        start_record=(cached.scanned_records if can_resume else 0),
+                        open_capture=(cached.open_capture if can_resume else None),
+                        existing_captures=(cached.captures if can_resume else ()),
                     )
                     with self._lock:
                         if generation != self._generation:
@@ -759,15 +748,45 @@ class AuyatRgbCatalog:
                             capture_date=capture_date,
                             captures=parsed,
                             channel_order=channel_order,
+                            scanned_records=scanned_records,
+                            open_capture=open_capture,
                         )
-                        self._pending_signatures.pop(path, None)
                     cache_changed = True
+                payload_bytes = max(0, signature[0] - HEADER_SIZE)
+                if open_capture is not None or payload_bytes % RECORD_SIZE:
+                    waiting_file_count += 1
                 captures.extend(parsed)
             except (AuyatRgbError, OSError) as error:
                 errors.append(str(error))
 
         _raise_if_cancelled(cancel_requested)
-        captures.sort(key=lambda item: (item.media_started_at_ms, item.file_path.name, item.start_record))
+        unique_captures: dict[
+            tuple[date, int, int, int, int, str],
+            AuyatRgbCapture,
+        ] = {}
+        for capture in captures:
+            key = (
+                capture.capture_date,
+                capture.start_tick,
+                capture.end_tick,
+                capture.column_count,
+                capture.height,
+                capture.channel_order,
+            )
+            existing = unique_captures.get(key)
+            if existing is None or (
+                SNAPSHOT_SUFFIX.search(capture.file_path.name)
+                and not SNAPSHOT_SUFFIX.search(existing.file_path.name)
+            ):
+                unique_captures[key] = capture
+        captures = list(unique_captures.values())
+        captures.sort(
+            key=lambda item: (
+                item.media_started_at_ms,
+                item.file_path.name,
+                item.start_record,
+            )
+        )
         status = "ready" if captures else "waiting"
         if waiting_file_count:
             message = f"已连接，等待 {waiting_file_count} 个高速文件封口"
@@ -882,12 +901,20 @@ class AuyatRgbCatalog:
                     if indexed and capture_date is not None
                     else None
                 )
+                open_values = item.get("open_capture")
+                open_capture = (
+                    (int(open_values[0]), int(open_values[1]))
+                    if isinstance(open_values, list) and len(open_values) == 2
+                    else None
+                )
                 loaded[path] = _CachedRgbFile(
                     signature=signature,
                     capture_date=capture_date,
                     captures=cached_captures,
                     channel_order=channel_order,
                     error=str(item.get("error") or ""),
+                    scanned_records=max(0, int(item.get("scanned_records", 0))),
+                    open_capture=open_capture,
                 )
             except (KeyError, TypeError, ValueError, AuyatRgbError):
                 continue
@@ -922,6 +949,12 @@ class AuyatRgbCatalog:
                         for capture in (cached.captures or ())
                     ],
                     "error": cached.error,
+                    "scanned_records": cached.scanned_records,
+                    "open_capture": (
+                        list(cached.open_capture)
+                        if cached.open_capture is not None
+                        else None
+                    ),
                 }
                 for path, cached in entries
             ],
@@ -989,6 +1022,27 @@ def scan_rgb_file(
     channel_order: str = "rgb",
     cancel_requested: Callable[[], bool] | None = None,
 ) -> tuple[AuyatRgbCapture, ...]:
+    captures, _scanned_records, _open_capture = _scan_rgb_file(
+        path,
+        channel_order=channel_order,
+        cancel_requested=cancel_requested,
+    )
+    return captures
+
+
+def _scan_rgb_file(
+    path: str | Path,
+    *,
+    channel_order: str = "rgb",
+    cancel_requested: Callable[[], bool] | None = None,
+    start_record: int = 0,
+    open_capture: Optional[tuple[int, int]] = None,
+    existing_captures: tuple[AuyatRgbCapture, ...] = (),
+) -> tuple[
+    tuple[AuyatRgbCapture, ...],
+    int,
+    Optional[tuple[int, int]],
+]:
     file_path = Path(path).expanduser().absolute()
     try:
         with file_path.open("rb") as source:
@@ -997,17 +1051,22 @@ def scan_rgb_file(
                 raise AuyatRgbError(f"RGB文件头不完整: {file_path}")
             capture_date, height = _parse_header(header, file_path)
             complete_records = max(0, (file_path.stat().st_size - HEADER_SIZE) // RECORD_SIZE)
-            open_capture: Optional[tuple[int, int]] = None
-            captures: list[AuyatRgbCapture] = []
-            record_index = 0
+            record_index = max(0, int(start_record))
+            if record_index > complete_records:
+                record_index = 0
+                open_capture = None
+                existing_captures = ()
+            captures = list(existing_captures)
+            source.seek(HEADER_SIZE + record_index * RECORD_SIZE)
             records_per_chunk = 64
             while record_index < complete_records:
                 _raise_if_cancelled(cancel_requested)
                 count = min(records_per_chunk, complete_records - record_index)
                 chunk = source.read(count * RECORD_SIZE)
-                if len(chunk) != count * RECORD_SIZE:
+                complete_chunk_records = len(chunk) // RECORD_SIZE
+                if complete_chunk_records <= 0:
                     break
-                for local_index in range(count):
+                for local_index in range(complete_chunk_records):
                     offset = local_index * RECORD_SIZE
                     tick, flag = struct.unpack_from("<II", chunk, offset)
                     current_index = record_index + local_index
@@ -1028,12 +1087,14 @@ def scan_rgb_file(
                             )
                         )
                         open_capture = None
-                record_index += count
+                record_index += complete_chunk_records
+                if complete_chunk_records < count:
+                    break
     except PermissionError as error:
         raise AuyatRgbError(f"高速图像仍被原厂软件占用: {file_path}") from error
     except OSError as error:
         raise AuyatRgbError(f"无法读取高速图像: {file_path}") from error
-    return tuple(captures)
+    return tuple(captures), record_index, open_capture
 
 
 def read_rgb_header(path: str | Path) -> tuple[date, int]:

@@ -5,7 +5,8 @@ from typing import ClassVar
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, pyqtSignal
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton
 
 from realtime import passage_review
@@ -242,11 +243,12 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     assert window.receiver.is_running
     assert window.table.rowCount() == 1
     assert window.table.item(0, 1).text() == "15"
+    assert window.table.item(0, 2).text() == "张三"
     assert window.race_value.text() == "2026 城市自行车赛"
     assert window.stage_value.text() == "第一赛段"
     assert window.group_value.text() == "男子公开组"
     assert window.operator_identity_label.text() == "当前运动员：15 张三"
-    assert window.table.item(0, 5).text() == "已定位"
+    assert window.table.item(0, 6).text() == "待确认"
     assert len(window.timeline_store.segments()) == 1
     assert "可核对 1" in window.capture_status_label.text()
 
@@ -397,6 +399,36 @@ def test_confirm_and_next_does_not_advance_when_confirmation_fails(
 
     window._confirm_and_next()
 
+    assert move_calls == []
+    window.close()
+
+
+def test_plain_enter_confirms_pending_marker_without_advancing(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path)
+    window.show()
+    window.start()
+    _FakeReceiver.instances[0].deliver(_event())
+    qapp.processEvents()
+    window.regular_pane._pending_marker = (0.5, 0.5, 1, 100)
+    confirmed_panes = []
+    move_calls = []
+    monkeypatch.setattr(
+        window,
+        "_confirm_pending_marker",
+        lambda pane: confirmed_panes.append(pane) or True,
+    )
+    monkeypatch.setattr(window, "_move_selection", move_calls.append)
+    window._update_operator_controls()
+    window.identity_search.setFocus()
+
+    QTest.keyClick(window.identity_search, Qt.Key_Return)
+    qapp.processEvents()
+
+    assert confirmed_panes == [window.regular_pane]
     assert move_calls == []
     window.close()
 

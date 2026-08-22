@@ -505,7 +505,10 @@ def test_corrected_passage_window_keeps_old_evidence_but_returns_current_window(
     assert buffer.pinned_event_ids("first.ts") == frozenset({"passage-15"})
 
 
-def test_ready_window_publishes_one_idempotent_playable_timeline(tmp_path):
+def test_ready_window_publishes_one_idempotent_playable_timeline(
+    tmp_path,
+    monkeypatch,
+):
     buffer_dir = tmp_path / "review_buffer" / "camera_01"
     buffer_dir.mkdir(parents=True)
     playlist = _write_playlist(
@@ -525,6 +528,10 @@ def test_ready_window_publishes_one_idempotent_playable_timeline(tmp_path):
     publisher = PassageReviewTimelinePublisher(ring_buffer, timeline)
 
     first = publisher.publish(window, race_id="race-1")
+    monkeypatch.setattr(
+        "realtime.review_recorder.os.replace",
+        lambda *_args: pytest.fail("unchanged playlist must not be replaced"),
+    )
     second = publisher.publish(window, race_id="race-1")
 
     assert first == second

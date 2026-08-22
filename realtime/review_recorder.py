@@ -1179,9 +1179,15 @@ class PassageReviewTimelinePublisher:
             )
             previous_end_ms = segment.ended_at_ms
         lines.append("#EXT-X-ENDLIST")
+        payload = ("\n".join(lines) + "\n").encode("utf-8")
+        try:
+            if path.read_bytes() == payload:
+                return
+        except FileNotFoundError:
+            pass
         temporary_path = path.with_suffix(path.suffix + ".tmp")
         with temporary_path.open("wb") as output:
-            output.write(("\n".join(lines) + "\n").encode("utf-8"))
+            output.write(payload)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary_path, path)

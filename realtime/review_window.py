@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PyQt5.QtCore import QObject, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
@@ -25,6 +26,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QShortcut,
     QStyle,
     QVBoxLayout,
 )
@@ -436,7 +438,7 @@ class FinishReviewWindow(PassageReviewDialog):
         identity = ""
         athlete_name = ""
         if event is not None:
-            identity = event.bib.strip() or event.chip_id.strip()
+            identity = event.bib.strip()
             athlete_name = event.athlete_name.strip()
         else:
             identity = self.selected_identity_value.text().strip()
@@ -467,22 +469,30 @@ class FinishReviewWindow(PassageReviewDialog):
         )
         self.mark_regular_button.setEnabled(regular_ready)
         self.mark_high_speed_button.setEnabled(high_speed_ready)
-        self.confirm_next_button.setEnabled(
-            bool(
-                identity
-                and (
-                    self.regular_pane.has_pending_marker
-                    or self.high_speed_pane.has_pending_marker
-                )
-            )
+        has_pending_marker = bool(
+            self.regular_pane.has_pending_marker
+            or self.high_speed_pane.has_pending_marker
         )
+        self.confirm_next_button.setEnabled(bool(identity and has_pending_marker))
+        for shortcut in getattr(self, "confirm_marker_shortcuts", ()):
+            shortcut.setEnabled(bool(identity and has_pending_marker))
+
+    def _pending_marker_pane(self):
+        if self.regular_pane.has_pending_marker:
+            return self.regular_pane
+        if self.high_speed_pane.has_pending_marker:
+            return self.high_speed_pane
+        return None
+
+    def _confirm_current_marker(self) -> None:
+        pane = self._pending_marker_pane()
+        if pane is None:
+            return
+        self._confirm_pending_marker(pane)
+        self._update_operator_controls()
 
     def _confirm_and_next(self) -> None:
-        pane = None
-        if self.regular_pane.has_pending_marker:
-            pane = self.regular_pane
-        elif self.high_speed_pane.has_pending_marker:
-            pane = self.high_speed_pane
+        pane = self._pending_marker_pane()
         if pane is None:
             return
         row = self.table.currentRow()
@@ -731,6 +741,13 @@ class FinishReviewWindow(PassageReviewDialog):
         self.confirm_next_button.setShortcut("Ctrl+Return")
         self.confirm_next_button.clicked.connect(self._confirm_and_next)
         layout.addWidget(self.confirm_next_button)
+        self.confirm_marker_shortcuts = []
+        for key in (Qt.Key_Return, Qt.Key_Enter):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.activated.connect(self._confirm_current_marker)
+            shortcut.setEnabled(False)
+            self.confirm_marker_shortcuts.append(shortcut)
         for pane in (self.regular_pane, self.high_speed_pane):
             pane.video_view.marker_position_selected.connect(
                 lambda _x, _y: QTimer.singleShot(0, self._update_operator_controls)

@@ -208,6 +208,17 @@ def compact_source_status(location: Optional[PassageVideoLocation]) -> str:
     return _STATUS_TEXT.get(location.status, location.status)
 
 
+def source_confirmation_status(
+    location: Optional[PassageVideoLocation],
+    association: Optional[PassageEvidenceAssociation],
+) -> str:
+    if association is not None:
+        return "已确认"
+    if location is not None and location.status == "located":
+        return "待确认"
+    return compact_source_status(location)
+
+
 def combined_review_status(
     regular: Optional[PassageVideoLocation],
     high_speed: Optional[PassageVideoLocation],
@@ -480,6 +491,10 @@ class EvidenceImageView(QGraphicsView):
             self.frame_step_requested.emit(-1 if event.key() == Qt.Key_Left else 1)
             event.accept()
             return
+        if event.key() in (Qt.Key_Up, Qt.Key_Down):
+            self.passage_step_requested.emit(-1 if event.key() == Qt.Key_Up else 1)
+            event.accept()
+            return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             self.marker_confirm_requested.emit()
             event.accept()
@@ -503,7 +518,7 @@ class EvidenceImageView(QGraphicsView):
         y = y_normalized * self._source_height
         scale = max(0.001, abs(self.transform().m11()))
         color = QColor("#1bbf83" if confirmed else "#ffb020")
-        pen = QPen(color, 2)
+        pen = QPen(color, 3)
         pen.setCosmetic(True)
         if not confirmed:
             pen.setStyle(Qt.DashLine)
@@ -511,20 +526,36 @@ class EvidenceImageView(QGraphicsView):
         painter.save()
         painter.setPen(pen)
         painter.drawLine(int(x), 0, int(x), self._source_height)
-        cross_extent = 18.0 / scale
+        cross_extent = 22.0 / scale
         painter.drawLine(int(x - cross_extent), int(y), int(x + cross_extent), int(y))
         painter.drawLine(int(x), int(y - cross_extent), int(x), int(y + cross_extent))
 
         tag_text = label if confirmed else f"{label} 待确认"
-        tag_width = max(58.0, 15.0 + len(tag_text) * 14.0) / scale
-        tag_height = 25.0 / scale
-        tag_rect = QRectF(x + 7.0 / scale, y + 7.0 / scale, tag_width, tag_height)
+        margin = 8.0 / scale
+        tag_width = max(76.0, 20.0 + len(tag_text) * 22.0) / scale
+        tag_height = 40.0 / scale
+        visible_left = max(0.0, rect.left())
+        visible_top = max(0.0, rect.top())
+        visible_right = min(float(self._source_width), rect.right())
+        visible_bottom = min(float(self._source_height), rect.bottom())
+        tag_x = x + margin
+        if tag_x + tag_width > visible_right - margin:
+            tag_x = x - tag_width - margin
+        tag_x = max(
+            visible_left + margin,
+            min(tag_x, max(visible_left + margin, visible_right - tag_width - margin)),
+        )
+        tag_y = max(
+            visible_top + margin,
+            min(y + margin, max(visible_top + margin, visible_bottom - tag_height - margin)),
+        )
+        tag_rect = QRectF(tag_x, tag_y, tag_width, tag_height)
         painter.setPen(Qt.NoPen)
         painter.setBrush(color)
         painter.drawRoundedRect(tag_rect, 3.0 / scale, 3.0 / scale)
         painter.setPen(QColor("#07120e" if confirmed else "#231703"))
         font = QFont(self.font())
-        font.setPixelSize(max(1, int(round(13.0 / scale))))
+        font.setPixelSize(max(1, int(round(22.0 / scale))))
         font.setBold(True)
         painter.setFont(font)
         painter.drawText(tag_rect, Qt.AlignCenter, tag_text)
@@ -819,7 +850,7 @@ class PassageEvidencePane(QFrame):
         )
         self._event = event
         self._location = location
-        self._identity = event.bib.strip() or event.chip_id.strip() or "未知"
+        self._identity = event.bib.strip() or "未知"
         if (
             association is not None
             and location is not None
@@ -1283,14 +1314,14 @@ class PassageReviewDialog(QDialog):
         form.addRow("赛事", self.race_value)
         form.addRow("赛段", self.stage_value)
         form.addRow("当前组别", self.group_value)
-        form.addRow("号码 / 芯片", self.selected_identity_value)
-        form.addRow("运动员", self.athlete_value)
+        form.addRow("号码", self.selected_identity_value)
+        form.addRow("姓名", self.athlete_value)
         form.addRow("队伍", self.team_value)
-        form.addRow("北京时间", self.selected_time_value)
+        form.addRow("通过时间", self.selected_time_value)
         form.addRow("证据状态", self.source_value)
         info_layout.addLayout(form)
         info_layout.addStretch()
-        authority = QLabel("芯片时间只读；正式成绩由 CycleRace 计算")
+        authority = QLabel("通过时间只读；正式成绩由 CycleRace 计算")
         authority.setWordWrap(True)
         authority.setStyleSheet(
             "background: #e8f2fa; color: #15547f; padding: 7px; border-radius: 3px;"
@@ -1314,7 +1345,7 @@ class PassageReviewDialog(QDialog):
         self.group_combo.currentIndexChanged.connect(self._on_group_changed)
         filters.addWidget(self.group_combo)
         self.identity_search = QLineEdit(self)
-        self.identity_search.setPlaceholderText("输入号码或芯片")
+        self.identity_search.setPlaceholderText("输入号码或姓名")
         self.identity_search.setClearButtonEnabled(True)
         self.identity_search.setMaximumWidth(170)
         self.identity_search.returnPressed.connect(self._find_identity)
@@ -1337,14 +1368,15 @@ class PassageReviewDialog(QDialog):
         filters.addWidget(refresh_btn)
         results_layout.addLayout(filters)
 
-        self.table = QTableWidget(0, 8, self)
+        self.table = QTableWidget(0, 9, self)
         self.table.setHorizontalHeaderLabels(
             [
                 "序号",
-                "号码 / 芯片",
+                "号码",
+                "姓名",
                 "组别",
                 "圈次",
-                "北京时间",
+                "通过时间",
                 "普通录像",
                 "高速摄像",
                 "核对状态",
@@ -1358,9 +1390,9 @@ class PassageReviewDialog(QDialog):
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         self.table.cellDoubleClicked.connect(self._open_preferred_source)
         header = self.table.horizontalHeader()
-        for column in (0, 3):
+        for column in (0, 4):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        for column in (1, 2, 4, 5, 6, 7):
+        for column in (1, 2, 3, 5, 6, 7, 8):
             header.setSectionResizeMode(column, QHeaderView.Stretch)
         results_layout.addWidget(self.table, 1)
         upper_splitter.addWidget(results_panel)
@@ -1375,7 +1407,9 @@ class PassageReviewDialog(QDialog):
         transport_layout.setContentsMargins(10, 5, 10, 5)
         transport_layout.setSpacing(7)
         self.current_passage_label = QLabel("未选择通过记录")
-        self.current_passage_label.setStyleSheet("font-weight: 700;")
+        self.current_passage_label.setStyleSheet(
+            "font-size: 18px; font-weight: 700; color: #17212b;"
+        )
         self.current_time_label = QLabel("--:--:--.---")
         self.current_time_label.setStyleSheet(
             "font-family: Consolas; font-size: 14px; font-weight: 700;"
@@ -1642,24 +1676,29 @@ class PassageReviewDialog(QDialog):
             regular_association,
             high_speed_association,
         )
-        identity = event.bib.strip() or event.chip_id.strip() or "未知"
+        metadata_athlete = self._metadata_athlete_for_event(event)
+        identity = event.bib.strip() or "未知"
+        athlete_name = event.athlete_name.strip() or (
+            metadata_athlete.name.strip() if metadata_athlete is not None else ""
+        ) or "--"
         values = (
             str(event.sequence),
             identity,
+            athlete_name,
             event.group_name.strip() or event.group_id,
             str(event.lap),
             format_passage_time(event.timeline_timestamp_ms),
-            compact_source_status(regular),
-            compact_source_status(high_speed),
+            source_confirmation_status(regular, regular_association),
+            source_confirmation_status(high_speed, high_speed_association),
             review_status,
         )
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
-            if column in {0, 3, 4, 5, 6, 7}:
+            if column in {0, 4, 5, 6, 7, 8}:
                 item.setTextAlignment(Qt.AlignCenter)
             if column == 0:
                 item.setData(Qt.UserRole, event.event_id)
-            if column in {5, 6, 7}:
+            if column in {6, 7, 8}:
                 item.setForeground(self._status_color(value))
             self.table.setItem(row, column, item)
 
@@ -1828,9 +1867,16 @@ class PassageReviewDialog(QDialog):
 
     @staticmethod
     def _status_color(value: str) -> QColor:
-        if value in {"已定位", "双源就绪", "录像确认", "高速确认", "双源确认"}:
+        if value in {
+            "已定位",
+            "已确认",
+            "双源就绪",
+            "录像确认",
+            "高速确认",
+            "双源确认",
+        }:
             return QColor("#16845b")
-        if value in {"边界候选", "需核对", "范围未验证"}:
+        if value in {"待确认", "边界候选", "需核对", "范围未验证"}:
             return QColor("#a56300")
         if value in {
             "未匹配",
@@ -1875,7 +1921,7 @@ class PassageReviewDialog(QDialog):
                 high_speed_association,
             )
         self._selected_event_id = event.event_id
-        identity = event.bib.strip() or event.chip_id.strip() or "未知"
+        identity = event.bib.strip() or "未知"
         metadata = self._current_metadata()
         metadata_athlete = self._metadata_athlete_for_event(event)
         athlete_name = event.athlete_name.strip() or (
@@ -2094,10 +2140,6 @@ class PassageReviewDialog(QDialog):
             roster_athlete.bib.strip()
             if roster_athlete is not None
             else bib
-        ) or (
-            roster_athlete.chip_ids[0]
-            if roster_athlete is not None and roster_athlete.chip_ids
-            else athlete_id
         )
         athlete_name = (
             roster_athlete.name.strip() if roster_athlete is not None else ""
@@ -2192,13 +2234,19 @@ class PassageReviewDialog(QDialog):
             regular_association,
             high_speed_association,
         )
+        row_values = (
+            (6, source_confirmation_status(regular, regular_association)),
+            (7, source_confirmation_status(high_speed, high_speed_association)),
+            (8, status),
+        )
         for row, event in enumerate(self._visible_events):
             if event.event_id != event_id:
                 continue
-            item = self.table.item(row, 7)
-            if item is not None:
-                item.setText(status)
-                item.setForeground(self._status_color(status))
+            for column, value in row_values:
+                item = self.table.item(row, column)
+                if item is not None:
+                    item.setText(value)
+                    item.setForeground(self._status_color(value))
             break
         if event_id == self._selected_event_id:
             self.source_value.setText(status)
@@ -2309,7 +2357,15 @@ class PassageReviewDialog(QDialog):
         if not value:
             return
         for row, event in enumerate(self._visible_events):
-            if value in {event.bib.strip().casefold(), event.chip_id.strip().casefold()}:
+            metadata_athlete = self._metadata_athlete_for_event(event)
+            athlete_name = event.athlete_name.strip() or (
+                metadata_athlete.name.strip() if metadata_athlete is not None else ""
+            )
+            if value in {
+                event.bib.strip().casefold(),
+                event.chip_id.strip().casefold(),
+                athlete_name.casefold(),
+            }:
                 self.table.setCurrentCell(row, 0)
                 self.table.selectRow(row)
                 item = self.table.item(row, 1)
@@ -2322,11 +2378,12 @@ class PassageReviewDialog(QDialog):
             for athlete in metadata.athletes:
                 if selected_group and athlete.group_id != selected_group:
                     continue
-                if not athlete.matches_identity(value):
+                if not (
+                    athlete.matches_identity(value)
+                    or athlete.name.strip().casefold() == value
+                ):
                     continue
-                identity = athlete.bib.strip() or (
-                    athlete.chip_ids[0] if athlete.chip_ids else "未知"
-                )
+                identity = athlete.bib.strip() or "未知"
                 self.race_value.setText(metadata.race_name or metadata.race_id)
                 self.stage_value.setText(metadata.stage_name or metadata.stage_id)
                 self.group_value.setText(metadata.group_label(athlete.group_id))
@@ -2340,7 +2397,7 @@ class PassageReviewDialog(QDialog):
                     f"名单运动员 {athlete_summary}（尚无通过记录）"
                 )
                 return
-        QMessageBox.information(self, "未找到", "当前组别没有该号码或芯片的通过记录。")
+        QMessageBox.information(self, "未找到", "当前组别没有该号码或姓名的通过记录。")
 
     def _move_selection(self, delta: int) -> None:
         if self.table.rowCount() <= 0:

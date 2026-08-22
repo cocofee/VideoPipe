@@ -17,6 +17,12 @@ from realtime.passage_evidence import (
 )
 from realtime.passage_receiver import PassageEvent, PassageEventStore
 from realtime.passage_review import PassageReviewDialog, lookup_status_text
+from realtime.race_metadata import (
+    RaceAthleteMetadata,
+    RaceGroupMetadata,
+    RaceMetadata,
+    RaceMetadataStore,
+)
 from realtime.video_timeline import VideoTimelineStore
 
 
@@ -102,6 +108,9 @@ def _event(
     group_name="",
     athlete_name="",
     team_name="",
+    athlete_id="",
+    revision=1,
+    is_active=True,
 ):
     return PassageEvent(
         event_id=event_id,
@@ -120,6 +129,9 @@ def _event(
         group_name=group_name,
         athlete_name=athlete_name,
         team_name=team_name,
+        athlete_id=athlete_id,
+        revision=revision,
+        is_active=is_active,
     )
 
 
@@ -422,6 +434,202 @@ def test_selected_passage_uses_cyclerace_display_metadata(qapp, tmp_path):
     assert dialog.current_passage_label.text() == "当前运动员 15 张三"
     assert dialog.group_combo.itemText(1) == "男子公开组"
     assert dialog.group_combo.itemData(1) == "men-open"
+    dialog.close()
+
+
+def test_race_metadata_populates_context_before_first_passage(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(event_id="old-test", bib="TEST-15"))
+    metadata_store = RaceMetadataStore(tmp_path / "race_metadata.json")
+    metadata_store.store(
+        RaceMetadata(
+            race_id="race-11",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            race_name="11",
+            stage_name="1",
+            stage_date="2026-08-22",
+            groups=(RaceGroupMetadata("elite-men", "男子精英组"),),
+            athletes=(
+                RaceAthleteMetadata(
+                    athlete_id="15",
+                    bib="15",
+                    name="十五号运动员",
+                    team_name="示例队",
+                    group_id="elite-men",
+                    chip_ids=("261623",),
+                ),
+            ),
+        )
+    )
+
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+        metadata_store=metadata_store,
+    )
+    qapp.processEvents()
+
+    assert dialog.table.rowCount() == 0
+    assert dialog.race_value.text() == "11"
+    assert dialog.stage_value.text() == "1"
+    assert dialog.group_combo.itemText(1) == "男子精英组"
+    assert dialog.group_combo.itemData(1) == "elite-men"
+
+    dialog.identity_search.setText("261623")
+    dialog._find_identity()
+
+    assert dialog.selected_identity_value.text() == "15"
+    assert dialog.athlete_value.text() == "十五号运动员"
+    assert dialog.team_value.text() == "示例队"
+    assert dialog.selected_time_value.text() == "尚无通过记录"
+    dialog.close()
+
+
+def test_switching_to_metadata_context_clears_stale_test_identity(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(_event(event_id="old-test", bib="TEST-15"))
+    metadata_store = RaceMetadataStore(tmp_path / "race_metadata.json")
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+        metadata_store=metadata_store,
+    )
+    qapp.processEvents()
+    assert dialog.identity_search.text() == "TEST-15"
+    assert dialog.regular_pane.mark_btn.text() == "标线 TEST-15"
+
+    metadata_store.store(
+        RaceMetadata(
+            race_id="race-11",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            race_name="11",
+            stage_name="1",
+            groups=(RaceGroupMetadata("elite-men", "男子精英组"),),
+        )
+    )
+    dialog.refresh()
+    qapp.processEvents()
+
+    assert dialog.table.rowCount() == 0
+    assert dialog.identity_search.text() == ""
+    assert dialog.regular_pane.mark_btn.text() == "标记"
+    assert dialog.high_speed_pane.mark_btn.text() == "标记"
+    dialog.close()
+
+
+def test_focus_athlete_selects_latest_passage_and_switches_group(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(
+            event_id="passage-15-first",
+            sequence=1,
+            passage_time_ms=10_000,
+            group_id="elite-men",
+            bib="15",
+            athlete_id="15",
+        )
+    )
+    passage_store.append(
+        _event(
+            event_id="passage-15-latest",
+            sequence=2,
+            passage_time_ms=20_000,
+            group_id="elite-men",
+            bib="15",
+            athlete_id="15",
+        )
+    )
+    metadata_store = RaceMetadataStore(tmp_path / "race_metadata.json")
+    metadata_store.store(
+        RaceMetadata(
+            race_id="race-1",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            race_name="11",
+            stage_name="1",
+            groups=(
+                RaceGroupMetadata("elite-men", "男子精英组"),
+                RaceGroupMetadata("women-open", "女子公开组"),
+            ),
+        )
+    )
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+        metadata_store=metadata_store,
+    )
+    dialog.group_combo.setCurrentIndex(dialog.group_combo.findData("women-open"))
+
+    assert dialog.focus_athlete(
+        "race-1",
+        "stage-1",
+        athlete_id="15",
+        bib="15",
+        group_id="elite-men",
+    ) is True
+
+    assert dialog.group_combo.currentData() == "elite-men"
+    assert dialog._selected_event_id == "passage-15-latest"
+    assert dialog.selected_identity_value.text() == "15"
+    dialog.close()
+
+
+def test_focus_athlete_without_passage_clears_stale_video_and_shows_roster(
+    qapp,
+    tmp_path,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-12", bib="12", athlete_id="12")
+    )
+    metadata_store = RaceMetadataStore(tmp_path / "race_metadata.json")
+    metadata_store.store(
+        RaceMetadata(
+            race_id="race-1",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            race_name="11",
+            stage_name="1",
+            groups=(RaceGroupMetadata("men-open", "男子公开组"),),
+            athletes=(
+                RaceAthleteMetadata(
+                    athlete_id="15",
+                    bib="15",
+                    name="十五号运动员",
+                    team_name="示例队",
+                    group_id="men-open",
+                ),
+            ),
+        )
+    )
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+        metadata_store=metadata_store,
+    )
+    assert dialog._selected_event_id == "passage-12"
+
+    assert dialog.focus_athlete(
+        "race-1",
+        "stage-1",
+        athlete_id="15",
+        bib="15",
+        group_id="men-open",
+    ) is True
+
+    assert dialog._selected_event_id == ""
+    assert dialog.selected_identity_value.text() == "15"
+    assert dialog.athlete_value.text() == "十五号运动员"
+    assert dialog.team_value.text() == "示例队"
+    assert dialog.selected_time_value.text() == "尚无通过记录"
+    assert dialog.regular_pane._event is None
+    assert dialog.high_speed_pane._event is None
     dialog.close()
 
 
@@ -1130,6 +1338,36 @@ def test_refresh_after_new_passage_preserves_selected_video_position(
     dialog.close()
 
 
+def test_refresh_invalidates_negative_lookup_after_timeline_changes(
+    qapp,
+    tmp_path,
+    fake_playback,
+):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    passage_store.append(
+        _event(event_id="passage-15", passage_time_ms=15_000, bib="15")
+    )
+    timeline_store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    dialog = PassageReviewDialog(passage_store, timeline_store)
+    qapp.processEvents()
+    assert dialog._lookups["passage-15"].status == "no_segments"
+
+    _add_segment(
+        timeline_store,
+        tmp_path / "videos" / "camera_01.mkv",
+        source_id="camera_01",
+        camera_index=1,
+        started_at_ms=10_000,
+        ended_at_ms=20_000,
+    )
+    dialog.refresh()
+    qapp.processEvents()
+
+    assert dialog._lookups["passage-15"].status == "located"
+    assert dialog.regular_pane.location is not None
+    dialog.close()
+
+
 def test_incremental_refresh_appends_only_the_new_passage_row(
     qapp,
     tmp_path,
@@ -1166,6 +1404,56 @@ def test_incremental_refresh_appends_only_the_new_passage_row(
     assert dialog._selected_event_id == "passage-12"
     assert worker.seek_calls == seek_calls_before
     assert dialog.next_passage_btn.isEnabled()
+    dialog.close()
+
+
+def test_incremental_refresh_removes_inactive_passage_revision(qapp, tmp_path):
+    passage_store = PassageEventStore(tmp_path / "passages.jsonl")
+    active = _event(event_id="passage-15", bib="15")
+    passage_store.append(active)
+    dialog = PassageReviewDialog(
+        passage_store,
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+    assert dialog.table.rowCount() == 1
+
+    passage_store.append(
+        _event(
+            event_id=active.event_id,
+            bib="15",
+            revision=2,
+            is_active=False,
+        )
+    )
+    dialog.refresh_events((active.event_id,))
+    qapp.processEvents()
+
+    assert dialog.table.rowCount() == 0
+    assert dialog._selected_event_id == ""
+    assert dialog.regular_pane._event is None
+    assert passage_store.events(include_inactive=True)[0].is_active is False
+    dialog.close()
+
+
+def test_large_incremental_batch_falls_back_to_one_full_refresh(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    dialog = PassageReviewDialog(
+        PassageEventStore(tmp_path / "passages.jsonl"),
+        VideoTimelineStore(tmp_path / "video_timeline.jsonl"),
+    )
+    refresh_calls = 0
+
+    def counted_refresh():
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    monkeypatch.setattr(dialog, "refresh", counted_refresh)
+    dialog.refresh_events(f"passage-{index}" for index in range(65))
+
+    assert refresh_calls == 1
     dialog.close()
 
 

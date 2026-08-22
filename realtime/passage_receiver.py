@@ -14,12 +14,33 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
+try:
+    from .race_metadata import (
+        ACK_MESSAGE_TYPE as METADATA_ACK_MESSAGE_TYPE,
+        MESSAGE_TYPE as METADATA_MESSAGE_TYPE,
+        RaceMetadata,
+        RaceMetadataConflictError,
+        RaceMetadataError,
+        RaceMetadataStore,
+    )
+except ImportError:
+    from race_metadata import (
+        ACK_MESSAGE_TYPE as METADATA_ACK_MESSAGE_TYPE,
+        MESSAGE_TYPE as METADATA_MESSAGE_TYPE,
+        RaceMetadata,
+        RaceMetadataConflictError,
+        RaceMetadataError,
+        RaceMetadataStore,
+    )
+
 
 logger = logging.getLogger("VideoPipe.PassageReceiver")
 
 SCHEMA_VERSION = 1
 MESSAGE_TYPE = "passage"
 ACK_MESSAGE_TYPE = "passage_ack"
+FOCUS_MESSAGE_TYPE = "race_focus"
+FOCUS_ACK_MESSAGE_TYPE = "race_focus_ack"
 DEFAULT_PATH = "/api/v1/passage-events"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 18765
@@ -52,6 +73,47 @@ class PassageIngestResult(str, Enum):
     DUPLICATE = "duplicate"
 
 
+@dataclass(frozen=True, slots=True)
+class RaceFocus:
+    """Ephemeral CycleRace command selecting one athlete in the finish console."""
+
+    race_id: str
+    stage_id: str
+    athlete_id: str
+    bib: str
+    group_id: str
+    emitted_at_ms: int
+    schema_version: int = SCHEMA_VERSION
+    message_type: str = FOCUS_MESSAGE_TYPE
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SCHEMA_VERSION:
+            raise PassageEventError("unsupported race focus schema_version")
+        if self.message_type != FOCUS_MESSAGE_TYPE:
+            raise PassageEventError("message_type must be race_focus")
+        if not self.race_id.strip() or not self.stage_id.strip():
+            raise PassageEventError("race_id and stage_id are required")
+        if not self.athlete_id.strip() and not self.bib.strip():
+            raise PassageEventError("athlete_id or bib is required")
+        if self.emitted_at_ms < 0:
+            raise PassageEventError("emitted_at_ms must be non-negative")
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "RaceFocus":
+        if not isinstance(payload, Mapping):
+            raise PassageEventError("race focus must be a JSON object")
+        return cls(
+            schema_version=_integer_field(payload, "schema_version"),
+            message_type=_string_field(payload, "message_type"),
+            race_id=_string_field(payload, "race_id"),
+            stage_id=_string_field(payload, "stage_id"),
+            athlete_id=_string_field(payload, "athlete_id", default=""),
+            bib=_string_field(payload, "bib", default=""),
+            group_id=_string_field(payload, "group_id", default=""),
+            emitted_at_ms=_integer_field(payload, "emitted_at_ms"),
+        )
+
+
 def _string_field(
     payload: Mapping[str, Any],
     name: str,
@@ -81,6 +143,22 @@ def _integer_field(
     value = payload[name]
     if isinstance(value, bool) or not isinstance(value, int):
         raise PassageEventError(f"{name} must be an integer")
+    return value
+
+
+def _boolean_field(
+    payload: Mapping[str, Any],
+    name: str,
+    *,
+    default: object = _MISSING,
+) -> bool:
+    if name not in payload:
+        if default is _MISSING:
+            raise PassageEventError(f"{name} is required")
+        return bool(default)
+    value = payload[name]
+    if not isinstance(value, bool):
+        raise PassageEventError(f"{name} must be a boolean")
     return value
 
 
@@ -118,6 +196,7 @@ class PassageEvent:
     athlete_id: str = ""
     athlete_name: str = ""
     team_name: str = ""
+    is_active: bool = True
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -148,6 +227,8 @@ class PassageEvent:
             raise PassageEventError("emitted_at_ms must be non-negative")
         if self.revision <= 0:
             raise PassageEventError("revision must be positive")
+        if not isinstance(self.is_active, bool):
+            raise PassageEventError("is_active must be a boolean")
 
     @property
     def timeline_timestamp_ms(self) -> int:
@@ -184,6 +265,7 @@ class PassageEvent:
             athlete_id=_string_field(payload, "athlete_id", default=""),
             athlete_name=_string_field(payload, "athlete_name", default=""),
             team_name=_string_field(payload, "team_name", default=""),
+            is_active=_boolean_field(payload, "is_active", default=True),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -210,6 +292,7 @@ class PassageEvent:
             "athlete_id": payload["athlete_id"],
             "athlete_name": payload["athlete_name"],
             "team_name": payload["team_name"],
+            "is_active": payload["is_active"],
         }
 
 
@@ -324,16 +407,6 @@ class PassageEventStore:
         if not isinstance(event, PassageEvent):
             raise TypeError("event must be a PassageEvent")
         with self._lock:
-            if len(self._race_ids) > 1:
-                raise PassageEventConflictError(
-                    "passage event journal contains multiple race_id values"
-                )
-            if self._race_ids and event.race_id not in self._race_ids:
-                active_race_id = next(iter(self._race_ids))
-                raise PassageEventConflictError(
-                    "passage event race_id does not match this race journal: "
-                    f"expected {active_race_id}"
-                )
             current = self._events.get(event.event_id)
             if current is not None:
                 if event.revision < current.revision:
@@ -395,13 +468,17 @@ class PassageEventStore:
         with self._lock:
             return self._events.get(str(event_id))
 
-    def events(self) -> tuple[PassageEvent, ...]:
+    def events(self, *, include_inactive: bool = False) -> tuple[PassageEvent, ...]:
         with self._lock:
-            return tuple(self._events[event_id] for event_id in self._event_order)
+            events = tuple(
+                self._events[event_id] for event_id in self._event_order
+            )
+            if include_inactive:
+                return events
+            return tuple(event for event in events if event.is_active)
 
     def __len__(self) -> int:
-        with self._lock:
-            return len(self._events)
+        return len(self.events())
 
     @property
     def recovered_incomplete_tail(self) -> bool:
@@ -541,6 +618,9 @@ class PassageDiscoveryResponder:
 
 def _handler_type(
     ingestor: PassageEventIngestor,
+    metadata_store: RaceMetadataStore,
+    on_metadata_accepted: Optional[Callable[[RaceMetadata], None]],
+    on_focus_accepted: Optional[Callable[[RaceFocus], None]],
     request_path: str,
     max_body_bytes: int,
 ):
@@ -565,12 +645,47 @@ def _handler_type(
             try:
                 raw_body = self.rfile.read(content_length)
                 payload = json.loads(raw_body.decode("utf-8"))
-                result = ingestor.ingest_payload(payload)
-                status = 201 if result is PassageIngestResult.ACCEPTED else 200
-                self._send_json(status, result.value)
-            except PassageEventConflictError as error:
+                message_type = (
+                    payload.get("message_type")
+                    if isinstance(payload, Mapping)
+                    else None
+                )
+                if message_type == MESSAGE_TYPE:
+                    result = ingestor.ingest_payload(payload)
+                    ack_message_type = ACK_MESSAGE_TYPE
+                elif message_type == METADATA_MESSAGE_TYPE:
+                    metadata = RaceMetadata.from_payload(payload)
+                    result = metadata_store.store(metadata)
+                    if (
+                        result.value == PassageIngestResult.ACCEPTED.value
+                        and on_metadata_accepted is not None
+                    ):
+                        on_metadata_accepted(metadata)
+                    ack_message_type = METADATA_ACK_MESSAGE_TYPE
+                elif message_type == FOCUS_MESSAGE_TYPE:
+                    focus = RaceFocus.from_payload(payload)
+                    if on_focus_accepted is not None:
+                        on_focus_accepted(focus)
+                    result = PassageIngestResult.ACCEPTED
+                    ack_message_type = FOCUS_ACK_MESSAGE_TYPE
+                else:
+                    raise PassageEventError(
+                        "message_type must be passage, race_metadata, or race_focus"
+                    )
+                status = 201 if result.value == PassageIngestResult.ACCEPTED.value else 200
+                self._send_json(
+                    status,
+                    result.value,
+                    message_type=ack_message_type,
+                )
+            except (PassageEventConflictError, RaceMetadataConflictError) as error:
                 self._send_json(409, "rejected", str(error))
-            except (UnicodeDecodeError, json.JSONDecodeError, PassageEventError) as error:
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                PassageEventError,
+                RaceMetadataError,
+            ) as error:
                 self._send_json(400, "rejected", str(error))
             except PassageEventDeliveryError as error:
                 self._send_json(503, "retry", str(error))
@@ -578,10 +693,17 @@ def _handler_type(
                 logger.exception("Passage event request failed")
                 self._send_json(500, "error", str(error))
 
-        def _send_json(self, status: int, result: str, error: str = "") -> None:
+        def _send_json(
+            self,
+            status: int,
+            result: str,
+            error: str = "",
+            *,
+            message_type: str = ACK_MESSAGE_TYPE,
+        ) -> None:
             body: dict[str, Any] = {
                 "schema_version": SCHEMA_VERSION,
-                "message_type": ACK_MESSAGE_TYPE,
+                "message_type": message_type,
                 "status": result,
             }
             if error:
@@ -618,6 +740,9 @@ class PassageEventReceiver:
         max_body_bytes: int = MAX_BODY_BYTES,
         discovery_port: int | None = DEFAULT_DISCOVERY_PORT,
         on_accepted: Optional[Callable[[PassageEvent], None]] = None,
+        metadata_store: RaceMetadataStore | None = None,
+        on_metadata_accepted: Optional[Callable[[RaceMetadata], None]] = None,
+        on_focus_accepted: Optional[Callable[[RaceFocus], None]] = None,
     ):
         host = str(host).strip()
         port = int(port)
@@ -641,6 +766,11 @@ class PassageEventReceiver:
         )
         self.store = store
         self.ingestor = PassageEventIngestor(store, on_accepted=on_accepted)
+        self.metadata_store = metadata_store or RaceMetadataStore(
+            store.journal_path.with_name("cyclerace_race_metadata.json")
+        )
+        self._on_metadata_accepted = on_metadata_accepted
+        self._on_focus_accepted = on_focus_accepted
         self._lock = threading.RLock()
         self._server: Optional[_PassageHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -653,6 +783,9 @@ class PassageEventReceiver:
                 return
             handler = _handler_type(
                 self.ingestor,
+                self.metadata_store,
+                self._on_metadata_accepted,
+                self._on_focus_accepted,
                 self.request_path,
                 self.max_body_bytes,
             )
@@ -733,6 +866,8 @@ __all__ = [
     "DEFAULT_PORT",
     "DISCOVERY_REQUEST",
     "DISCOVERY_SERVICE",
+    "FOCUS_ACK_MESSAGE_TYPE",
+    "FOCUS_MESSAGE_TYPE",
     "MESSAGE_TYPE",
     "PassageEvent",
     "PassageEventConflictError",
@@ -744,5 +879,6 @@ __all__ = [
     "PassageEventStore",
     "PassageIngestResult",
     "PassageJournalError",
+    "RaceFocus",
     "SCHEMA_VERSION",
 ]

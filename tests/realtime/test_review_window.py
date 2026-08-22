@@ -9,7 +9,12 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton
 
 from realtime import passage_review
-from realtime.passage_receiver import PassageEvent, PassageEventStore
+from realtime.passage_receiver import PassageEvent, PassageEventStore, RaceFocus
+from realtime.race_metadata import (
+    RaceAthleteMetadata,
+    RaceGroupMetadata,
+    RaceMetadata,
+)
 from realtime.review_recorder import make_directshow_source
 from realtime.review_window import (
     FinishReviewLaunchDialog,
@@ -123,12 +128,25 @@ class _FakeRecorder:
 class _FakeReceiver:
     instances: ClassVar[list["_FakeReceiver"]] = []
 
-    def __init__(self, host, port, store, *, on_accepted):
+    def __init__(
+        self,
+        host,
+        port,
+        store,
+        *,
+        on_accepted,
+        metadata_store=None,
+        on_metadata_accepted=None,
+        on_focus_accepted=None,
+    ):
         self.host = host
         self.port = port
         self.listen_port = port or 18765
         self.store = store
         self.on_accepted = on_accepted
+        self.metadata_store = metadata_store
+        self.on_metadata_accepted = on_metadata_accepted
+        self.on_focus_accepted = on_focus_accepted
         self.is_running = False
         self.stopped = False
         type(self).instances.append(self)
@@ -144,9 +162,16 @@ class _FakeReceiver:
         self.store.append(event)
         self.on_accepted(event)
 
+    def deliver_metadata(self, metadata):
+        self.metadata_store.store(metadata)
+        self.on_metadata_accepted(metadata)
 
-def _event(*, absolute=True):
-    return PassageEvent(
+    def deliver_focus(self, focus):
+        self.on_focus_accepted(focus)
+
+
+def _event(*, absolute=True, **overrides):
+    values = dict(
         event_id="race-1-stage-1-passage-15",
         race_id="race-1",
         stage_id="stage-1",
@@ -164,9 +189,11 @@ def _event(*, absolute=True):
         athlete_name="张三",
         team_name="示例车队",
     )
+    values.update(overrides)
+    return PassageEvent(**values)
 
 
-def _window(tmp_path):
+def _window(tmp_path, *, passage_batch_interval_ms=0):
     _FakeRecorder.instances.clear()
     _FakeReceiver.instances.clear()
     return FinishReviewWindow(
@@ -174,9 +201,34 @@ def _window(tmp_path):
         tmp_path,
         passage_host="127.0.0.1",
         passage_port=18765,
+        passage_batch_interval_ms=passage_batch_interval_ms,
         recorder_factory=_FakeRecorder,
         receiver_factory=_FakeReceiver,
     )
+
+
+def test_runtime_status_reports_loaded_race_metadata(qapp, tmp_path):
+    window = _window(tmp_path)
+    window.start_receiver()
+    window.metadata_store.store(
+        RaceMetadata(
+            race_id="race-11",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            race_name="11",
+            stage_name="1",
+            groups=(RaceGroupMetadata("elite-men", "男子精英组"),),
+        )
+    )
+
+    window._update_runtime_status()
+
+    assert window.receiver_status_label.text() == (
+        "CycleRace: 已同步 11 / 1，等待通过"
+    )
+    assert "已读取 1 个组别" in window.receiver_status_label.toolTip()
+    window.close()
 
 
 def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
@@ -226,6 +278,107 @@ def test_received_passage_uses_incremental_table_refresh(
     assert full_refresh_calls == 0
     assert window.table.rowCount() == 1
     assert window.table.item(0, 1).text() == "15"
+    window.close()
+
+
+def test_received_passages_are_coalesced_into_one_ui_and_archive_batch(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    window = _window(tmp_path, passage_batch_interval_ms=1_000)
+    window.start_receiver()
+    receiver = _FakeReceiver.instances[0]
+    refreshed_batches = []
+    archive_calls = 0
+
+    def record_refresh(event_ids):
+        refreshed_batches.append(set(event_ids))
+
+    def record_archive(**_kwargs):
+        nonlocal archive_calls
+        archive_calls += 1
+        return ()
+
+    monkeypatch.setattr(window, "refresh_events", record_refresh)
+    monkeypatch.setattr(window, "_publish_archive_segments", record_archive)
+    for sequence in range(1, 4):
+        receiver.deliver(
+            _event(
+                event_id=f"race-1-stage-1-passage-{sequence}",
+                sequence=sequence,
+                bib=str(sequence),
+            )
+        )
+    qapp.processEvents()
+
+    assert refreshed_batches == []
+    assert "待处理 3" in window.receiver_status_label.text()
+
+    window._passage_batch_timer.stop()
+    window._flush_passage_batch()
+
+    assert refreshed_batches == [
+        {
+            "race-1-stage-1-passage-1",
+            "race-1-stage-1-passage-2",
+            "race-1-stage-1-passage-3",
+        }
+    ]
+    assert archive_calls == 1
+    assert "本次已接收 3" in window.receiver_status_label.text()
+    window.close()
+
+
+def test_focus_before_passage_shows_roster_then_auto_selects_passage(
+    qapp,
+    tmp_path,
+):
+    window = _window(tmp_path)
+    window.start_receiver()
+    receiver = _FakeReceiver.instances[0]
+    receiver.deliver_metadata(
+        RaceMetadata(
+            race_id="race-1",
+            stage_id="stage-1",
+            revision=1,
+            emitted_at_ms=1,
+            race_name="11",
+            stage_name="1",
+            groups=(RaceGroupMetadata("men-open", "男子公开组"),),
+            athletes=(
+                RaceAthleteMetadata(
+                    athlete_id="15",
+                    bib="15",
+                    name="十五号运动员",
+                    team_name="示例队",
+                    group_id="men-open",
+                ),
+            ),
+        )
+    )
+    receiver.deliver_focus(
+        RaceFocus(
+            race_id="race-1",
+            stage_id="stage-1",
+            athlete_id="15",
+            bib="15",
+            group_id="men-open",
+            emitted_at_ms=2,
+        )
+    )
+    qapp.processEvents()
+
+    assert window._selected_event_id == ""
+    assert window.selected_identity_value.text() == "15"
+    assert window.selected_time_value.text() == "尚无通过记录"
+    assert window.operator_identity_label.text() == "当前运动员：15 十五号运动员"
+
+    receiver.deliver(_event())
+    qapp.processEvents()
+
+    assert window._selected_event_id == "race-1-stage-1-passage-15"
+    assert window.selected_identity_value.text() == "15"
     window.close()
 
 

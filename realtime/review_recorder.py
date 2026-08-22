@@ -28,6 +28,7 @@ try:
         DEFAULT_TIMING_ERROR_MS,
         RecordingSegment,
         VideoTimelineStore,
+        probe_video_duration_ms,
     )
 except ImportError:
     from stream_recorder import (
@@ -41,6 +42,7 @@ except ImportError:
         DEFAULT_TIMING_ERROR_MS,
         RecordingSegment,
         VideoTimelineStore,
+        probe_video_duration_ms,
     )
 
 
@@ -49,6 +51,8 @@ DEFAULT_REVIEW_SEGMENT_SECONDS = 2
 DEFAULT_REVIEW_RETENTION_SECONDS = 90
 DEFAULT_REVIEW_PRE_ROLL_SECONDS = 3
 DEFAULT_REVIEW_POST_ROLL_SECONDS = 3
+DEFAULT_ARCHIVE_TIMING_ERROR_MS = 3_000
+ARCHIVE_SESSION_SCHEMA_VERSION = 1
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 _DIRECTSHOW_SCHEME = "dshow"
 _VIDEO_SIZE_PATTERN = re.compile(r"^[1-9]\d{1,4}x[1-9]\d{1,4}$")
@@ -224,6 +228,76 @@ class PassageReviewWindow:
     segments: tuple[ReviewSegment, ...] = ()
 
 
+def _archive_paths(pattern: Path) -> tuple[Path, ...]:
+    paths = []
+    for path in pattern.parent.glob(pattern.name.replace("%04d", "*")):
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                paths.append(path.resolve())
+        except OSError:
+            continue
+    return tuple(sorted(paths, key=lambda path: path.name))
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveRecordingSession:
+    camera_index: int
+    session_id: str
+    session_started_at_ms: int
+    archive_pattern: Path
+
+    @property
+    def source_id(self) -> str:
+        return f"camera_{self.camera_index:02d}_review"
+
+    def archive_paths(self) -> tuple[Path, ...]:
+        return _archive_paths(self.archive_pattern)
+
+
+def load_archive_recording_sessions(
+    output_dir: str | Path,
+) -> tuple[ArchiveRecordingSession, ...]:
+    archive_dir = (Path(output_dir).expanduser().resolve() / "videos").resolve()
+    sessions = []
+    for manifest_path in archive_dir.glob("*_archive_session.json"):
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if payload.get("schema_version") != ARCHIVE_SESSION_SCHEMA_VERSION:
+                continue
+            camera_index = int(payload["camera_index"])
+            session_id = str(payload["session_id"]).strip()
+            session_started_at_ms = int(payload["session_started_at_ms"])
+            pattern_name = str(payload["archive_pattern"]).strip()
+            if (
+                camera_index <= 0
+                or not session_id
+                or session_started_at_ms < 0
+                or Path(pattern_name).name != pattern_name
+                or "%04d" not in pattern_name
+            ):
+                continue
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        sessions.append(
+            ArchiveRecordingSession(
+                camera_index=camera_index,
+                session_id=session_id,
+                session_started_at_ms=session_started_at_ms,
+                archive_pattern=(archive_dir / pattern_name).resolve(),
+            )
+        )
+    return tuple(
+        sorted(
+            sessions,
+            key=lambda item: (
+                item.session_started_at_ms,
+                item.camera_index,
+                item.session_id,
+            ),
+        )
+    )
+
+
 class FfmpegReviewRecorder:
     """Record one RTSP or Windows USB/UVC input for the finish console."""
 
@@ -257,6 +331,7 @@ class FfmpegReviewRecorder:
 
         self._process: subprocess.Popen | None = None
         self._session_id = ""
+        self._session_started_at_ms: int | None = None
         self._playlist_path: Path | None = None
         self._archive_pattern: Path | None = None
         self._stderr_lines: list[str] = []
@@ -278,6 +353,54 @@ class FfmpegReviewRecorder:
     @property
     def archive_pattern(self) -> Path | None:
         return self._archive_pattern
+
+    @property
+    def session_started_at_ms(self) -> int | None:
+        return self._session_started_at_ms
+
+    def archive_paths(self) -> tuple[Path, ...]:
+        session = self.archive_session
+        return session.archive_paths() if session is not None else ()
+
+    @property
+    def archive_session(self) -> ArchiveRecordingSession | None:
+        if self._archive_pattern is None or self._session_started_at_ms is None:
+            return None
+        return ArchiveRecordingSession(
+            camera_index=self.camera_index,
+            session_id=self._session_id,
+            session_started_at_ms=self._session_started_at_ms,
+            archive_pattern=self._archive_pattern.resolve(),
+        )
+
+    @property
+    def archive_session_path(self) -> Path | None:
+        session = self.archive_session
+        if session is None:
+            return None
+        return self.archive_dir / (
+            f"camera_{self.camera_index:02d}_{session.session_id}_archive_session.json"
+        )
+
+    def _write_archive_session_manifest(self) -> None:
+        session = self.archive_session
+        manifest_path = self.archive_session_path
+        if session is None or manifest_path is None:
+            raise RecordingError("archive recording session is not initialized")
+        payload = {
+            "schema_version": ARCHIVE_SESSION_SCHEMA_VERSION,
+            "camera_index": session.camera_index,
+            "session_id": session.session_id,
+            "session_started_at_ms": session.session_started_at_ms,
+            "archive_pattern": session.archive_pattern.name,
+        }
+        temporary_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        with temporary_path.open("wb") as output:
+            output.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+            output.write(b"\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, manifest_path)
 
     @property
     def is_running(self) -> bool:
@@ -430,7 +553,11 @@ class FfmpegReviewRecorder:
 
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.review_dir.mkdir(parents=True, exist_ok=True)
-        self._session_id = self._clock().strftime("%Y%m%d_%H%M%S_%f")
+        started_at = self._clock()
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            started_at = started_at.astimezone()
+        self._session_id = started_at.strftime("%Y%m%d_%H%M%S_%f")
+        self._session_started_at_ms = round(started_at.timestamp() * 1000.0)
         command = self._build_command()
         kwargs = {
             "stdin": subprocess.PIPE,
@@ -459,6 +586,14 @@ class FfmpegReviewRecorder:
             daemon=True,
         )
         self._stderr_thread.start()
+        try:
+            self._write_archive_session_manifest()
+        except OSError as exc:
+            try:
+                self.stop()
+            except RecordingError:
+                pass
+            raise RecordingError(f"failed to save archive session metadata: {exc}") from exc
         assert self._playlist_path is not None
         return self._playlist_path
 
@@ -523,6 +658,83 @@ class FfmpegReviewRecorder:
             if detail:
                 message = f"{message}: {detail}"
             raise RecordingError(message)
+
+
+class ArchiveTimelinePublisher:
+    """Index sealed long-form archive files as a late-passage fallback."""
+
+    def __init__(
+        self,
+        recorder: FfmpegReviewRecorder | ArchiveRecordingSession,
+        timeline_store: VideoTimelineStore,
+        *,
+        timing_error_ms: int = DEFAULT_ARCHIVE_TIMING_ERROR_MS,
+        duration_probe: Callable[[Path], int | None] = probe_video_duration_ms,
+    ):
+        self.recorder = recorder
+        self.timeline_store = timeline_store
+        self.timing_error_ms = max(0, int(timing_error_ms))
+        self.duration_probe = duration_probe
+        self.source_id = f"camera_{recorder.camera_index:02d}_review"
+
+    def publish_completed(
+        self,
+        *,
+        race_id: str,
+        recording: bool,
+    ) -> tuple[RecordingSegment, ...]:
+        session_started_at_ms = getattr(
+            self.recorder,
+            "session_started_at_ms",
+            None,
+        )
+        if session_started_at_ms is None:
+            return ()
+        archive_paths_reader = getattr(self.recorder, "archive_paths", None)
+        if not callable(archive_paths_reader):
+            return ()
+        archive_paths = tuple(archive_paths_reader())
+        if recording and archive_paths:
+            archive_paths = archive_paths[:-1]
+        if not archive_paths:
+            return ()
+
+        existing_by_path = {
+            self.timeline_store.resolve_video_path(segment).resolve(): segment
+            for segment in self.timeline_store.segments()
+        }
+        cursor_ms = int(session_started_at_ms)
+        published = []
+        for archive_path in archive_paths:
+            existing = existing_by_path.get(archive_path)
+            if existing is not None:
+                if (
+                    existing.media_started_at_ms is not None
+                    and existing.media_duration_ms is not None
+                ):
+                    cursor_ms = max(
+                        cursor_ms,
+                        existing.media_started_at_ms + existing.media_duration_ms,
+                    )
+                continue
+            media_duration_ms = self.duration_probe(archive_path)
+            if media_duration_ms is None or int(media_duration_ms) <= 0:
+                break
+            segment = self.timeline_store.add_completed_segment(
+                source_id=self.source_id,
+                camera_index=self.recorder.camera_index,
+                video_path=archive_path,
+                media_started_at_ms=cursor_ms,
+                media_duration_ms=int(media_duration_ms),
+                clock_source=DEFAULT_CLOCK_SOURCE,
+                timing_error_ms=self.timing_error_ms,
+                end_reason="continuous_archive_fallback",
+                race_id=str(race_id),
+            )
+            published.append(segment)
+            existing_by_path[archive_path] = segment
+            cursor_ms += int(media_duration_ms)
+        return tuple(published)
 
 
 class ReviewRingBuffer:
@@ -899,6 +1111,13 @@ class PassageReviewCoordinator:
     def get(self, event_id: str) -> PassageReviewWindow | None:
         return self._windows.get(str(event_id))
 
+    def discard(self, event_id: str) -> None:
+        event_id = str(event_id).strip()
+        if not event_id:
+            return
+        self._windows.pop(event_id, None)
+        self.ring_buffer.release(event_id)
+
 
 class PassageReviewTimelinePublisher:
     """Publish one sealed passage window as a short playable HLS timeline."""
@@ -1000,7 +1219,11 @@ class PassageReviewTimelinePublisher:
 
 
 __all__ = [
+    "ArchiveTimelinePublisher",
+    "ArchiveRecordingSession",
+    "ARCHIVE_SESSION_SCHEMA_VERSION",
     "DEFAULT_ARCHIVE_SEGMENT_SECONDS",
+    "DEFAULT_ARCHIVE_TIMING_ERROR_MS",
     "DEFAULT_REVIEW_POST_ROLL_SECONDS",
     "DEFAULT_REVIEW_PRE_ROLL_SECONDS",
     "DEFAULT_REVIEW_RETENTION_SECONDS",
@@ -1015,6 +1238,7 @@ __all__ = [
     "ReviewSegment",
     "discover_directshow_video_devices",
     "is_supported_review_source",
+    "load_archive_recording_sessions",
     "make_directshow_source",
     "parse_directshow_source",
 ]

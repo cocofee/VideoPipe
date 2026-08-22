@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from realtime.review_recorder import (
+    ArchiveTimelinePublisher,
     FfmpegReviewRecorder,
     PassageReviewCoordinator,
     PassageReviewState,
@@ -13,6 +14,7 @@ from realtime.review_recorder import (
     ReviewRingBuffer,
     discover_directshow_video_devices,
     is_supported_review_source,
+    load_archive_recording_sessions,
     make_directshow_source,
     parse_directshow_source,
 )
@@ -129,10 +131,110 @@ def test_review_recorder_uses_one_input_for_archive_and_short_hls(tmp_path):
     assert "program_date_time" in command[command.index("-hls_flags") + 1]
     assert playlist.parent.name == "camera_01"
     assert recorder.archive_pattern.parent.name == "videos"
+    assert recorder.session_started_at_ms == 1_787_313_600_000
     assert kwargs["stdout"] is not None
 
     recorder.stop()
     assert factory.process.stdin.getvalue() == b"q\n"
+
+
+def test_sealed_archive_remains_locatable_after_review_segments_expire(
+    tmp_path,
+):
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffmpeg.write_bytes(b"binary")
+    factory = _ProcessFactory()
+    recorder = FfmpegReviewRecorder(
+        "rtsp://camera/live",
+        tmp_path / "race",
+        camera_index=1,
+        ffmpeg_path=ffmpeg,
+        popen_factory=factory,
+        clock=lambda: datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc),
+    )
+    playlist = recorder.start()
+    assert recorder.archive_pattern is not None
+    sessions = load_archive_recording_sessions(tmp_path / "race")
+    assert len(sessions) == 1
+    assert sessions[0].camera_index == 1
+    assert sessions[0].session_started_at_ms == 1_787_313_600_000
+    assert sessions[0].archive_pattern == recorder.archive_pattern.resolve()
+    first_archive = Path(str(recorder.archive_pattern).replace("%04d", "0000"))
+    active_archive = Path(str(recorder.archive_pattern).replace("%04d", "0001"))
+    first_archive.write_bytes(b"sealed archive")
+    active_archive.write_bytes(b"active archive")
+    duration_probe = (
+        lambda path: 300_000 if Path(path) == first_archive else 120_000
+    )
+    timeline = VideoTimelineStore(tmp_path / "race" / "video_timeline.jsonl")
+    publisher = ArchiveTimelinePublisher(
+        recorder,
+        timeline,
+        duration_probe=duration_probe,
+    )
+
+    published = publisher.publish_completed(race_id="race-1", recording=True)
+
+    assert len(published) == 1
+    assert timeline.resolve_video_path(published[0]) == first_archive.resolve()
+    assert published[0].media_started_at_ms == 1_787_313_600_000
+    assert published[0].media_duration_ms == 300_000
+
+    recorder.stop()
+    final_published = publisher.publish_completed(
+        race_id="race-1",
+        recording=False,
+    )
+    assert len(final_published) == 1
+    assert timeline.resolve_video_path(final_published[0]) == active_archive.resolve()
+    assert final_published[0].media_started_at_ms == 1_787_313_900_000
+    assert final_published[0].media_duration_ms == 120_000
+
+    recovered_timeline = VideoTimelineStore(
+        tmp_path / "race" / "recovered_video_timeline.jsonl"
+    )
+    recovered_published = ArchiveTimelinePublisher(
+        sessions[0],
+        recovered_timeline,
+        duration_probe=duration_probe,
+    ).publish_completed(race_id="race-1", recording=False)
+    assert len(recovered_published) == 2
+    recovered_location = recovered_timeline.locate_passage(
+        1_787_313_960_000,
+        race_id="race-1",
+    )
+    assert recovered_location.status == "located"
+    assert recovered_location.locations[0].video_path == active_archive.resolve()
+    assert recovered_location.locations[0].passage_position_ms == 60_000
+
+    review_segment = playlist.parent / "expired.ts"
+    review_segment.write_bytes(b"short review")
+    playlist.write_text(
+        "\n".join(
+            (
+                "#EXTM3U",
+                "#EXT-X-PROGRAM-DATE-TIME:2026-08-21T12:01:58.000+00:00",
+                "#EXTINF:2.000,",
+                review_segment.name,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ring_buffer = ReviewRingBuffer(playlist, camera_index=1, retention_seconds=90)
+    ring_buffer.scan()
+    assert ring_buffer.cleanup(current_time_ms=1_787_313_840_000) == (
+        review_segment,
+    )
+
+    located = timeline.locate_passage(
+        1_787_313_720_000,
+        race_id="race-1",
+    )
+
+    assert located.status == "located"
+    assert located.locations[0].video_path == first_archive.resolve()
+    assert located.locations[0].passage_position_ms == 120_000
 
 
 def test_directshow_source_round_trips_installed_usb_camera_settings():

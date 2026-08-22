@@ -257,7 +257,8 @@ def _validate_source_camera_mapping(
         camera_to_source[camera_index] = source_id
 
     for segment in timeline_store.segments():
-        register(segment.source_id, segment.camera_index, segment.video_path)
+        if segment.clock_source == EXTERNAL_CLOCK_SOURCE:
+            register(segment.source_id, segment.camera_index, segment.video_path)
     for clip in clips:
         register(clip.source_id, clip.camera_index, str(clip.video_path))
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import inspect
 import socket
 import shutil
 import time
@@ -42,9 +43,12 @@ try:
         PassageEvent,
         PassageEventReceiver,
         PassageEventStore,
+        RaceFocus,
     )
     from .passage_review import PassageReviewDialog
+    from .race_metadata import RaceMetadata, RaceMetadataStore
     from .review_recorder import (
+        ArchiveTimelinePublisher,
         FfmpegReviewRecorder,
         PassageReviewCoordinator,
         PassageReviewState,
@@ -53,6 +57,7 @@ try:
         ReviewRingBuffer,
         discover_directshow_video_devices,
         is_supported_review_source,
+        load_archive_recording_sessions,
         make_directshow_source,
         parse_directshow_source,
     )
@@ -75,9 +80,12 @@ except ImportError:
         PassageEvent,
         PassageEventReceiver,
         PassageEventStore,
+        RaceFocus,
     )
     from passage_review import PassageReviewDialog
+    from race_metadata import RaceMetadata, RaceMetadataStore
     from review_recorder import (
+        ArchiveTimelinePublisher,
         FfmpegReviewRecorder,
         PassageReviewCoordinator,
         PassageReviewState,
@@ -86,6 +94,7 @@ except ImportError:
         ReviewRingBuffer,
         discover_directshow_video_devices,
         is_supported_review_source,
+        load_archive_recording_sessions,
         make_directshow_source,
         parse_directshow_source,
     )
@@ -295,6 +304,8 @@ class FinishReviewLaunchDialog(QDialog):
 
 class _PassageSignalBridge(QObject):
     accepted = pyqtSignal(object)
+    metadata_accepted = pyqtSignal(object)
+    focus_accepted = pyqtSignal(object)
 
 
 class FinishReviewWindow(PassageReviewDialog):
@@ -313,6 +324,7 @@ class FinishReviewWindow(PassageReviewDialog):
         review_retention_seconds: int = 90,
         timing_error_ms: int = DEFAULT_TIMING_ERROR_MS,
         refresh_interval_ms: int = 500,
+        passage_batch_interval_ms: int = 150,
         recorder_factory: Callable[..., FfmpegReviewRecorder] = FfmpegReviewRecorder,
         receiver_factory: Callable[..., PassageEventReceiver] = PassageEventReceiver,
         settings_saver: Callable[[FinishReviewSettings], None] | None = None,
@@ -333,8 +345,16 @@ class FinishReviewWindow(PassageReviewDialog):
         passage_store = PassageEventStore(
             self.output_dir / "cyclerace_passage_events.jsonl"
         )
+        metadata_store = RaceMetadataStore(
+            self.output_dir / "cyclerace_race_metadata.json"
+        )
         timeline_store = VideoTimelineStore(self.output_dir / "video_timeline.jsonl")
-        super().__init__(passage_store, timeline_store, parent)
+        super().__init__(
+            passage_store,
+            timeline_store,
+            parent,
+            metadata_store=metadata_store,
+        )
 
         self.setWindowTitle("VideoPipe 终点多源核对")
         self.setMinimumSize(1180, 760)
@@ -343,6 +363,10 @@ class FinishReviewWindow(PassageReviewDialog):
         self._ring_buffer: ReviewRingBuffer | None = None
         self._coordinator: PassageReviewCoordinator | None = None
         self._publisher: PassageReviewTimelinePublisher | None = None
+        self._archive_publishers = [
+            ArchiveTimelinePublisher(session, self.timeline_store)
+            for session in load_archive_recording_sessions(self.output_dir)
+        ]
         self._capture_windows: dict[str, PassageReviewWindow] = {}
         self._published_keys: set[tuple[str, int]] = set()
         self._unsupported_event_ids: set[str] = set()
@@ -355,12 +379,22 @@ class FinishReviewWindow(PassageReviewDialog):
         self._historical_passage_count = len(passage_store)
         self._received_passage_count = 0
         self._last_passage_monotonic = 0.0
+        self._pending_focus: RaceFocus | None = None
+        self._pending_passages: dict[str, PassageEvent] = {}
 
         self._signal_bridge = _PassageSignalBridge(self)
         self._signal_bridge.accepted.connect(self._on_passage_received)
+        self._signal_bridge.metadata_accepted.connect(self._on_metadata_received)
+        self._signal_bridge.focus_accepted.connect(self._on_focus_received)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(max(100, int(refresh_interval_ms)))
         self._refresh_timer.timeout.connect(self._refresh_capture_windows)
+        self._passage_batch_timer = QTimer(self)
+        self._passage_batch_timer.setSingleShot(True)
+        self._passage_batch_timer.setInterval(
+            max(0, int(passage_batch_interval_ms))
+        )
+        self._passage_batch_timer.timeout.connect(self._flush_passage_batch)
         self._clock_timer = QTimer(self)
         self._clock_timer.setInterval(1_000)
         self._clock_timer.timeout.connect(self._update_runtime_status)
@@ -368,6 +402,13 @@ class FinishReviewWindow(PassageReviewDialog):
         self._init_operator_controls()
         self.auto_advance_checkbox.setChecked(False)
         self.auto_advance_checkbox.hide()
+        try:
+            if self._publish_archive_segments():
+                self._lookup_cache.clear()
+                self.refresh()
+        except Exception as exc:  # noqa: BLE001 - recovery remains operator-visible.
+            self._capture_error = sanitize_recording_message(exc)
+            logger.exception("Failed to recover archived recording sessions")
         self._clock_timer.start()
         self._update_runtime_status()
 
@@ -397,6 +438,13 @@ class FinishReviewWindow(PassageReviewDialog):
         if event is not None:
             identity = event.bib.strip() or event.chip_id.strip()
             athlete_name = event.athlete_name.strip()
+        else:
+            identity = self.selected_identity_value.text().strip()
+            athlete_name = self.athlete_value.text().strip()
+            if identity == "--":
+                identity = ""
+            if athlete_name == "--":
+                athlete_name = ""
         athlete_summary = f"{identity} {athlete_name}".strip()
         label.setText(
             f"当前运动员：{athlete_summary}"
@@ -495,6 +543,8 @@ class FinishReviewWindow(PassageReviewDialog):
         output_changed = output_dir != self.output_dir
         if output_changed:
             self.stop_receiver()
+            self._passage_batch_timer.stop()
+            self._pending_passages.clear()
         self.source = str(settings.source).strip()
         self.passage_host = str(settings.passage_host).strip()
         self.passage_port = int(settings.passage_port)
@@ -504,6 +554,9 @@ class FinishReviewWindow(PassageReviewDialog):
             self.output_dir = output_dir
             self.passage_store = PassageEventStore(
                 output_dir / "cyclerace_passage_events.jsonl"
+            )
+            self.metadata_store = RaceMetadataStore(
+                output_dir / "cyclerace_race_metadata.json"
             )
             self.timeline_store = VideoTimelineStore(
                 output_dir / "video_timeline.jsonl"
@@ -516,6 +569,10 @@ class FinishReviewWindow(PassageReviewDialog):
             self._selected_event_id = ""
             self._capture_windows.clear()
             self._published_keys.clear()
+            self._archive_publishers = [
+                ArchiveTimelinePublisher(session, self.timeline_store)
+                for session in load_archive_recording_sessions(self.output_dir)
+            ]
             self._unsupported_event_ids.clear()
             self._historical_passage_count = len(self.passage_store)
             self._received_passage_count = 0
@@ -540,7 +597,7 @@ class FinishReviewWindow(PassageReviewDialog):
 
     def _import_high_speed_sidecar(self) -> None:
         try:
-            race_id = race_id_from_passage_store(self.passage_store)
+            race_id = self._current_archive_race_id()
         except ExternalClipImportError as exc:
             QMessageBox.information(self, "暂时无法导入", str(exc))
             return
@@ -695,11 +752,36 @@ class FinishReviewWindow(PassageReviewDialog):
     def start_receiver(self) -> None:
         if self._receiver is not None and self._receiver.is_running:
             return
+        receiver_kwargs = {
+            "on_accepted": self._signal_bridge.accepted.emit,
+        }
+        parameters = inspect.signature(self._receiver_factory).parameters.values()
+        supports_metadata = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ) or "metadata_store" in {
+            parameter.name for parameter in parameters
+        }
+        if supports_metadata:
+            receiver_kwargs.update(
+                metadata_store=self.metadata_store,
+                on_metadata_accepted=self._signal_bridge.metadata_accepted.emit,
+            )
+        supports_focus = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ) or "on_focus_accepted" in {
+            parameter.name for parameter in parameters
+        }
+        if supports_focus:
+            receiver_kwargs["on_focus_accepted"] = (
+                self._signal_bridge.focus_accepted.emit
+            )
         receiver = self._receiver_factory(
             self.passage_host,
             self.passage_port,
             self.passage_store,
-            on_accepted=self._signal_bridge.accepted.emit,
+            **receiver_kwargs,
         )
         try:
             receiver.start()
@@ -747,6 +829,7 @@ class FinishReviewWindow(PassageReviewDialog):
             ffmpeg_path=self.ffmpeg_path,
             review_retention_seconds=self.review_retention_seconds,
         )
+        archive_publisher = None
         try:
             playlist_path = recorder.start()
             ring_buffer = ReviewRingBuffer(
@@ -761,11 +844,18 @@ class FinishReviewWindow(PassageReviewDialog):
                 self.timeline_store,
                 timing_error_ms=self.timing_error_ms,
             )
+            archive_publisher = ArchiveTimelinePublisher(
+                recorder,
+                self.timeline_store,
+            )
             self._recorder = recorder
             self._ring_buffer = ring_buffer
             self._coordinator = coordinator
             self._publisher = publisher
-            for event in self.passage_store.events():
+            self._archive_publishers.append(archive_publisher)
+            for event in self._events_for_current_metadata(
+                self.passage_store.events()
+            ):
                 self._register_passage(event, scan=False)
             self._started = True
             self._recording_started_at = time.monotonic()
@@ -787,6 +877,11 @@ class FinishReviewWindow(PassageReviewDialog):
             self._ring_buffer = None
             self._coordinator = None
             self._publisher = None
+            if (
+                archive_publisher is not None
+                and archive_publisher in self._archive_publishers
+            ):
+                self._archive_publishers.remove(archive_publisher)
             raise
         finally:
             self._update_runtime_status()
@@ -804,6 +899,9 @@ class FinishReviewWindow(PassageReviewDialog):
         return timestamp_ms
 
     def _register_passage(self, event: PassageEvent, *, scan: bool = True) -> None:
+        if not event.is_active:
+            self._discard_registered_passage(event.event_id)
+            return
         coordinator = self._coordinator
         if coordinator is None:
             return
@@ -820,6 +918,13 @@ class FinishReviewWindow(PassageReviewDialog):
         )
         self._capture_windows[event.event_id] = window
         self._publish_window(window, event)
+
+    def _discard_registered_passage(self, event_id: str) -> None:
+        coordinator = self._coordinator
+        if coordinator is not None:
+            coordinator.discard(event_id)
+        self._capture_windows.pop(event_id, None)
+        self._unsupported_event_ids.discard(event_id)
 
     def _publish_window(
         self,
@@ -842,14 +947,101 @@ class FinishReviewWindow(PassageReviewDialog):
         self._received_passage_count += 1
         self._historical_passage_count = len(self.passage_store)
         self._last_passage_monotonic = time.monotonic()
+        self._pending_passages[event.event_id] = event
+        if not self._passage_batch_timer.isActive():
+            self._passage_batch_timer.start()
+        self._update_runtime_status()
+
+    def _flush_passage_batch(self) -> None:
+        pending_events = tuple(self._pending_passages.values())
+        self._pending_passages.clear()
+        if not pending_events:
+            self._update_runtime_status()
+            return
+        metadata = self.metadata_store.current()
+
+        def belongs_to_current_context(event: PassageEvent) -> bool:
+            return metadata is None or (
+                event.race_id == metadata.race_id
+                and event.stage_id == metadata.stage_id
+            )
+
         try:
-            self._register_passage(event)
-            self.refresh_events((event.event_id,))
+            active_events = tuple(
+                event
+                for event in pending_events
+                if event.is_active and belongs_to_current_context(event)
+            )
+            if active_events and self._ring_buffer is not None:
+                self._ring_buffer.scan()
+            archive_segments = (
+                self._publish_archive_segments() if active_events else ()
+            )
+            changed_event_ids = {event.event_id for event in pending_events}
+            for event in pending_events:
+                if event.is_active and belongs_to_current_context(event):
+                    self._register_passage(event, scan=False)
+                else:
+                    self._discard_registered_passage(event.event_id)
+            if archive_segments:
+                changed_event_ids.update(
+                    item.event_id
+                    for item in self._events_for_current_metadata(
+                        self.passage_store.events()
+                    )
+                )
+            self.refresh_events(changed_event_ids)
+            self._apply_pending_focus()
             self._capture_error = ""
         except Exception as exc:
             self._capture_error = sanitize_recording_message(exc)
             logger.exception("Failed to prepare passage review evidence")
         self._update_runtime_status()
+
+    def _on_metadata_received(self, metadata: RaceMetadata) -> None:
+        pending_focus = self._pending_focus
+        if pending_focus is not None and (
+            pending_focus.race_id != metadata.race_id
+            or pending_focus.stage_id != metadata.stage_id
+        ):
+            self._pending_focus = None
+        self._lookup_cache.clear()
+        self._selected_event_id = ""
+        for event_id in tuple(self._capture_windows):
+            event = self.passage_store.get(event_id)
+            if event is None or not event.is_active or (
+                event.race_id != metadata.race_id
+                or event.stage_id != metadata.stage_id
+            ):
+                self._discard_registered_passage(event_id)
+        self.refresh()
+        self._apply_pending_focus()
+        self._update_runtime_status()
+
+    def _on_focus_received(self, focus: RaceFocus) -> None:
+        self._pending_focus = focus
+        self._apply_pending_focus()
+
+    def _apply_pending_focus(self) -> bool:
+        focus = self._pending_focus
+        if focus is None:
+            return False
+        applied = self.focus_athlete(
+            focus.race_id,
+            focus.stage_id,
+            athlete_id=focus.athlete_id,
+            bib=focus.bib,
+            group_id=focus.group_id,
+        )
+        if applied:
+            self._update_operator_controls()
+        return applied
+
+    def _current_archive_race_id(self) -> str:
+        metadata = self.metadata_store.current()
+        if metadata is not None:
+            return metadata.race_id
+        return race_id_from_passage_store(self.passage_store)
 
     def _refresh_capture_windows(self) -> None:
         coordinator = self._coordinator
@@ -863,6 +1055,13 @@ class FinishReviewWindow(PassageReviewDialog):
             # Keep indexing completed camera segments even when no passage is
             # waiting, so device health and retention remain current.
             ring_buffer.scan()
+            if self._publish_archive_segments():
+                changed_event_ids.update(
+                    event.event_id
+                    for event in self._events_for_current_metadata(
+                        self.passage_store.events()
+                    )
+                )
             for window in coordinator.refresh(scan=False):
                 previous = self._capture_windows.get(window.event_id)
                 self._capture_windows[window.event_id] = window
@@ -887,6 +1086,36 @@ class FinishReviewWindow(PassageReviewDialog):
             logger.exception("Failed to refresh passage review capture")
         self._update_operator_controls()
         self._update_runtime_status()
+
+    def _publish_archive_segments(
+        self,
+        *,
+        race_id: str | None = None,
+        recording: bool | None = None,
+    ):
+        publishers = tuple(self._archive_publishers)
+        if not publishers:
+            return ()
+        if race_id is None:
+            try:
+                race_id = self._current_archive_race_id()
+            except ExternalClipImportError:
+                return ()
+        if recording is None:
+            recorder = self._recorder
+            recording = bool(recorder is not None and recorder.is_running)
+        published = []
+        for publisher in publishers:
+            publisher_recording = bool(
+                recording and publisher.recorder is self._recorder
+            )
+            published.extend(
+                publisher.publish_completed(
+                    race_id=str(race_id),
+                    recording=publisher_recording,
+                )
+            )
+        return tuple(published)
 
     def _update_runtime_status(self) -> None:
         beijing_now = datetime.now(timezone(timedelta(hours=8)))
@@ -947,13 +1176,35 @@ class FinishReviewWindow(PassageReviewDialog):
 
         receiver = self._receiver
         if receiver is not None and receiver.is_running:
-            if self._received_passage_count:
+            metadata = self.metadata_store.current()
+            pending_count = len(self._pending_passages)
+            if pending_count:
+                self.receiver_status_label.setText(
+                    "CycleRace: 正在补同步，"
+                    f"已接收 {self._received_passage_count}，待处理 {pending_count}"
+                )
+                self.receiver_status_label.setStyleSheet("color: #a56300;")
+                self.receiver_status_label.setToolTip(
+                    "通过记录已先写入本地审计日志，正在合并刷新录像定位和判读列表"
+                )
+            elif self._received_passage_count:
                 self.receiver_status_label.setText(
                     f"CycleRace: 本次已接收 {self._received_passage_count}"
                 )
                 self.receiver_status_label.setStyleSheet("color: #247a52;")
                 self.receiver_status_label.setToolTip(
                     "已收到CycleRace通过记录；当前协议没有持续心跳，不虚报长期在线"
+                )
+            elif metadata is not None:
+                race_label = metadata.race_name.strip() or metadata.race_id
+                stage_label = metadata.stage_name.strip() or metadata.stage_id
+                self.receiver_status_label.setText(
+                    f"CycleRace: 已同步 {race_label} / {stage_label}，等待通过"
+                )
+                self.receiver_status_label.setStyleSheet("color: #247a52;")
+                self.receiver_status_label.setToolTip(
+                    f"已读取 {len(metadata.groups)} 个组别、"
+                    f"{len(metadata.athletes)} 名运动员；等待真实通过时间"
                 )
             elif self._historical_passage_count:
                 self.receiver_status_label.setText(
@@ -1038,6 +1289,7 @@ class FinishReviewWindow(PassageReviewDialog):
             except RecordingError as exc:
                 self._runtime_error = sanitize_recording_message(exc)
             try:
+                self._publish_archive_segments(recording=False)
                 self._refresh_capture_windows()
             except Exception:
                 logger.exception("Failed to publish final review segments")
@@ -1061,6 +1313,8 @@ class FinishReviewWindow(PassageReviewDialog):
 
     def stop(self) -> None:
         self._refresh_timer.stop()
+        self._passage_batch_timer.stop()
+        self._pending_passages.clear()
         self.stop_recording()
         self.stop_receiver()
         self._update_runtime_status()

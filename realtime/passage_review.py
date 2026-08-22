@@ -44,6 +44,11 @@ try:
         PassageEvidenceAssociationStore,
     )
     from .passage_receiver import PassageEvent, PassageEventStore
+    from .race_metadata import (
+        RaceAthleteMetadata,
+        RaceMetadata,
+        RaceMetadataStore,
+    )
     from .video_playback import TargetTimelineSlider, VideoPlaybackWorker
     from .video_timeline import (
         DEFAULT_CLOCK_SOURCE,
@@ -60,6 +65,11 @@ except ImportError:
         PassageEvidenceAssociationStore,
     )
     from passage_receiver import PassageEvent, PassageEventStore
+    from race_metadata import (
+        RaceAthleteMetadata,
+        RaceMetadata,
+        RaceMetadataStore,
+    )
     from video_playback import TargetTimelineSlider, VideoPlaybackWorker
     from video_timeline import (
         DEFAULT_CLOCK_SOURCE,
@@ -889,6 +899,32 @@ class PassageEvidencePane(QFrame):
         self._worker = worker
         worker.start()
 
+    def clear_passage(self, message: str = "没有通过记录") -> None:
+        self._stop_worker()
+        self._event = None
+        self._location = None
+        self._association = None
+        self._pending_marker = None
+        self._identity = ""
+        self._target_position_ms = 0
+        self._playing = False
+        self._duration_ms = 0
+        self._fps = 0.0
+        self._source_width = 0
+        self._source_height = 0
+        self._current_frame_index = -1
+        self._current_position_ms = 0
+        self.timeline.setRange(0, 0)
+        self.timeline.setEnabled(False)
+        self.play_btn.setText("▶")
+        self.mark_btn.setText("标记")
+        self.status_label.setText("未选择通过记录")
+        self.time_label.setText("--:--:--.---")
+        self.video_view.set_marker_mode(False)
+        self.video_view.clear_marker()
+        self.video_label.clear_frame(message)
+        self._set_transport_enabled(False)
+
     def _on_metadata_ready(
         self,
         duration_ms: int,
@@ -1137,6 +1173,7 @@ class PassageReviewDialog(QDialog):
         clock_offset_ms: int = 0,
         pre_roll_ms: int = 3_000,
         association_store: Optional[PassageEvidenceAssociationStore] = None,
+        metadata_store: Optional[RaceMetadataStore] = None,
         open_location: Optional[
             Callable[[PassageEvent, PassageVideoLocation], None]
         ] = None,
@@ -1147,6 +1184,7 @@ class PassageReviewDialog(QDialog):
         self.association_store = association_store or PassageEvidenceAssociationStore(
             passage_store.journal_path.with_name("passage_evidence_associations.jsonl")
         )
+        self.metadata_store = metadata_store
         self.clock_offset_ms = int(clock_offset_ms)
         self.pre_roll_ms = max(0, int(pre_roll_ms))
         self._open_location = open_location
@@ -1167,6 +1205,7 @@ class PassageReviewDialog(QDialog):
         self._located_event_ids: set[str] = set()
         self._fully_ready_event_ids: set[str] = set()
         self._confirmed_event_ids: set[str] = set()
+        self._metadata_context_key: tuple[str, str] = ("", "")
 
         self.setWindowTitle("终点多源核对")
         self.resize(1400, 860)
@@ -1506,12 +1545,50 @@ class PassageReviewDialog(QDialog):
             return 0
         return int(max(candidates)[1])
 
+    def _current_metadata(self) -> Optional[RaceMetadata]:
+        if self.metadata_store is None:
+            return None
+        return self.metadata_store.current()
+
+    def _events_for_current_metadata(
+        self,
+        events: tuple[PassageEvent, ...],
+    ) -> tuple[PassageEvent, ...]:
+        metadata = self._current_metadata()
+        if metadata is None:
+            return events
+        return tuple(
+            event
+            for event in events
+            if event.race_id == metadata.race_id
+            and event.stage_id == metadata.stage_id
+        )
+
+    def _metadata_athlete_for_event(
+        self,
+        event: PassageEvent,
+    ) -> Optional[RaceAthleteMetadata]:
+        metadata = self._current_metadata()
+        if metadata is None:
+            return None
+        for athlete in metadata.athletes:
+            if event.athlete_id and athlete.athlete_id == event.athlete_id:
+                return athlete
+            if athlete.matches_identity(event.bib or event.chip_id):
+                return athlete
+        return None
+
     def _update_group_combo(self, events: tuple[PassageEvent, ...]) -> bool:
         previous_group = str(self.group_combo.currentData() or "")
         group_labels = {
             event.group_id: event.group_name.strip() or event.group_id
             for event in events
         }
+        metadata = self._current_metadata()
+        if metadata is not None:
+            group_labels.update(
+                {group.group_id: group.name for group in metadata.groups}
+            )
         expected_items = [
             (group_id, group_label)
             for group_id, group_label in sorted(
@@ -1588,10 +1665,25 @@ class PassageReviewDialog(QDialog):
 
     def refresh(self) -> None:
         previous_event_id = self._selected_event_id
-        events = self.passage_store.events()
+        metadata = self._current_metadata()
+        metadata_context_key = (
+            (metadata.race_id, metadata.stage_id)
+            if metadata is not None
+            else ("", "")
+        )
+        if metadata_context_key != self._metadata_context_key:
+            self._metadata_context_key = metadata_context_key
+            previous_event_id = ""
+            self.identity_search.clear()
+        events = self._events_for_current_metadata(self.passage_store.events())
         signature = self._timeline_cache_signature()
         if signature != self._timeline_signature:
             self._timeline_signature = signature
+            self._lookup_cache = {
+                event_id: cached
+                for event_id, cached in self._lookup_cache.items()
+                if cached[1].locations
+            }
 
         self._update_group_combo(events)
         selected_group = str(self.group_combo.currentData() or "")
@@ -1635,7 +1727,10 @@ class PassageReviewDialog(QDialog):
         changed_event_ids = {str(event_id) for event_id in event_ids if event_id}
         if not changed_event_ids:
             return
-        events = self.passage_store.events()
+        if len(changed_event_ids) > 64:
+            self.refresh()
+            return
+        events = self._events_for_current_metadata(self.passage_store.events())
         if self._update_group_combo(events):
             self.refresh()
             return
@@ -1643,6 +1738,11 @@ class PassageReviewDialog(QDialog):
         signature = self._timeline_cache_signature()
         if signature != self._timeline_signature:
             self._timeline_signature = signature
+            self._lookup_cache = {
+                event_id: cached
+                for event_id, cached in self._lookup_cache.items()
+                if cached[1].locations
+            }
         for event_id in changed_event_ids:
             self._lookup_cache.pop(event_id, None)
 
@@ -1776,17 +1876,41 @@ class PassageReviewDialog(QDialog):
             )
         self._selected_event_id = event.event_id
         identity = event.bib.strip() or event.chip_id.strip() or "未知"
-        athlete_name = event.athlete_name.strip() or "--"
-        team_name = event.team_name.strip() or "--"
+        metadata = self._current_metadata()
+        metadata_athlete = self._metadata_athlete_for_event(event)
+        athlete_name = event.athlete_name.strip() or (
+            metadata_athlete.name.strip() if metadata_athlete is not None else ""
+        ) or "--"
+        team_name = event.team_name.strip() or (
+            metadata_athlete.team_name.strip()
+            if metadata_athlete is not None
+            else ""
+        ) or "--"
         passage_time = format_passage_time(event.timeline_timestamp_ms)
         status = self._confirmation_status(
             regular_association,
             high_speed_association,
             review_status_text(lookup, regular, high_speed),
         )
-        self.race_value.setText(event.race_name.strip() or event.race_id)
-        self.stage_value.setText(event.stage_name.strip() or event.stage_id)
-        self.group_value.setText(event.group_name.strip() or event.group_id)
+        self.race_value.setText(
+            (metadata.race_name.strip() if metadata is not None else "")
+            or event.race_name.strip()
+            or event.race_id
+        )
+        self.stage_value.setText(
+            (metadata.stage_name.strip() if metadata is not None else "")
+            or event.stage_name.strip()
+            or event.stage_id
+        )
+        self.group_value.setText(
+            (
+                metadata.group_label(event.group_id)
+                if metadata is not None
+                else ""
+            )
+            or event.group_name.strip()
+            or event.group_id
+        )
         self.selected_identity_value.setText(identity)
         self.athlete_value.setText(athlete_name)
         self.team_value.setText(team_name)
@@ -1794,7 +1918,7 @@ class PassageReviewDialog(QDialog):
         self.selected_time_value.setText(passage_time)
         self.source_value.setText(status)
         athlete_summary = (
-            f"{identity} {event.athlete_name.strip()}".strip()
+            f"{identity} {athlete_name if athlete_name != '--' else ''}".strip()
         )
         self.current_passage_label.setText(f"当前运动员 {athlete_summary}")
         if not preserve_media:
@@ -1830,10 +1954,24 @@ class PassageReviewDialog(QDialog):
         self._set_sync_playing(False)
         self._shared_delta_ms = 0
         self._selected_event_id = ""
+        metadata = self._current_metadata()
+        self.race_value.setText(
+            (metadata.race_name.strip() or metadata.race_id)
+            if metadata is not None
+            else "--"
+        )
+        self.stage_value.setText(
+            (metadata.stage_name.strip() or metadata.stage_id)
+            if metadata is not None
+            else "--"
+        )
+        selected_group = str(self.group_combo.currentData() or "")
+        self.group_value.setText(
+            metadata.group_label(selected_group)
+            if metadata is not None and selected_group
+            else "--"
+        )
         for label in (
-            self.race_value,
-            self.stage_value,
-            self.group_value,
             self.selected_identity_value,
             self.athlete_value,
             self.team_value,
@@ -1843,11 +1981,147 @@ class PassageReviewDialog(QDialog):
             label.setText("--")
         self.current_passage_label.setText("未选择通过记录")
         self.current_time_label.setText("--:--:--.---")
-        self.regular_pane.shutdown()
-        self.high_speed_pane.shutdown()
-        self.regular_pane.video_label.clear_frame("没有通过记录")
-        self.high_speed_pane.video_label.clear_frame("没有通过记录")
+        self.regular_pane.clear_passage()
+        self.high_speed_pane.clear_passage()
         self._update_navigation_controls()
+
+    def focus_athlete(
+        self,
+        race_id: str,
+        stage_id: str,
+        *,
+        athlete_id: str = "",
+        bib: str = "",
+        group_id: str = "",
+    ) -> bool:
+        """Select the newest passage or show roster-only details without a modal."""
+
+        race_id = str(race_id).strip()
+        stage_id = str(stage_id).strip()
+        athlete_id = str(athlete_id).strip()
+        bib = str(bib).strip()
+        group_id = str(group_id).strip()
+        metadata = self._current_metadata()
+        if metadata is not None and (
+            metadata.race_id != race_id or metadata.stage_id != stage_id
+        ):
+            return False
+
+        events = tuple(
+            event
+            for event in self._events_for_current_metadata(self.passage_store.events())
+            if event.race_id == race_id and event.stage_id == stage_id
+        )
+        athlete_matches = (
+            [event for event in events if athlete_id and event.athlete_id == athlete_id]
+            if athlete_id
+            else []
+        )
+        matches = athlete_matches or [
+            event for event in events if bib and event.bib.strip() == bib
+        ]
+        if matches:
+            event = max(
+                matches,
+                key=lambda item: (
+                    item.timeline_timestamp_ms,
+                    item.sequence,
+                    item.revision,
+                ),
+            )
+            target_group = event.group_id or group_id
+            group_index = self.group_combo.findData(target_group)
+            if group_index >= 0 and group_index != self.group_combo.currentIndex():
+                self.group_combo.setCurrentIndex(group_index)
+            row = next(
+                (
+                    index
+                    for index, visible in enumerate(self._visible_events)
+                    if visible.event_id == event.event_id
+                ),
+                -1,
+            )
+            if row < 0:
+                self.refresh()
+                row = next(
+                    (
+                        index
+                        for index, visible in enumerate(self._visible_events)
+                        if visible.event_id == event.event_id
+                    ),
+                    -1,
+                )
+            if row < 0:
+                return False
+            self.table.blockSignals(True)
+            self.table.setCurrentCell(row, 0)
+            self.table.selectRow(row)
+            self.table.blockSignals(False)
+            item = self.table.item(row, 1)
+            if item is not None:
+                self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+            self._select_event(event.event_id)
+            return True
+
+        roster_athlete = None
+        if metadata is not None:
+            for candidate in metadata.athletes:
+                if athlete_id and candidate.athlete_id == athlete_id:
+                    roster_athlete = candidate
+                    break
+            if roster_athlete is None and bib:
+                roster_athlete = next(
+                    (
+                        candidate
+                        for candidate in metadata.athletes
+                        if candidate.bib.strip() == bib
+                    ),
+                    None,
+                )
+        target_group = (
+            roster_athlete.group_id if roster_athlete is not None else group_id
+        )
+        group_index = self.group_combo.findData(target_group)
+        if group_index >= 0 and group_index != self.group_combo.currentIndex():
+            self.group_combo.setCurrentIndex(group_index)
+        self.table.blockSignals(True)
+        self.table.clearSelection()
+        self.table.setCurrentCell(-1, -1)
+        self.table.blockSignals(False)
+        self._clear_selection_details()
+
+        identity = (
+            roster_athlete.bib.strip()
+            if roster_athlete is not None
+            else bib
+        ) or (
+            roster_athlete.chip_ids[0]
+            if roster_athlete is not None and roster_athlete.chip_ids
+            else athlete_id
+        )
+        athlete_name = (
+            roster_athlete.name.strip() if roster_athlete is not None else ""
+        )
+        team_name = (
+            roster_athlete.team_name.strip() if roster_athlete is not None else ""
+        )
+        if metadata is not None:
+            self.race_value.setText(metadata.race_name.strip() or metadata.race_id)
+            self.stage_value.setText(metadata.stage_name.strip() or metadata.stage_id)
+            self.group_value.setText(
+                metadata.group_label(target_group) if target_group else "--"
+            )
+        self.identity_search.setText(identity)
+        self.selected_identity_value.setText(identity or "--")
+        self.athlete_value.setText(athlete_name or "--")
+        self.team_value.setText(team_name or "--")
+        self.selected_time_value.setText("尚无通过记录")
+        self.source_value.setText("等待 CycleRace 通过时间")
+        athlete_summary = f"{identity} {athlete_name}".strip()
+        self.current_passage_label.setText(
+            f"名单运动员 {athlete_summary}（尚无通过记录）"
+        )
+        return bool(roster_athlete is not None or identity)
 
     def _begin_marking(self, pane: PassageEvidencePane) -> None:
         self._set_sync_playing(False)
@@ -2041,6 +2315,30 @@ class PassageReviewDialog(QDialog):
                 item = self.table.item(row, 1)
                 if item is not None:
                     self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                return
+        metadata = self._current_metadata()
+        if metadata is not None:
+            selected_group = str(self.group_combo.currentData() or "")
+            for athlete in metadata.athletes:
+                if selected_group and athlete.group_id != selected_group:
+                    continue
+                if not athlete.matches_identity(value):
+                    continue
+                identity = athlete.bib.strip() or (
+                    athlete.chip_ids[0] if athlete.chip_ids else "未知"
+                )
+                self.race_value.setText(metadata.race_name or metadata.race_id)
+                self.stage_value.setText(metadata.stage_name or metadata.stage_id)
+                self.group_value.setText(metadata.group_label(athlete.group_id))
+                self.selected_identity_value.setText(identity)
+                self.athlete_value.setText(athlete.name.strip() or "--")
+                self.team_value.setText(athlete.team_name.strip() or "--")
+                self.selected_time_value.setText("尚无通过记录")
+                self.source_value.setText("等待 CycleRace 通过时间")
+                athlete_summary = f"{identity} {athlete.name}".strip()
+                self.current_passage_label.setText(
+                    f"名单运动员 {athlete_summary}（尚无通过记录）"
+                )
                 return
         QMessageBox.information(self, "未找到", "当前组别没有该号码或芯片的通过记录。")
 

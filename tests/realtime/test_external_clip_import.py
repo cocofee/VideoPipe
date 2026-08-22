@@ -291,7 +291,7 @@ def test_rejects_inconsistent_source_camera_mapping(
     assert store.segments() == ()
 
 
-def test_rejects_external_source_reusing_an_existing_camera_index(tmp_path):
+def test_external_camera_index_can_match_regular_video_camera_index(tmp_path):
     clip = _clip(tmp_path, "external.mkv")
     store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
     live_path = tmp_path / "live.mkv"
@@ -304,6 +304,43 @@ def test_rejects_external_source_reusing_an_existing_camera_index(tmp_path):
     )
     store.finish_segment(segment.segment_id, ended_at_ms=2_000)
 
+    result = import_external_clip_sidecar(
+        store,
+        _write_sidecar(tmp_path, [clip]),
+        expected_race_id="race-1",
+        duration_probe=lambda _path: 3_000,
+    )
+
+    assert result.created_count == 1
+    assert [segment.camera_index for segment in store.segments()] == [1, 1]
+    assert [segment.source_id for segment in store.segments()] == [
+        "camera_01",
+        "high_speed_01",
+    ]
+
+
+def test_external_camera_index_remains_unique_within_high_speed_sources(tmp_path):
+    store = VideoTimelineStore(tmp_path / "video_timeline.jsonl")
+    existing_path = tmp_path / "existing.mkv"
+    existing_path.write_bytes(b"video")
+    store.add_completed_segment(
+        source_id="high_speed_01",
+        camera_index=1,
+        video_path=existing_path,
+        media_started_at_ms=1_000,
+        media_duration_ms=3_000,
+        clock_source=EXTERNAL_CLOCK_SOURCE,
+        timing_error_ms=20,
+        end_reason="external_clip_import",
+        race_id="race-1",
+    )
+    clip = _clip(
+        tmp_path,
+        "new.mkv",
+        source_id="high_speed_02",
+        camera_index=1,
+    )
+
     with pytest.raises(ExternalClipImportError, match="camera_index maps"):
         import_external_clip_sidecar(
             store,
@@ -311,8 +348,6 @@ def test_rejects_external_source_reusing_an_existing_camera_index(tmp_path):
             expected_race_id="race-1",
             duration_probe=lambda _path: 3_000,
         )
-
-    assert len(store.segments()) == 1
 
 
 def test_new_clip_is_appended_as_one_completed_journal_write(

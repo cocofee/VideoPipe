@@ -36,6 +36,7 @@ from PyQt5.QtWidgets import (
 )
 
 try:
+    from .auyat_rgb import AUYAT_CLOCK_SOURCE, AuyatRgbPlaybackWorker
     from .external_clip_import import EXTERNAL_CLOCK_SOURCE
     from .passage_evidence import (
         HIGH_SPEED_SOURCE,
@@ -57,6 +58,7 @@ try:
         VideoTimelineStore,
     )
 except ImportError:
+    from auyat_rgb import AUYAT_CLOCK_SOURCE, AuyatRgbPlaybackWorker
     from external_clip_import import EXTERNAL_CLOCK_SOURCE
     from passage_evidence import (
         HIGH_SPEED_SOURCE,
@@ -197,15 +199,9 @@ def source_location(
 
 
 def compact_source_status(location: Optional[PassageVideoLocation]) -> str:
-    if location is None:
-        return "未匹配"
-    if location.status == "located":
-        return "已定位"
-    if location.status == "near_boundary":
-        return "边界候选"
-    if location.status == "unverified":
-        return "范围未验证"
-    return _STATUS_TEXT.get(location.status, location.status)
+    if location is not None and location.status in _OPENABLE_STATUSES:
+        return "可查看"
+    return "无画面"
 
 
 def source_confirmation_status(
@@ -213,9 +209,7 @@ def source_confirmation_status(
     association: Optional[PassageEvidenceAssociation],
 ) -> str:
     if association is not None:
-        return "已确认"
-    if location is not None and location.status == "located":
-        return "待确认"
+        return "已标记"
     return compact_source_status(location)
 
 
@@ -223,19 +217,7 @@ def combined_review_status(
     regular: Optional[PassageVideoLocation],
     high_speed: Optional[PassageVideoLocation],
 ) -> str:
-    regular_ready = regular is not None and regular.status in _OPENABLE_STATUSES
-    high_speed_ready = (
-        high_speed is not None and high_speed.status in _OPENABLE_STATUSES
-    )
-    if regular_ready and high_speed_ready:
-        if "near_boundary" in {regular.status, high_speed.status}:
-            return "需核对"
-        return "双源就绪"
-    if regular_ready:
-        return "缺少高速"
-    if high_speed_ready:
-        return "缺少普通录像"
-    return "无可用证据"
+    return "芯片记录"
 
 
 def review_status_text(
@@ -243,10 +225,7 @@ def review_status_text(
     regular: Optional[PassageVideoLocation],
     high_speed: Optional[PassageVideoLocation],
 ) -> str:
-    status = combined_review_status(regular, high_speed)
-    if lookup.locations or lookup.status == "no_segments":
-        return status
-    return lookup_status_text(lookup)
+    return "芯片记录"
 
 
 class EvidenceImageView(QGraphicsView):
@@ -286,9 +265,11 @@ class EvidenceImageView(QGraphicsView):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._source_width = 0
         self._source_height = 0
+        self._frame_cache_key = 0
         self._fit_mode = True
         self._marker_mode = False
         self._marker: Optional[tuple[float, float, str, bool]] = None
+        self._marker_simple = False
         self._mouse_press_position: Optional[QPoint] = None
         self._mouse_dragged = False
         self._marker_dragging = False
@@ -332,11 +313,22 @@ class EvidenceImageView(QGraphicsView):
         source_width: int = 0,
         source_height: int = 0,
     ) -> None:
+        cache_key = int(image.cacheKey())
+        expected_source_width = max(image.width(), int(source_width or 0))
+        expected_source_height = max(image.height(), int(source_height or 0))
+        if (
+            self.has_frame
+            and cache_key == self._frame_cache_key
+            and expected_source_width == self._source_width
+            and expected_source_height == self._source_height
+        ):
+            return
         pixmap = QPixmap.fromImage(image)
         if pixmap.isNull():
             return
-        self._source_width = max(pixmap.width(), int(source_width or 0))
-        self._source_height = max(pixmap.height(), int(source_height or 0))
+        self._frame_cache_key = cache_key
+        self._source_width = max(pixmap.width(), expected_source_width)
+        self._source_height = max(pixmap.height(), expected_source_height)
         self._pixmap_item.setPixmap(pixmap)
         self._pixmap_item.setTransform(
             QTransform.fromScale(
@@ -353,6 +345,7 @@ class EvidenceImageView(QGraphicsView):
 
     def clear_frame(self, message: str = "") -> None:
         self._pixmap_item.setPixmap(QPixmap())
+        self._frame_cache_key = 0
         self._source_width = 0
         self._source_height = 0
         self.resetTransform()
@@ -414,6 +407,7 @@ class EvidenceImageView(QGraphicsView):
         label: str,
         *,
         confirmed: bool,
+        simple: bool = False,
     ) -> None:
         self._marker = (
             max(0.0, min(1.0, float(x_normalized))),
@@ -421,10 +415,12 @@ class EvidenceImageView(QGraphicsView):
             str(label),
             bool(confirmed),
         )
+        self._marker_simple = bool(simple)
         self.viewport().update()
 
     def clear_marker(self) -> None:
         self._marker = None
+        self._marker_simple = False
         self.viewport().update()
 
     def fit_to_window(self) -> None:
@@ -620,23 +616,25 @@ class EvidenceImageView(QGraphicsView):
         if self._marker is None or self._source_width <= 0 or self._source_height <= 0:
             return
         x_normalized, y_normalized, label, confirmed = self._marker
+        simple = self._marker_simple
         x = x_normalized * self._source_width
         y = y_normalized * self._source_height
         scale = max(0.001, abs(self.transform().m11()))
-        color = QColor("#1bbf83" if confirmed else "#ffb020")
+        color = QColor("#ffb020" if simple else "#1bbf83" if confirmed else "#ffb020")
         pen = QPen(color, 3)
         pen.setCosmetic(True)
-        if not confirmed:
+        if not confirmed and not simple:
             pen.setStyle(Qt.DashLine)
 
         painter.save()
         painter.setPen(pen)
         painter.drawLine(int(x), 0, int(x), self._source_height)
-        cross_extent = 22.0 / scale
-        painter.drawLine(int(x - cross_extent), int(y), int(x + cross_extent), int(y))
-        painter.drawLine(int(x), int(y - cross_extent), int(x), int(y + cross_extent))
+        if not simple:
+            cross_extent = 22.0 / scale
+            painter.drawLine(int(x - cross_extent), int(y), int(x + cross_extent), int(y))
+            painter.drawLine(int(x), int(y - cross_extent), int(x), int(y + cross_extent))
 
-        tag_text = label if confirmed else f"{label} 待确认"
+        tag_text = label if confirmed or simple else f"{label} 待确认"
         margin = 8.0 / scale
         tag_width = max(76.0, 20.0 + len(tag_text) * 22.0) / scale
         tag_height = 40.0 / scale
@@ -711,8 +709,8 @@ class PassageEvidencePane(QFrame):
         self._association: Optional[PassageEvidenceAssociation] = None
         self._pending_marker: Optional[tuple[float, float, int, int]] = None
         self._identity = ""
-        self._worker: Optional[VideoPlaybackWorker] = None
-        self._retired_workers: set[VideoPlaybackWorker] = set()
+        self._worker: Optional[object] = None
+        self._retired_workers: set[object] = set()
         self._target_position_ms = 0
         self._playing = False
         self._duration_ms = 0
@@ -844,6 +842,13 @@ class PassageEvidencePane(QFrame):
     def has_pending_marker(self) -> bool:
         return self._pending_marker is not None
 
+    @property
+    def is_auyat_rgb(self) -> bool:
+        return bool(
+            self._location is not None
+            and self._location.segment.clock_source == AUYAT_CLOCK_SOURCE
+        )
+
     def matches_passage_context(
         self,
         event: PassageEvent,
@@ -908,11 +913,28 @@ class PassageEvidencePane(QFrame):
         if self._current_frame_index < 0:
             return
         self.marking_requested.emit(self)
+        frame_index = self._current_frame_index
+        position_ms = self._current_position_ms
+        worker = self._worker
+        if self.is_auyat_rgb and worker is not None:
+            mapped_position = worker.position_ms_for_x(x_normalized)
+            if mapped_position is not None:
+                position_ms = int(mapped_position)
+                frame_index = max(
+                    0,
+                    min(
+                        self._source_width - 1,
+                        int(round(float(x_normalized) * (self._source_width - 1))),
+                    ),
+                )
+                self.passage_delta_requested.emit(
+                    position_ms - self._target_position_ms
+                )
         self._pending_marker = (
             float(x_normalized),
             float(y_normalized),
-            self._current_frame_index,
-            self._current_position_ms,
+            frame_index,
+            position_ms,
         )
         self._render_marker()
 
@@ -926,19 +948,23 @@ class PassageEvidencePane(QFrame):
 
     def _render_marker(self) -> None:
         marker = self._pending_marker
-        if marker is not None:
-            cue_status = "待确认"
-        elif self._association is not None:
-            cue_status = "已确认"
+        if self.is_auyat_rgb:
+            self.video_view.clear_identity_cue()
         else:
-            cue_status = "待判读"
-        self.video_view.set_identity_cue(self._identity, cue_status)
+            if marker is not None:
+                cue_status = "待确认"
+            elif self._association is not None:
+                cue_status = "已确认"
+            else:
+                cue_status = "待判读"
+            self.video_view.set_identity_cue(self._identity, cue_status)
         if marker is not None:
             self.video_view.set_marker(
                 marker[0],
                 marker[1],
                 self._identity,
                 confirmed=False,
+                simple=self.is_auyat_rgb,
             )
             return
         association = self._association
@@ -951,8 +977,25 @@ class PassageEvidencePane(QFrame):
                 association.marker_y_normalized,
                 self._identity,
                 confirmed=True,
+                simple=self.is_auyat_rgb,
             )
             return
+        if self.is_auyat_rgb and self._current_frame_index >= 0:
+            worker = self._worker
+            marker_x = (
+                worker.x_for_position_ms(self._current_position_ms)
+                if worker is not None
+                else None
+            )
+            if marker_x is not None:
+                self.video_view.set_marker(
+                    marker_x,
+                    0.5,
+                    self._identity,
+                    confirmed=False,
+                    simple=True,
+                )
+                return
         self.video_view.clear_marker()
 
     def set_passage(
@@ -963,16 +1006,9 @@ class PassageEvidencePane(QFrame):
         *,
         initial_delta_ms: int = 0,
     ) -> None:
-        previous_event_id = self._event.event_id if self._event is not None else ""
-        previous_segment_id = (
-            self._location.segment.segment_id if self._location is not None else ""
-        )
-        next_segment_id = location.segment.segment_id if location is not None else ""
-        same_context = (
-            previous_event_id == event.event_id
-            and bool(previous_segment_id)
-            and previous_segment_id == next_segment_id
-        )
+        previous_context = self._media_context(self._location)
+        next_context = self._media_context(location)
+        same_context = bool(previous_context) and previous_context == next_context
         self._event = event
         self._location = location
         self._identity = event.bib.strip() or "未知"
@@ -1028,6 +1064,8 @@ class PassageEvidencePane(QFrame):
             worker is not None
             and worker.isRunning()
             and worker.video_path == Path(location.video_path)
+            and str(getattr(worker, "media_locator", ""))
+            == str(location.media_locator)
         ):
             worker.pause()
             self.timeline.set_target_position(self._target_position_ms)
@@ -1045,7 +1083,11 @@ class PassageEvidencePane(QFrame):
         self.timeline.setRange(0, 0)
         self.timeline.setEnabled(False)
         self.timeline.setProperty("initial_delta_ms", int(initial_delta_ms))
-        worker = VideoPlaybackWorker(location.video_path, self)
+        worker = (
+            AuyatRgbPlaybackWorker(location, self)
+            if location.segment.clock_source == AUYAT_CLOCK_SOURCE
+            else VideoPlaybackWorker(location.video_path, self)
+        )
         worker.pause()
         worker.metadata_ready.connect(self._on_metadata_ready)
         worker.frame_ready.connect(self._on_frame_ready)
@@ -1054,6 +1096,17 @@ class PassageEvidencePane(QFrame):
         worker.playback_error.connect(self._on_playback_error)
         self._worker = worker
         worker.start()
+
+    @staticmethod
+    def _media_context(
+        location: Optional[PassageVideoLocation],
+    ) -> tuple[str, str]:
+        if location is None:
+            return ("", "")
+        return (
+            str(Path(location.video_path).absolute()),
+            str(location.media_locator or location.segment.segment_id),
+        )
 
     def clear_passage(self, message: str = "没有通过记录") -> None:
         self._stop_worker()
@@ -1272,8 +1325,13 @@ class PassageEvidencePane(QFrame):
         worker = self._worker
         if worker is None:
             return
+        bounds = self.available_delta_bounds()
+        if bounds is None:
+            return
+        lower, upper = bounds
+        clamped_delta_ms = max(lower, min(int(delta_ms), upper))
         worker.pause()
-        worker.seek(self._target_position_ms + int(delta_ms))
+        worker.seek(self._target_position_ms + clamped_delta_ms)
         self._playing = bool(linked_playing)
         self.play_btn.setText("Ⅱ" if self._playing else "▶")
 
@@ -1293,6 +1351,7 @@ class PassageEvidencePane(QFrame):
             enabled
             and self._location is not None
             and self._location.status in _OPENABLE_STATUSES
+            and self._location.segment.clock_source != AUYAT_CLOCK_SOURCE
         )
 
     def _request_open(self) -> None:
@@ -1354,6 +1413,9 @@ class PassageReviewDialog(QDialog):
         open_location: Optional[
             Callable[[PassageEvent, PassageVideoLocation], None]
         ] = None,
+        high_speed_locator: Optional[
+            Callable[[PassageEvent, int, int], Optional[PassageVideoLocation]]
+        ] = None,
     ):
         super().__init__(parent)
         self.passage_store = passage_store
@@ -1365,6 +1427,8 @@ class PassageReviewDialog(QDialog):
         self.clock_offset_ms = int(clock_offset_ms)
         self.pre_roll_ms = max(0, int(pre_roll_ms))
         self._open_location = open_location
+        self._high_speed_locator = high_speed_locator
+        self._external_location_revision = 0
         self._visible_events: list[PassageEvent] = []
         self._lookups: dict[str, PassageVideoLookup] = {}
         self._lookup_cache: dict[str, tuple[tuple, PassageVideoLookup]] = {}
@@ -1380,7 +1444,6 @@ class PassageReviewDialog(QDialog):
         self._maximized_pane: Optional[PassageEvidencePane] = None
         self._available_evidence_count = 0
         self._located_event_ids: set[str] = set()
-        self._fully_ready_event_ids: set[str] = set()
         self._confirmed_event_ids: set[str] = set()
         self._metadata_context_key: tuple[str, str] = ("", "")
 
@@ -1635,12 +1698,40 @@ class PassageReviewDialog(QDialog):
         self.refresh()
 
     def _lookup(self, event: PassageEvent) -> PassageVideoLookup:
-        return self.timeline_store.locate_passage(
+        lookup = self.timeline_store.locate_passage(
             event.timeline_timestamp_ms,
             clock_offset_ms=self.clock_offset_ms,
             pre_roll_ms=self.pre_roll_ms,
             race_id=event.race_id,
         )
+        if self._high_speed_locator is None:
+            return lookup
+        locations = [
+            location for location in lookup.locations if not is_high_speed(location)
+        ]
+        high_speed = self._high_speed_locator(
+            event,
+            self.clock_offset_ms,
+            self.pre_roll_ms,
+        )
+        if high_speed is not None:
+            locations.append(high_speed)
+        if any(location.status == "located" for location in locations):
+            status = "located"
+        elif any(location.status == "near_boundary" for location in locations):
+            status = "near_boundary"
+        else:
+            status = lookup.status
+        return PassageVideoLookup(
+            status,
+            event.timeline_timestamp_ms + self.clock_offset_ms,
+            tuple(locations),
+        )
+
+    def invalidate_external_locations(self) -> None:
+        self._external_location_revision += 1
+        self._lookup_cache.clear()
+        self.refresh()
 
     def _timeline_cache_signature(self) -> tuple:
         return tuple(
@@ -1663,6 +1754,7 @@ class PassageReviewDialog(QDialog):
             event.race_id,
             self.clock_offset_ms,
             self.pre_roll_ms,
+            self._external_location_revision,
         )
         cached = self._lookup_cache.get(event.event_id)
         if cached is not None and cached[0] == key:
@@ -1693,12 +1785,12 @@ class PassageReviewDialog(QDialog):
         fallback: str,
     ) -> str:
         if regular is not None and high_speed is not None:
-            return "双源确认"
+            return "双源标记"
         if regular is not None:
-            return "录像确认"
+            return "录像标记"
         if high_speed is not None:
-            return "高速确认"
-        return fallback
+            return "高速标记"
+        return "芯片记录"
 
     @staticmethod
     def _saved_delta_ms(
@@ -1737,12 +1829,22 @@ class PassageReviewDialog(QDialog):
     ) -> tuple[PassageEvent, ...]:
         metadata = self._current_metadata()
         if metadata is None:
-            return events
+            filtered = events
+        else:
+            filtered = tuple(
+                event
+                for event in events
+                if event.race_id == metadata.race_id
+                and event.stage_id == metadata.stage_id
+            )
         return tuple(
-            event
-            for event in events
-            if event.race_id == metadata.race_id
-            and event.stage_id == metadata.stage_id
+            sorted(
+                filtered,
+                key=lambda event: (
+                    event.timeline_timestamp_ms,
+                    event.event_id,
+                ),
+            )
         )
 
     def _metadata_athlete_for_event(
@@ -1829,7 +1931,7 @@ class PassageReviewDialog(QDialog):
             metadata_athlete.name.strip() if metadata_athlete is not None else ""
         ) or "--"
         values = (
-            str(event.sequence),
+            str(row + 1),
             identity,
             athlete_name,
             event.group_name.strip() or event.group_id,
@@ -1887,7 +1989,6 @@ class PassageReviewDialog(QDialog):
         self.table.blockSignals(True)
         self.table.setRowCount(len(self._visible_events))
         self._located_event_ids.clear()
-        self._fully_ready_event_ids.clear()
         self._confirmed_event_ids.clear()
         selected_row = -1
         for row, event in enumerate(self._visible_events):
@@ -2015,24 +2116,14 @@ class PassageReviewDialog(QDialog):
     @staticmethod
     def _status_color(value: str) -> QColor:
         if value in {
-            "已定位",
-            "已确认",
-            "双源就绪",
-            "录像确认",
-            "高速确认",
-            "双源确认",
+            "已标记",
+            "录像标记",
+            "高速标记",
+            "双源标记",
         }:
             return QColor("#16845b")
-        if value in {"待确认", "边界候选", "需核对", "范围未验证"}:
-            return QColor("#a56300")
-        if value in {
-            "未匹配",
-            "缺少高速",
-            "缺少普通录像",
-            "无可用证据",
-            "录像文件缺失",
-        }:
-            return QColor("#c53f45")
+        if value == "可查看":
+            return QColor("#276d9b")
         return QColor("#526170")
 
     def _on_table_selection_changed(self) -> None:
@@ -2404,7 +2495,7 @@ class PassageReviewDialog(QDialog):
         event_id: str,
         regular: Optional[PassageVideoLocation],
         high_speed: Optional[PassageVideoLocation],
-        readiness_status: str,
+        _readiness_status: str,
         regular_association: Optional[PassageEvidenceAssociation],
         high_speed_association: Optional[PassageEvidenceAssociation],
     ) -> None:
@@ -2415,11 +2506,6 @@ class PassageReviewDialog(QDialog):
                 location is not None and location.status in _OPENABLE_STATUSES
                 for location in (regular, high_speed)
             ),
-        )
-        self._set_membership(
-            self._fully_ready_event_ids,
-            event_id,
-            readiness_status == "双源就绪",
         )
         self._set_membership(
             self._confirmed_event_ids,
@@ -2436,18 +2522,15 @@ class PassageReviewDialog(QDialog):
 
     def _discard_summary_state(self, event_id: str) -> None:
         self._located_event_ids.discard(event_id)
-        self._fully_ready_event_ids.discard(event_id)
         self._confirmed_event_ids.discard(event_id)
 
     def _render_summary(self) -> None:
         located_count = len(self._located_event_ids)
-        fully_ready_count = len(self._fully_ready_event_ids)
         confirmed_count = len(self._confirmed_event_ids)
         self.summary_label.setText(
             f"共 {len(self.passage_store)} 条 passage，"
             f"当前显示 {len(self._visible_events)} 条；"
-            f"{located_count} 条有可用证据，{fully_ready_count} 条双源就绪；"
-            f"{confirmed_count} 条已人工确认；"
+            f"{located_count} 条有画面，{confirmed_count} 条已人工标记；"
             f"时钟偏移 {self.clock_offset_ms:+d} ms"
         )
         self._available_evidence_count = located_count
@@ -2456,7 +2539,6 @@ class PassageReviewDialog(QDialog):
         lookup = self._lookups.get(event_id)
         if lookup is None:
             return False
-        available_sources = []
         for high_speed, source_kind in (
             (False, REGULAR_SOURCE),
             (True, HIGH_SPEED_SOURCE),
@@ -2464,11 +2546,9 @@ class PassageReviewDialog(QDialog):
             location = source_location(lookup, high_speed=high_speed)
             if location is None or location.status not in _OPENABLE_STATUSES:
                 continue
-            available_sources.append((source_kind, location))
-        return bool(available_sources) and all(
-            self._source_association(event_id, source_kind, location) is not None
-            for source_kind, location in available_sources
-        )
+            if self._source_association(event_id, source_kind, location) is not None:
+                return True
+        return False
 
     def _cancel_pending_marker(self, pane: PassageEvidencePane) -> None:
         pane.cancel_marker_edit()
@@ -2591,10 +2671,8 @@ class PassageReviewDialog(QDialog):
         ]
         if not bounds:
             return None
-        lower = max(value[0] for value in bounds)
-        upper = min(value[1] for value in bounds)
-        if lower > upper:
-            return None
+        lower = min(value[0] for value in bounds)
+        upper = max(value[1] for value in bounds)
         return lower, upper
 
     def _seek_both_delta(self, delta_ms: int) -> None:

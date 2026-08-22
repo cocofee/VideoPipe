@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -56,6 +57,7 @@ def test_review_settings_round_trip_installed_usb_source(tmp_path):
         passage_host="127.0.0.1",
         passage_port=18765,
         camera_index=1,
+        high_speed_dir=Path(r"\\FINISH-RGB\AuyatData"),
     )
 
     save_review_settings(config_path, settings)
@@ -68,7 +70,8 @@ def test_review_settings_round_trip_installed_usb_source(tmp_path):
     )
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
+    assert payload["high_speed_dir"] == str(settings.high_speed_dir)
     assert payload["output_dir"] == str(settings.output_dir)
     assert payload["camera_index"] == 1
     assert loaded.source == source
@@ -76,6 +79,7 @@ def test_review_settings_round_trip_installed_usb_source(tmp_path):
     assert loaded.passage_host == "0.0.0.0"
     assert loaded.passage_port == 20000
     assert loaded.camera_index == 2
+    assert loaded.high_speed_dir == settings.high_speed_dir
 
 
 def test_review_settings_keep_legacy_rtsp_configuration(tmp_path):

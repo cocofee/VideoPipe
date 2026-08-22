@@ -11,6 +11,7 @@ from pathlib import Path
 
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
+from realtime.auyat_rgb import discover_auyat_root
 from realtime.passage_receiver import DEFAULT_HOST, DEFAULT_PORT
 from realtime.review_recorder import (
     is_supported_review_source,
@@ -41,6 +42,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="保存指定录像源供日常启动使用，然后退出",
     )
     parser.add_argument("--output", help="赛事数据目录")
+    parser.add_argument(
+        "--high-speed-dir",
+        help="高速摄像电脑共享的原厂数据目录，可使用 UNC 路径",
+    )
     parser.add_argument("--passage-host", default=DEFAULT_HOST)
     parser.add_argument("--passage-port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--camera-index", type=int)
@@ -100,10 +105,12 @@ def load_review_settings(
     passage_host: str,
     passage_port: int,
     camera_index: int | None,
+    high_speed_dir: Path | None = None,
 ) -> FinishReviewSettings:
     source = ""
     saved_output_dir = None
     saved_camera_index = None
+    saved_high_speed_dir = None
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
         candidate = str(payload.get("source") or "").strip()
@@ -115,6 +122,9 @@ def load_review_settings(
         camera_candidate = int(payload.get("camera_index", 0))
         if camera_candidate > 0:
             saved_camera_index = camera_candidate
+        high_speed_candidate = str(payload.get("high_speed_dir") or "").strip()
+        if high_speed_candidate:
+            saved_high_speed_dir = Path(high_speed_candidate).expanduser().absolute()
     except (OSError, TypeError, ValueError):
         pass
     return FinishReviewSettings(
@@ -123,16 +133,24 @@ def load_review_settings(
         passage_host=passage_host,
         passage_port=passage_port,
         camera_index=camera_index or saved_camera_index or 1,
+        high_speed_dir=(
+            high_speed_dir
+            or saved_high_speed_dir
+            or discover_auyat_root()
+        ),
     )
 
 
 def save_review_settings(config_path: Path, settings: FinishReviewSettings) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_version": 3,
+        "schema_version": 4,
         "source": settings.source,
         "output_dir": str(settings.output_dir),
         "camera_index": settings.camera_index,
+        "high_speed_dir": (
+            str(settings.high_speed_dir) if settings.high_speed_dir is not None else ""
+        ),
     }
     temporary_path = config_path.with_suffix(config_path.suffix + ".tmp")
     with temporary_path.open("wb") as output:
@@ -170,6 +188,11 @@ def main(argv: list[str] | None = None) -> int:
         passage_host=args.passage_host,
         passage_port=args.passage_port,
         camera_index=args.camera_index,
+        high_speed_dir=(
+            Path(args.high_speed_dir).expanduser().absolute()
+            if args.high_speed_dir
+            else None
+        ),
     )
     if args.install_source:
         settings = FinishReviewSettings(
@@ -178,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
             passage_host=args.passage_host,
             passage_port=args.passage_port,
             camera_index=args.camera_index or saved_settings.camera_index,
+            high_speed_dir=saved_settings.high_speed_dir,
         )
         try:
             save_review_settings(config_path, settings)
@@ -197,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
             if source_override
             else saved_settings.camera_index
         ),
+        high_speed_dir=saved_settings.high_speed_dir,
     )
 
     window = FinishReviewWindow(
@@ -205,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         passage_host=settings.passage_host,
         passage_port=settings.passage_port,
         camera_index=settings.camera_index,
+        high_speed_dir=settings.high_speed_dir,
         ffmpeg_path=Path(ffmpeg_path) if ffmpeg_path else None,
         settings_saver=lambda updated: save_review_settings(config_path, updated),
     )

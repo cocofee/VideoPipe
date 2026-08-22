@@ -9,7 +9,7 @@ import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
@@ -32,12 +32,13 @@ from PyQt5.QtWidgets import (
 )
 
 try:
-    from .external_clip_import import (
-        EXTERNAL_CLOCK_SOURCE,
-        ExternalClipImportError,
-        import_external_clip_sidecar,
-        race_id_from_passage_store,
+    from .auyat_rgb import (
+        AuyatRgbCatalog,
+        AuyatRgbScanWorker,
+        AuyatScanResult,
+        is_network_share,
     )
+    from .external_clip_import import ExternalClipImportError, race_id_from_passage_store
     from .passage_evidence import PassageEvidenceAssociationStore
     from .passage_receiver import (
         DEFAULT_HOST,
@@ -47,7 +48,7 @@ try:
         PassageEventStore,
         RaceFocus,
     )
-    from .passage_review import PassageReviewDialog
+    from .passage_review import PassageReviewDialog, source_location
     from .race_metadata import RaceMetadata, RaceMetadataStore
     from .review_recorder import (
         ArchiveTimelinePublisher,
@@ -69,12 +70,13 @@ try:
     )
     from .video_timeline import DEFAULT_TIMING_ERROR_MS, VideoTimelineStore
 except ImportError:
-    from external_clip_import import (
-        EXTERNAL_CLOCK_SOURCE,
-        ExternalClipImportError,
-        import_external_clip_sidecar,
-        race_id_from_passage_store,
+    from auyat_rgb import (
+        AuyatRgbCatalog,
+        AuyatRgbScanWorker,
+        AuyatScanResult,
+        is_network_share,
     )
+    from external_clip_import import ExternalClipImportError, race_id_from_passage_store
     from passage_evidence import PassageEvidenceAssociationStore
     from passage_receiver import (
         DEFAULT_HOST,
@@ -84,7 +86,7 @@ except ImportError:
         PassageEventStore,
         RaceFocus,
     )
-    from passage_review import PassageReviewDialog
+    from passage_review import PassageReviewDialog, source_location
     from race_metadata import RaceMetadata, RaceMetadataStore
     from review_recorder import (
         ArchiveTimelinePublisher,
@@ -108,6 +110,20 @@ except ImportError:
 
 
 logger = logging.getLogger("VideoPipe.FinishReview")
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+HIGH_SPEED_INDEX_FILENAME = ".videopipe_auyat_index.json"
+
+
+def _high_speed_target_dates(events: tuple[PassageEvent, ...]) -> frozenset[date]:
+    dates = {
+        datetime.fromtimestamp(
+            event.timeline_timestamp_ms / 1000.0,
+            tz=BEIJING_TIMEZONE,
+        ).date()
+        for event in events
+        if event.timeline_timestamp_ms >= 86_400_000
+    }
+    return frozenset(dates or {datetime.now(BEIJING_TIMEZONE).date()})
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +133,7 @@ class FinishReviewSettings:
     passage_host: str
     passage_port: int
     camera_index: int
+    high_speed_dir: Path | None = None
 
 
 class FinishReviewLaunchDialog(QDialog):
@@ -136,6 +153,11 @@ class FinishReviewLaunchDialog(QDialog):
         self._passage_host = settings.passage_host
         self._passage_port = settings.passage_port
         self._camera_index = settings.camera_index
+        self._high_speed_dir = (
+            Path(settings.high_speed_dir).expanduser().absolute()
+            if settings.high_speed_dir is not None
+            else None
+        )
         self._ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path else None
         self._detected_device_names: set[str] = set()
         self._device_provider = device_provider or (
@@ -196,6 +218,35 @@ class FinishReviewLaunchDialog(QDialog):
         browse_button.clicked.connect(self._browse_output_dir)
         output_row.addWidget(browse_button)
         form.addRow("录像证据保存", output_row)
+
+        high_speed_row = QHBoxLayout()
+        high_speed_row.setSpacing(6)
+        self.high_speed_edit = QLineEdit(
+            str(self._high_speed_dir) if self._high_speed_dir is not None else "",
+            self,
+        )
+        self.high_speed_edit.setPlaceholderText(r"\\高速摄像电脑\AuyatData")
+        self.high_speed_edit.setToolTip(
+            "正式比赛请填写另一台高速摄像电脑的只读共享目录，"
+            "例如 \\\\FINISH-RGB\\AuyatData"
+        )
+        high_speed_row.addWidget(self.high_speed_edit, 1)
+        high_speed_browse_button = QPushButton(self)
+        high_speed_browse_button.setIcon(
+            self.style().standardIcon(QStyle.SP_DirOpenIcon)
+        )
+        high_speed_browse_button.setToolTip("选择高速摄像电脑的局域网共享目录")
+        high_speed_browse_button.setFixedWidth(42)
+        high_speed_browse_button.clicked.connect(self._browse_high_speed_dir)
+        high_speed_row.addWidget(high_speed_browse_button)
+        form.addRow("高速电脑共享目录", high_speed_row)
+        high_speed_hint = QLabel(
+            "正式比赛从另一台高速摄像电脑读取；本机目录仅用于单机测试。",
+            self,
+        )
+        high_speed_hint.setStyleSheet("color: #667085;")
+        high_speed_hint.setWordWrap(True)
+        form.addRow("", high_speed_hint)
 
         cycle_status = QLabel(
             f"自动发现本机“{socket.gethostname()}”，"
@@ -284,6 +335,16 @@ class FinishReviewLaunchDialog(QDialog):
             self._output_dir = Path(selected).resolve()
             self.output_edit.setText(str(self._output_dir))
 
+    def _browse_high_speed_dir(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择原厂高速摄像数据目录",
+            str(self._high_speed_dir or self._output_dir),
+        )
+        if selected:
+            self._high_speed_dir = Path(selected).absolute()
+            self.high_speed_edit.setText(str(self._high_speed_dir))
+
     @property
     def settings(self) -> FinishReviewSettings:
         selected = str(self.device_combo.currentData() or "").strip()
@@ -295,12 +356,18 @@ class FinishReviewLaunchDialog(QDialog):
                 video_size=self.video_size_combo.currentData(),
                 framerate=self.framerate_combo.currentData(),
             )
+        high_speed_value = self.high_speed_edit.text().strip()
         return FinishReviewSettings(
             source=source,
             output_dir=self._output_dir,
             passage_host=self._passage_host,
             passage_port=self._passage_port,
             camera_index=self._camera_index,
+            high_speed_dir=(
+                Path(high_speed_value).expanduser().absolute()
+                if high_speed_value
+                else None
+            ),
         )
 
 
@@ -322,6 +389,7 @@ class FinishReviewWindow(PassageReviewDialog):
         passage_host: str = DEFAULT_HOST,
         passage_port: int = DEFAULT_PORT,
         camera_index: int = 1,
+        high_speed_dir: str | Path | None = None,
         ffmpeg_path: Path | None = None,
         review_retention_seconds: int = 90,
         timing_error_ms: int = DEFAULT_TIMING_ERROR_MS,
@@ -337,6 +405,11 @@ class FinishReviewWindow(PassageReviewDialog):
         self.passage_host = str(passage_host).strip()
         self.passage_port = int(passage_port)
         self.camera_index = max(1, int(camera_index))
+        self.high_speed_dir = (
+            Path(high_speed_dir).expanduser().absolute()
+            if high_speed_dir is not None and str(high_speed_dir).strip()
+            else None
+        )
         self.ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path else None
         self.review_retention_seconds = max(6, int(review_retention_seconds))
         self.timing_error_ms = max(0, int(timing_error_ms))
@@ -351,11 +424,18 @@ class FinishReviewWindow(PassageReviewDialog):
             self.output_dir / "cyclerace_race_metadata.json"
         )
         timeline_store = VideoTimelineStore(self.output_dir / "video_timeline.jsonl")
+        self._high_speed_catalog = AuyatRgbCatalog(
+            self.high_speed_dir,
+            cache_path=self.output_dir / HIGH_SPEED_INDEX_FILENAME,
+            target_dates=_high_speed_target_dates(passage_store.events()),
+        )
+        self._high_speed_scan_result = self._high_speed_catalog.snapshot()
         super().__init__(
             passage_store,
             timeline_store,
             parent,
             metadata_store=metadata_store,
+            high_speed_locator=self._locate_high_speed,
         )
 
         self.setWindowTitle("VideoPipe 终点多源核对")
@@ -402,6 +482,13 @@ class FinishReviewWindow(PassageReviewDialog):
         self._clock_timer.timeout.connect(self._update_runtime_status)
         self._init_runtime_status()
         self._init_operator_controls()
+        self._high_speed_scan_worker = AuyatRgbScanWorker(
+            self._high_speed_catalog,
+            self,
+        )
+        self._high_speed_scan_worker.scan_finished.connect(
+            self._on_high_speed_scan_finished
+        )
         self.auto_advance_checkbox.setChecked(False)
         self.auto_advance_checkbox.hide()
         try:
@@ -412,6 +499,8 @@ class FinishReviewWindow(PassageReviewDialog):
             self._capture_error = sanitize_recording_message(exc)
             logger.exception("Failed to recover archived recording sessions")
         self._clock_timer.start()
+        if self.high_speed_dir is not None:
+            self._high_speed_scan_worker.start()
         self._update_runtime_status()
 
     @property
@@ -422,13 +511,61 @@ class FinishReviewWindow(PassageReviewDialog):
     def receiver(self) -> PassageEventReceiver | None:
         return self._receiver
 
+    def _locate_high_speed(
+        self,
+        event: PassageEvent,
+        clock_offset_ms: int,
+        pre_roll_ms: int,
+    ):
+        return self._high_speed_catalog.locate(
+            event.timeline_timestamp_ms,
+            race_id=event.race_id,
+            clock_offset_ms=clock_offset_ms,
+            pre_roll_ms=pre_roll_ms,
+        )
+
+    def _on_high_speed_scan_finished(self, result: AuyatScanResult) -> None:
+        self._high_speed_scan_result = result
+        if result.changed:
+            self.invalidate_external_locations()
+        self._update_runtime_status()
+
+    def _request_high_speed_scan(self) -> None:
+        self._high_speed_scan_result = self._high_speed_catalog.snapshot()
+        if self.high_speed_dir is None:
+            self._update_runtime_status()
+            return
+        if not self._high_speed_scan_worker.isRunning():
+            self._high_speed_scan_worker.start()
+        else:
+            self._high_speed_scan_worker.request_scan()
+
+    def _include_high_speed_event_date(self, event: PassageEvent) -> None:
+        timestamp_ms = self._passage_timestamp(event)
+        if timestamp_ms is None:
+            return
+        event_date = datetime.fromtimestamp(
+            timestamp_ms / 1000.0,
+            tz=BEIJING_TIMEZONE,
+        ).date()
+        dates = self._high_speed_catalog.target_dates
+        if event_date in dates:
+            return
+        if self._high_speed_catalog.set_target_dates((*dates, event_date)):
+            self.invalidate_external_locations()
+            self._request_high_speed_scan()
+
     def _select_event(self, event_id: str) -> None:
         super()._select_event(event_id)
         self._update_operator_controls()
+        if hasattr(self, "high_speed_status_label"):
+            self._update_runtime_status()
 
     def _clear_selection_details(self) -> None:
         super()._clear_selection_details()
         self._update_operator_controls()
+        if hasattr(self, "high_speed_status_label"):
+            self._update_runtime_status()
 
     def _update_operator_controls(self) -> None:
         label = getattr(self, "operator_identity_label", None)
@@ -540,6 +677,7 @@ class FinishReviewWindow(PassageReviewDialog):
                 passage_host=self.passage_host,
                 passage_port=self.passage_port,
                 camera_index=self.camera_index,
+                high_speed_dir=self.high_speed_dir,
             ),
             self,
             ffmpeg_path=self.ffmpeg_path,
@@ -559,6 +697,16 @@ class FinishReviewWindow(PassageReviewDialog):
         self.passage_host = str(settings.passage_host).strip()
         self.passage_port = int(settings.passage_port)
         self.camera_index = max(1, int(settings.camera_index))
+        next_high_speed_dir = (
+            Path(settings.high_speed_dir).expanduser().absolute()
+            if settings.high_speed_dir is not None
+            and str(settings.high_speed_dir).strip()
+            else None
+        )
+        high_speed_changed = next_high_speed_dir != self.high_speed_dir
+        if high_speed_changed:
+            self.high_speed_dir = next_high_speed_dir
+            self._high_speed_catalog.set_root(next_high_speed_dir)
         if output_changed:
             output_dir.mkdir(parents=True, exist_ok=True)
             self.output_dir = output_dir
@@ -597,6 +745,15 @@ class FinishReviewWindow(PassageReviewDialog):
                     "CycleRace监听未启动",
                     self._runtime_error,
                 )
+            self._high_speed_catalog.set_cache_path(
+                output_dir / HIGH_SPEED_INDEX_FILENAME
+            )
+            self._high_speed_catalog.set_target_dates(
+                _high_speed_target_dates(self.passage_store.events())
+            )
+        if high_speed_changed or output_changed:
+            self.invalidate_external_locations()
+            self._request_high_speed_scan()
         if self._settings_saver is not None:
             try:
                 self._settings_saver(settings)
@@ -604,39 +761,6 @@ class FinishReviewWindow(PassageReviewDialog):
                 QMessageBox.warning(self, "设置未保存", str(exc))
         self._runtime_error = ""
         self._update_runtime_status()
-
-    def _import_high_speed_sidecar(self) -> None:
-        try:
-            race_id = self._current_archive_race_id()
-        except ExternalClipImportError as exc:
-            QMessageBox.information(self, "暂时无法导入", str(exc))
-            return
-        sidecar_path, _selected_filter = QFileDialog.getOpenFileName(
-            self,
-            "导入高速摄像北京时间 sidecar",
-            str(self.output_dir),
-            "JSON sidecar (*.json);;所有文件 (*)",
-        )
-        if not sidecar_path:
-            return
-        try:
-            result = import_external_clip_sidecar(
-                self.timeline_store,
-                sidecar_path,
-                expected_race_id=race_id,
-            )
-        except ExternalClipImportError as exc:
-            QMessageBox.warning(self, "高速摄像导入失败", str(exc))
-            return
-        self._lookup_cache.clear()
-        self.refresh()
-        self._update_runtime_status()
-        QMessageBox.information(
-            self,
-            "高速摄像导入完成",
-            f"新增 {result.created_count} 段，修复 {result.repaired_count} 段，"
-            f"跳过重复 {result.duplicate_count} 段。",
-        )
 
     def _init_runtime_status(self) -> None:
         panel = QFrame(self)
@@ -691,9 +815,6 @@ class FinishReviewWindow(PassageReviewDialog):
         self.settings_button = QPushButton("设备设置", panel)
         self.settings_button.clicked.connect(self._configure_devices)
         layout.addWidget(self.settings_button)
-        self.import_high_speed_button = QPushButton("导入高速", panel)
-        self.import_high_speed_button.clicked.connect(self._import_high_speed_sidecar)
-        layout.addWidget(self.import_high_speed_button)
         self.record_button = QPushButton("开始录像", panel)
         self.record_button.setObjectName("finishRecordButton")
         self.record_button.clicked.connect(self._toggle_recording)
@@ -826,6 +947,7 @@ class FinishReviewWindow(PassageReviewDialog):
                     "CycleRace监听未启动",
                     sanitize_recording_message(exc),
                 )
+        self._high_speed_scan_worker.request_scan()
         self._update_runtime_status()
 
     def start_recording(self) -> None:
@@ -964,6 +1086,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._received_passage_count += 1
         self._historical_passage_count = len(self.passage_store)
         self._last_passage_monotonic = time.monotonic()
+        self._include_high_speed_event_date(event)
         self._pending_passages[event.event_id] = event
         if not self._passage_batch_timer.isActive():
             self._passage_batch_timer.start()
@@ -1247,20 +1370,67 @@ class FinishReviewWindow(PassageReviewDialog):
                 self._receiver_error or "CycleRace接收服务未启动"
             )
 
-        high_speed_count = sum(
-            segment.clock_source == EXTERNAL_CLOCK_SOURCE
-            for segment in self.timeline_store.segments()
+        high_speed_result = self._high_speed_scan_result
+        high_speed_root = self._high_speed_catalog.root
+        selected_lookup = self._lookups.get(self._selected_event_id)
+        selected_high_speed = (
+            source_location(selected_lookup, high_speed=True)
+            if selected_lookup is not None
+            else None
         )
-        if high_speed_count:
+        high_speed_remote = is_network_share(high_speed_root)
+        if high_speed_root is None:
+            self.high_speed_status_label.setText("高速摄像: 未配置共享目录")
+            self.high_speed_status_label.setStyleSheet("color: #b54747;")
+        elif high_speed_result.status == "checking":
             self.high_speed_status_label.setText(
-                f"高速摄像: 已导入 {high_speed_count} 段"
+                "高速摄像: 正在连接共享目录"
+                if high_speed_remote
+                else "高速摄像: 正在检查本机测试目录"
+            )
+            self.high_speed_status_label.setStyleSheet("color: #a56300;")
+        elif high_speed_result.status == "unavailable":
+            self.high_speed_status_label.setText(
+                "高速摄像: 共享目录未连接"
+                if high_speed_remote
+                else "高速摄像: 本机测试目录不可用"
+            )
+            self.high_speed_status_label.setStyleSheet("color: #b54747;")
+        elif self._selected_event_id and selected_high_speed is not None:
+            self.high_speed_status_label.setText("高速摄像: 当前有画面")
+            self.high_speed_status_label.setStyleSheet("color: #247a52;")
+        elif high_speed_result.waiting_file_count:
+            self.high_speed_status_label.setText(
+                "高速摄像: 共享目录已连接，等待封口"
+                if high_speed_remote
+                else "高速摄像: 本机测试目录已连接，等待封口"
+            )
+            self.high_speed_status_label.setStyleSheet("color: #a56300;")
+        elif high_speed_result.status == "waiting":
+            self.high_speed_status_label.setText(
+                "高速摄像: 共享目录已连接，等待高速画面"
+                if high_speed_remote
+                else "高速摄像: 本机测试目录已连接，等待高速画面"
+            )
+            self.high_speed_status_label.setStyleSheet("color: #a56300;")
+        elif self._selected_event_id:
+            self.high_speed_status_label.setText("高速摄像: 当前无画面")
+            self.high_speed_status_label.setStyleSheet("color: #667085;")
+        else:
+            self.high_speed_status_label.setText(
+                f"高速摄像: {'共享目录' if high_speed_remote else '本机测试目录'}"
+                f"已连接，{len(high_speed_result.captures)} 段"
             )
             self.high_speed_status_label.setStyleSheet("color: #247a52;")
-        else:
-            self.high_speed_status_label.setText("高速摄像: 等待导入")
-            self.high_speed_status_label.setStyleSheet("color: #a56300;")
         self.high_speed_status_label.setToolTip(
-            "无厂商硬件接口时只报告北京时间sidecar导入状态"
+            "\n".join(
+                value
+                for value in (
+                    str(high_speed_root or "未配置高速摄像共享目录"),
+                    high_speed_result.message,
+                )
+                if value
+            )
         )
 
         try:
@@ -1295,7 +1465,6 @@ class FinishReviewWindow(PassageReviewDialog):
             self.capture_status_label.setStyleSheet(
                 "color: #667085; font-weight: 500;"
             )
-        self.import_high_speed_button.setEnabled(bool(self.passage_store.events()))
         self._update_operator_controls()
 
     def stop_recording(self) -> None:
@@ -1328,17 +1497,28 @@ class FinishReviewWindow(PassageReviewDialog):
                 logger.warning("Failed to stop CycleRace receiver: %s", exc)
         self._update_runtime_status()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self._refresh_timer.stop()
         self._passage_batch_timer.stop()
         self._pending_passages.clear()
+        worker = getattr(self, "_high_speed_scan_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.stop()
+            if not worker.wait(1_000):
+                return False
         self.stop_recording()
         self.stop_receiver()
         self._update_runtime_status()
+        return True
 
     def closeEvent(self, event) -> None:
         self._clock_timer.stop()
-        self.stop()
+        if not self.stop():
+            event.ignore()
+            self.setEnabled(False)
+            self.setWindowTitle("VideoPipe 终点多源核对 - 正在停止高速目录扫描")
+            QTimer.singleShot(100, self.close)
+            return
         super().closeEvent(event)
 
 

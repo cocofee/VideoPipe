@@ -1,4 +1,6 @@
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar
 
@@ -98,10 +100,18 @@ class _FakeRecorder:
             / f"camera_{self.camera_index:02d}"
         )
         buffer_dir.mkdir(parents=True, exist_ok=True)
-        entries = (
-            ("before.ts", "2026-08-22T11:59:58.000+00:00"),
-            ("finish.ts", "2026-08-22T12:00:00.000+00:00"),
-            ("after.ts", "2026-08-22T12:00:02.000+00:00"),
+        self.passage_timestamp_ms = int(time.time() * 1000.0) + 1_000
+        entries = tuple(
+            (
+                filename,
+                datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+                .isoformat(timespec="milliseconds"),
+            )
+            for filename, timestamp_ms in (
+                ("before.ts", self.passage_timestamp_ms - 3_000),
+                ("finish.ts", self.passage_timestamp_ms - 1_000),
+                ("after.ts", self.passage_timestamp_ms + 1_000),
+            )
         )
         lines = ["#EXTM3U", "#EXT-X-VERSION:6"]
         for filename, started_at in entries:
@@ -172,6 +182,16 @@ class _FakeReceiver:
 
 
 def _event(*, absolute=True, **overrides):
+    recorder_timestamp_ms = (
+        getattr(_FakeRecorder.instances[-1], "passage_timestamp_ms", None)
+        if _FakeRecorder.instances
+        else None
+    )
+    passage_timestamp_ms = (
+        recorder_timestamp_ms or int(time.time() * 1000.0)
+        if absolute
+        else None
+    )
     values = dict(
         event_id="race-1-stage-1-passage-15",
         race_id="race-1",
@@ -181,9 +201,9 @@ def _event(*, absolute=True, **overrides):
         chip_id="chip-15",
         bib="15",
         passage_time_ms=43_201_000,
-        passage_timestamp_ms=1_787_400_001_000 if absolute else None,
+        passage_timestamp_ms=passage_timestamp_ms,
         lap=1,
-        emitted_at_ms=1_787_400_001_100,
+        emitted_at_ms=(passage_timestamp_ms or 0) + 100,
         race_name="2026 城市自行车赛",
         stage_name="第一赛段",
         group_name="男子公开组",
@@ -248,7 +268,7 @@ def test_formal_console_starts_receives_and_publishes_review(qapp, tmp_path):
     assert window.stage_value.text() == "第一赛段"
     assert window.group_value.text() == "男子公开组"
     assert window.operator_identity_label.text() == "当前运动员：15 张三"
-    assert window.table.item(0, 6).text() == "待确认"
+    assert window.table.item(0, 6).text() == "可查看"
     assert len(window.timeline_store.segments()) == 1
     assert "可核对 1" in window.capture_status_label.text()
 
@@ -478,6 +498,9 @@ def test_device_settings_show_required_controls_without_receiver_values(qapp, tm
         for widget in dialog.findChildren(widget_type)
     )
     assert "录像证据保存" in visible_text
+    assert "高速电脑共享目录" in visible_text
+    assert "另一台高速摄像电脑" in visible_text
+    assert "本机目录仅用于单机测试" in visible_text
     assert "比赛数据" not in visible_text
     assert "无需共享目录、无需填写IP" in visible_text
     for forbidden in ("RTSP", "0.0.0.0", "18765", "端口", "机位"):
@@ -583,7 +606,8 @@ def test_capture_error_remains_visible_while_recording(qapp, tmp_path):
 
 def test_existing_timeline_evidence_is_counted_after_reopening(qapp, tmp_path):
     passage_store = PassageEventStore(tmp_path / "cyclerace_passage_events.jsonl")
-    passage_store.append(_event())
+    event = _event()
+    passage_store.append(event)
     video_path = tmp_path / "race_video" / "camera_01.mkv"
     video_path.parent.mkdir(parents=True)
     video_path.write_bytes(b"video")
@@ -592,13 +616,13 @@ def test_existing_timeline_evidence_is_counted_after_reopening(qapp, tmp_path):
         source_id="camera_01",
         camera_index=1,
         video_path=video_path,
-        started_at_ms=1_787_400_000_000,
+        started_at_ms=event.timeline_timestamp_ms - 1_000,
         race_id="race-1",
     )
     timeline_store.finish_segment(
         segment.segment_id,
-        ended_at_ms=1_787_400_004_000,
-        media_started_at_ms=1_787_400_000_000,
+        ended_at_ms=event.timeline_timestamp_ms + 3_000,
+        media_started_at_ms=event.timeline_timestamp_ms - 1_000,
         media_duration_ms=4_000,
     )
 
@@ -660,7 +684,7 @@ def test_formal_console_opens_before_recording_and_exposes_operator_controls(
     assert window.receiver.is_running
     assert window.record_button.text() == "开始录像"
     assert window.settings_button.text() == "设备设置"
-    assert window.import_high_speed_button.text() == "导入高速"
+    assert not hasattr(window, "import_high_speed_button")
     assert window.receiver_status_label.text() == "CycleRace: 等待数据"
     assert window.capture_status_label.y() > window.camera_status_label.y()
     assert window.capture_status_label.width() >= window.capture_status_label.sizeHint().width()

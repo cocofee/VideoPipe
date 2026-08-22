@@ -75,6 +75,7 @@ class PassageVideoLocation:
     clock_offset_ms: int
     timing_error_ms: int
     status: str
+    media_locator: str = ""
 
 
 @dataclass(frozen=True, slots=True)

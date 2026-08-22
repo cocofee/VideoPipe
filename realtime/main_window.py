@@ -113,6 +113,8 @@ try:
     from .video_playback import VideoPlaybackDialog, find_recordings
     from .passage_receiver import DEFAULT_HOST, DEFAULT_PORT, PassageEventReceiver, PassageEventStore
     from .passage_review import PassageReviewDialog, lookup_status_text
+    from .racetiger_source import RaceTigerClient, RaceTigerError, RaceTigerSource, RaceTigerStatus, parse_beijing_timestamp
+    from .video_supplement import VideoSupplementStore, parse_beijing_datetime
     from .video_timeline import VideoTimelineError, VideoTimelineStore
     from .camera_clock import camera_clock_check_required, check_hikvision_camera_clock
     from .external_clip_import import (
@@ -147,6 +149,8 @@ except ImportError:
     from video_playback import VideoPlaybackDialog, find_recordings
     from passage_receiver import DEFAULT_HOST, DEFAULT_PORT, PassageEventReceiver, PassageEventStore
     from passage_review import PassageReviewDialog, lookup_status_text
+    from racetiger_source import RaceTigerClient, RaceTigerError, RaceTigerSource, RaceTigerStatus, parse_beijing_timestamp
+    from video_supplement import VideoSupplementStore, parse_beijing_datetime
     from video_timeline import VideoTimelineError, VideoTimelineStore
     from camera_clock import camera_clock_check_required, check_hikvision_camera_clock
     from external_clip_import import (
@@ -2565,6 +2569,7 @@ class MainWindow(QMainWindow):
     log_signal = pyqtSignal(str)
     field_issue_saved_signal = pyqtSignal(object)
     passage_received_signal = pyqtSignal(object)
+    timing_status_signal = pyqtSignal(object)
 
     def __init__(
         self,
@@ -2591,6 +2596,7 @@ class MainWindow(QMainWindow):
         self.log_signal.connect(self._on_log_received_ui)
         self.field_issue_saved_signal.connect(self._on_field_issue_saved_ui)
         self.passage_received_signal.connect(self._on_passage_received_ui)
+        self.timing_status_signal.connect(self._on_timing_status_ui)
 
         # 组件 (支持多摄像头)
         self.readers = {}         # source_id -> StreamReader
@@ -2622,7 +2628,9 @@ class MainWindow(QMainWindow):
         self._latest_frame_observations: Dict[int, tuple[list, list]] = {}
 
         self.passage_receiver: Optional[PassageEventReceiver] = None
+        self.racetiger_source: Optional[RaceTigerSource] = None
         self.passage_event_store: Optional[PassageEventStore] = None
+        self.video_supplement_store: Optional[VideoSupplementStore] = None
         self.video_timeline_store: Optional[VideoTimelineStore] = None
         self.passage_review_dialog: Optional[PassageReviewDialog] = None
         self._external_clip_import_thread: Optional[ExternalClipProbeThread] = None
@@ -2630,6 +2638,18 @@ class MainWindow(QMainWindow):
         self._external_clip_import_context = None
         self.external_clip_action: Optional[QAction] = None
         self._latest_passage_event = None
+        self._timing_provider = str(config.get("timing_provider", "cyclerace") or "cyclerace").strip().lower()
+        self.config["timing_provider"] = self._timing_provider
+        self._racetiger_base_url = str(config.get("racetiger_base_url", "") or "").strip()
+        self._racetiger_pc = str(config.get("racetiger_pc", "") or "").strip()
+        self._racetiger_rid = str(config.get("racetiger_rid", "") or "").strip()
+        self._racetiger_token = str(config.get("racetiger_token", "") or "").strip()
+        try:
+            self._racetiger_poll_interval = max(
+                0.5, float(config.get("racetiger_poll_interval_seconds", 2.0))
+            )
+        except (TypeError, ValueError):
+            self._racetiger_poll_interval = 2.0
         self._passage_receiver_enabled = bool(config.get("passage_receiver_enabled", False))
         self._passage_receiver_host = str(
             config.get("passage_receiver_host") or DEFAULT_HOST
@@ -2879,6 +2899,27 @@ class MainWindow(QMainWindow):
         self.config.update(runtime_config)
         self.config['output_dir'] = str(race_dir)
         self._sync_passage_video_config()
+        self._timing_provider = str(
+            self.config.get("timing_provider", "cyclerace") or "cyclerace"
+        ).strip().lower()
+        self._racetiger_base_url = str(
+            self.config.get("racetiger_base_url", "") or ""
+        ).strip()
+        self._racetiger_pc = str(
+            self.config.get("racetiger_pc", "") or ""
+        ).strip()
+        self._racetiger_rid = str(
+            self.config.get("racetiger_rid", "") or ""
+        ).strip()
+        self._racetiger_token = str(
+            self.config.get("racetiger_token", "") or ""
+        ).strip()
+        try:
+            self._racetiger_poll_interval = max(
+                0.5, float(self.config.get("racetiger_poll_interval_seconds", 2.0))
+            )
+        except (TypeError, ValueError):
+            self._racetiger_poll_interval = 2.0
         self.sport_profile = normalize_sport_profile(self.config.get('sport_profile', 'cycling'))
         self.config['sport_profile'] = self.sport_profile
         self._gate_guard_enabled = True
@@ -2937,6 +2978,9 @@ class MainWindow(QMainWindow):
             self.live_event_review.clear_event()
         self._load_video_timeline()
         self._start_passage_receiver()
+        self.video_supplement_store = VideoSupplementStore(
+            self.output_dir / "video_supplements.jsonl"
+        )
         if self._yolo_only_mode:
             self.ocr_manager = None
         elif not self.ocr_manager:
@@ -2954,6 +2998,8 @@ class MainWindow(QMainWindow):
             self.race_name_label.setText(race_dir.name)
         if hasattr(self, "passage_review_btn"):
             self.passage_review_btn.setEnabled(True)
+        if hasattr(self, "video_supplement_btn"):
+            self.video_supplement_btn.setEnabled(True)
         self._refresh_evidence_ui()
         self.statusBar().showMessage(f"当前赛事: {race_dir.name}")
 
@@ -3120,7 +3166,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.race_name_label)
         header_layout.addStretch()
 
-        self.cyclerace_status_label = QLabel("CycleRace: 等待赛事")
+        self.cyclerace_status_label = QLabel("计时源: 等待赛事")
         self.cyclerace_status_label.setStyleSheet("color: #667085; font-size: 12px; font-weight: 600;")
         header_layout.addWidget(self.cyclerace_status_label)
         self.evidence_status_label = QLabel("录像证据: 等待赛事")
@@ -3134,6 +3180,12 @@ class MainWindow(QMainWindow):
         self.passage_review_btn.setToolTip("按号码快速核对普通录像和高速摄像")
         self.passage_review_btn.clicked.connect(self._show_passage_review)
         header_layout.addWidget(self.passage_review_btn)
+        self.video_supplement_btn = QPushButton("视频补录")
+        self.video_supplement_btn.setObjectName("settings_btn")
+        self.video_supplement_btn.setEnabled(False)
+        self.video_supplement_btn.setToolTip("记录赛虎没有对应芯片的录像观察")
+        self.video_supplement_btn.clicked.connect(self._add_video_supplement)
+        header_layout.addWidget(self.video_supplement_btn)
         self.external_clip_btn = QPushButton("导入高速")
         self.external_clip_btn.setObjectName("settings_btn")
         self.external_clip_btn.setEnabled(False)
@@ -4086,6 +4138,9 @@ class MainWindow(QMainWindow):
     def _start_passage_receiver(self):
         MainWindow._stop_passage_receiver(self, reset_status=False)
         self._latest_passage_event = None
+        if self._timing_provider == "racetiger":
+            self._start_racetiger_source()
+            return
         journal_path = self.output_dir / "cyclerace_passage_events.jsonl"
         try:
             store = PassageEventStore(journal_path)
@@ -4142,15 +4197,80 @@ class MainWindow(QMainWindow):
             )
             logger.exception("[Main] 启动 CycleRace passage 接收失败: %s", exc)
 
+    def _start_racetiger_source(self):
+        journal_path = self.output_dir / "racetiger_passage_events.jsonl"
+        try:
+            store = PassageEventStore(journal_path)
+            self.passage_event_store = store
+            missing = [
+                name
+                for name, value in (
+                    ("racetiger_base_url", self._racetiger_base_url),
+                    ("racetiger_pc", self._racetiger_pc),
+                    ("racetiger_rid", self._racetiger_rid),
+                    ("racetiger_token", self._racetiger_token),
+                )
+                if not value
+            ]
+            if missing:
+                self._set_passage_receiver_status(
+                    "赛虎: 未配置",
+                    "#b54747",
+                    "请在赛事 config.json 中配置: " + ", ".join(missing),
+                )
+                return
+            client = RaceTigerClient(
+                self._racetiger_base_url,
+                self._racetiger_token,
+                pc=self._racetiger_pc,
+                rid=self._racetiger_rid,
+            )
+            source = RaceTigerSource(
+                client,
+                store,
+                race_id=f"racetiger:{self.output_dir.name}",
+                poll_interval_seconds=self._racetiger_poll_interval,
+                on_event=self._on_passage_received,
+                on_status=self._on_racetiger_status,
+            )
+            self.racetiger_source = source
+            source.start()
+            self._set_passage_receiver_status(
+                f"赛虎: 正在读取 {len(store)} 条",
+                "#247a52",
+                f"POST {self._racetiger_base_url}/Dif/*；已保存 {len(store)} 条",
+            )
+        except Exception as exc:
+            self.passage_event_store = None
+            self._set_passage_receiver_status("赛虎: 启动失败", "#b54747", str(exc))
+            logger.exception("[Main] RaceTiger source start failed: %s", exc)
+
+    def _on_racetiger_status(self, status: RaceTigerStatus):
+        self.timing_status_signal.emit(status)
+
+    def _on_timing_status_ui(self, status):
+        if isinstance(status, RaceTigerStatus):
+            color = "#247a52" if status.state == "ok" else "#b54747"
+            self._set_passage_receiver_status(status.message, color, status.message)
+            return
+        self._set_passage_receiver_status(str(status), "#667085", str(status))
+
     def _stop_passage_receiver(self, *, reset_status=True):
         receiver = getattr(self, "passage_receiver", None)
+        racetiger_source = getattr(self, "racetiger_source", None)
         self.passage_receiver = None
+        self.racetiger_source = None
         self.passage_event_store = None
         if receiver is not None:
             try:
                 receiver.stop()
             except Exception as exc:
                 logger.warning("[Main] 停止 CycleRace passage 接收失败: %s", exc)
+        if racetiger_source is not None:
+            try:
+                racetiger_source.stop()
+            except Exception as exc:
+                logger.warning("[Main] Stop RaceTiger source failed: %s", exc)
         if reset_status:
             MainWindow._set_passage_receiver_status(
                 self,
@@ -4185,8 +4305,13 @@ class MainWindow(QMainWindow):
             f"revision {event.revision}；{video_status}；"
             f"时钟偏移 {self._passage_clock_offset_ms:+d} ms",
         )
+        provider_label = (
+            "赛虎"
+            if getattr(self, "_timing_provider", "cyclerace") == "racetiger"
+            else "CycleRace"
+        )
         self.statusBar().showMessage(
-            f"收到 CycleRace 通过记录: {identity}（第 {event.sequence} 条）",
+            f"收到 {provider_label} 通过记录: {identity}",
             3000,
         )
         dialog = self.passage_review_dialog
@@ -4201,6 +4326,8 @@ class MainWindow(QMainWindow):
         )
 
     def _set_passage_receiver_status(self, text, color, tooltip):
+        if getattr(self, "_timing_provider", "cyclerace") == "racetiger" and str(text).startswith("CycleRace"):
+            text = str(text).replace("CycleRace", "赛虎", 1)
         label = getattr(self, "cyclerace_status_label", None)
         if label is None:
             return
@@ -4246,6 +4373,48 @@ class MainWindow(QMainWindow):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def _add_video_supplement(self):
+        if not self._race_ready:
+            QMessageBox.warning(self, "提示", "请先打开赛事。")
+            return
+        store = getattr(self, "video_supplement_store", None)
+        if store is None:
+            QMessageBox.warning(self, "无法补录", "当前赛事的视频补录存储不可用。")
+            return
+        bib, accepted = QInputDialog.getText(
+            self,
+            "视频补录",
+            "号码或临时编号：",
+        )
+        if not accepted:
+            return
+        observed_at, accepted = QInputDialog.getText(
+            self,
+            "视频补录",
+            "通过北京时间（YYYY-MM-DD HH:MM:SS.mmm）：",
+        )
+        if not accepted:
+            return
+        observed_at_ms = parse_beijing_datetime(observed_at)
+        if observed_at_ms is None:
+            QMessageBox.warning(self, "补录失败", "北京时间格式无效。")
+            return
+        note, accepted = QInputDialog.getText(self, "视频补录", "备注（可选）：")
+        if not accepted:
+            return
+        try:
+            item = store.append(
+                bib=bib,
+                observed_at_ms=observed_at_ms,
+                note=note,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            QMessageBox.warning(self, "补录失败", str(error))
+            return
+        message = f"已保存视频补录：{item.bib or '未知'}，不影响赛虎正式成绩。"
+        self.statusBar().showMessage(message, 5000)
+        logger.info("[Main] Video supplement saved: id=%s, bib=%s", item.supplement_id, item.bib)
 
     def _on_passage_review_finished(self, dialog):
         if dialog is not self.passage_review_dialog:
@@ -5244,8 +5413,11 @@ class MainWindow(QMainWindow):
 
         MainWindow._stop_passage_receiver(self)
         self.video_timeline_store = None
+        self.video_supplement_store = None
         if hasattr(self, "passage_review_btn"):
             self.passage_review_btn.setEnabled(False)
+        if hasattr(self, "video_supplement_btn"):
+            self.video_supplement_btn.setEnabled(False)
 
         if self.ocr_manager is not None:
             try:
@@ -7132,6 +7304,12 @@ def main():
         'passage_receiver_enabled': True,
         'passage_receiver_host': DEFAULT_HOST,
         'passage_receiver_port': DEFAULT_PORT,
+        'timing_provider': 'cyclerace',
+        'racetiger_base_url': '',
+        'racetiger_pc': '',
+        'racetiger_rid': '',
+        'racetiger_token': '',
+        'racetiger_poll_interval_seconds': 2.0,
         'finish_line': {
             'x1': x1, 'y1': y1,
             'x2': x2, 'y2': y2,

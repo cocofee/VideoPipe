@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -193,9 +194,27 @@ def _event_date_from_payload(payload: Any) -> Optional[date]:
 
 def parse_beijing_timestamp(value: Any, event_date: Optional[date]) -> Optional[int]:
     """Parse RaceTiger PassTime into Beijing epoch milliseconds."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if math.isfinite(numeric):
+            if numeric >= 100_000_000_000:
+                return int(round(numeric))
+            if numeric >= 1_000_000_000:
+                return int(round(numeric * 1000.0))
     text = str(value or "").strip()
     if not text:
         return None
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric is not None and math.isfinite(numeric):
+        if numeric >= 100_000_000_000:
+            return int(round(numeric))
+        if numeric >= 1_000_000_000:
+            return int(round(numeric * 1000.0))
     iso_text = text.replace("/", "-").replace("Z", "+00:00")
     if "T" in iso_text or " " in iso_text:
         try:
@@ -623,13 +642,19 @@ class RaceTigerSource:
                 revision = current.revision + (
                     1 if current_values != next_values else 0
                 )
-            self._sequence += 1 if current is None else 0
+            if current is None:
+                self._sequence += 1
+                sequence = self._sequence
+            else:
+                # A revision updates the existing observation; its stable
+                # sequence must remain unchanged for downstream consumers.
+                sequence = current.sequence
             event = PassageEvent(
                 event_id=event_id,
                 race_id=self.race_id,
                 stage_id=self.stage_id,
                 group_id=normalized_group_id,
-                sequence=self._sequence,
+                sequence=sequence,
                 chip_id=chip_id,
                 bib=bib,
                 passage_time_ms=_milliseconds_since_midnight(pass_timestamp_ms),

@@ -12,6 +12,7 @@ from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton
 
 from realtime import passage_review
+from realtime import review_window as review_window_module
 from realtime.auyat_rgb import AuyatScanResult
 from realtime.passage_receiver import PassageEvent, PassageEventStore, RaceFocus
 from realtime.race_metadata import (
@@ -136,7 +137,6 @@ class _FakeRecorder:
         self.is_running = False
         self.stopped = True
 
-
 class _FakeReceiver:
     instances: ClassVar[list["_FakeReceiver"]] = []
 
@@ -180,6 +180,33 @@ class _FakeReceiver:
 
     def deliver_focus(self, focus):
         self.on_focus_accepted(focus)
+
+
+class _FakeRaceTigerSource:
+    instances: ClassVar[list["_FakeRaceTigerSource"]] = []
+
+    def __init__(self, client, store, *, race_id, stage_id, poll_interval_seconds,
+                 on_event, on_status):
+        self.client = client
+        self.store = store
+        self.race_id = race_id
+        self.stage_id = stage_id
+        self.poll_interval_seconds = poll_interval_seconds
+        self.on_event = on_event
+        self.on_status = on_status
+        self.is_running = False
+        self.stopped = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+        self.stopped = True
+
+    def deliver(self, event):
+        self.on_event(event)
 
 
 def _event(*, absolute=True, **overrides):
@@ -250,6 +277,83 @@ def test_runtime_status_reports_loaded_race_metadata(qapp, tmp_path):
         "CycleRace: 已同步 11 / 1，等待通过"
     )
     assert "已读取 1 个组别" in window.receiver_status_label.toolTip()
+    window.close()
+
+
+def test_racetiger_mode_uses_racetiger_source_and_journal(qapp, tmp_path, monkeypatch):
+    _FakeReceiver.instances.clear()
+    _FakeRaceTigerSource.instances.clear()
+    monkeypatch.setattr(review_window_module, "RaceTigerSource", _FakeRaceTigerSource)
+
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        timing_provider="racetiger",
+        racetiger_base_url="https://rqs.racetigertiming.com",
+        racetiger_pc="finish-pc",
+        racetiger_rid="RID-2026",
+        racetiger_token="local-test-token",
+        receiver_factory=_FakeReceiver,
+    )
+
+    assert window.passage_store.journal_path.name == "racetiger_passage_events.jsonl"
+    assert window.metadata_store is None
+    window.start_receiver()
+
+    assert not _FakeReceiver.instances
+    assert len(_FakeRaceTigerSource.instances) == 1
+    assert _FakeRaceTigerSource.instances[0].race_id == "RID-2026"
+    assert window.receiver_status_label.text() == "赛虎: 正在读取"
+
+    window.stop()
+    window.close()
+
+
+def test_stopped_racetiger_source_cannot_deliver_late_events(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    _FakeRaceTigerSource.instances.clear()
+    monkeypatch.setattr(review_window_module, "RaceTigerSource", _FakeRaceTigerSource)
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        timing_provider="racetiger",
+        racetiger_base_url="https://rqs.racetigertiming.com",
+        racetiger_pc="finish-pc",
+        racetiger_rid="RID-2026",
+        racetiger_token="local-test-token",
+    )
+    window.start_receiver()
+    source = _FakeRaceTigerSource.instances[0]
+    window.stop_receiver()
+
+    source.deliver(_event(race_id="RID-2026", event_id="late-event"))
+    qapp.processEvents()
+
+    assert not window._pending_passages
+    window.close()
+
+
+def test_racetiger_view_filters_events_from_another_rid(qapp, tmp_path):
+    window = FinishReviewWindow(
+        "rtsp://camera/live",
+        tmp_path,
+        timing_provider="racetiger",
+        racetiger_base_url="https://rqs.racetigertiming.com",
+        racetiger_pc="finish-pc",
+        racetiger_rid="RID-2026",
+        racetiger_token="local-test-token",
+    )
+
+    events = (
+        _event(event_id="old-rid", race_id="RID-OLD"),
+        _event(event_id="current-rid", race_id="RID-2026"),
+    )
+    assert [event.event_id for event in window._events_for_current_metadata(events)] == [
+        "current-rid"
+    ]
     window.close()
 
 
@@ -562,6 +666,31 @@ def test_device_settings_select_preinstalled_usb_camera_without_manual_ip(
     assert "DJI Osmo Action 5 Pro" in combo_text
     assert "dshow" not in visible_text.lower()
     assert dialog.settings.source == source
+    dialog.close()
+
+
+def test_device_settings_expose_racetiger_configuration(qapp, tmp_path):
+    dialog = FinishReviewLaunchDialog(
+        FinishReviewSettings(
+            source="rtsp://camera/live",
+            output_dir=tmp_path,
+            passage_host="127.0.0.1",
+            passage_port=18765,
+            camera_index=1,
+            timing_provider="racetiger",
+            racetiger_base_url="https://rqs.racetigertiming.com",
+            racetiger_pc="finish-pc",
+            racetiger_rid="RID-2026",
+            racetiger_token="local-test-token",
+        ),
+        device_provider=lambda: (),
+    )
+
+    assert dialog.timing_provider_combo.currentData() == "racetiger"
+    assert dialog.racetiger_base_url_edit.isEnabled()
+    assert dialog.racetiger_rid_edit.text() == "RID-2026"
+    assert dialog.settings.timing_provider == "racetiger"
+    assert dialog.settings.racetiger_token == "local-test-token"
     dialog.close()
 
 

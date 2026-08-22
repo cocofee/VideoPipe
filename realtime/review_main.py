@@ -111,6 +111,12 @@ def load_review_settings(
     saved_output_dir = None
     saved_camera_index = None
     saved_high_speed_dir = None
+    timing_provider = "cyclerace"
+    racetiger_base_url = ""
+    racetiger_pc = ""
+    racetiger_rid = ""
+    racetiger_token = ""
+    racetiger_poll_interval_seconds = 2.0
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
         candidate = str(payload.get("source") or "").strip()
@@ -125,6 +131,20 @@ def load_review_settings(
         high_speed_candidate = str(payload.get("high_speed_dir") or "").strip()
         if high_speed_candidate:
             saved_high_speed_dir = Path(high_speed_candidate).expanduser().absolute()
+        candidate_provider = str(payload.get("timing_provider") or "").strip().lower()
+        if candidate_provider in {"cyclerace", "racetiger"}:
+            timing_provider = candidate_provider
+        racetiger_base_url = str(payload.get("racetiger_base_url") or "").strip()
+        racetiger_pc = str(payload.get("racetiger_pc") or "").strip()
+        racetiger_rid = str(payload.get("racetiger_rid") or "").strip()
+        racetiger_token = str(payload.get("racetiger_token") or "")
+        try:
+            racetiger_poll_interval_seconds = max(
+                0.5,
+                float(payload.get("racetiger_poll_interval_seconds", 2.0)),
+            )
+        except (TypeError, ValueError):
+            racetiger_poll_interval_seconds = 2.0
     except (OSError, TypeError, ValueError):
         pass
     return FinishReviewSettings(
@@ -138,19 +158,31 @@ def load_review_settings(
             or saved_high_speed_dir
             or discover_auyat_root()
         ),
+        timing_provider=timing_provider,
+        racetiger_base_url=racetiger_base_url,
+        racetiger_pc=racetiger_pc,
+        racetiger_rid=racetiger_rid,
+        racetiger_token=racetiger_token,
+        racetiger_poll_interval_seconds=racetiger_poll_interval_seconds,
     )
 
 
 def save_review_settings(config_path: Path, settings: FinishReviewSettings) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_version": 4,
+        "schema_version": 5,
         "source": settings.source,
         "output_dir": str(settings.output_dir),
         "camera_index": settings.camera_index,
         "high_speed_dir": (
             str(settings.high_speed_dir) if settings.high_speed_dir is not None else ""
         ),
+        "timing_provider": settings.timing_provider,
+        "racetiger_base_url": settings.racetiger_base_url,
+        "racetiger_pc": settings.racetiger_pc,
+        "racetiger_rid": settings.racetiger_rid,
+        "racetiger_token": settings.racetiger_token,
+        "racetiger_poll_interval_seconds": settings.racetiger_poll_interval_seconds,
     }
     temporary_path = config_path.with_suffix(config_path.suffix + ".tmp")
     with temporary_path.open("wb") as output:
@@ -202,6 +234,12 @@ def main(argv: list[str] | None = None) -> int:
             passage_port=args.passage_port,
             camera_index=args.camera_index or saved_settings.camera_index,
             high_speed_dir=saved_settings.high_speed_dir,
+            timing_provider=saved_settings.timing_provider,
+            racetiger_base_url=saved_settings.racetiger_base_url,
+            racetiger_pc=saved_settings.racetiger_pc,
+            racetiger_rid=saved_settings.racetiger_rid,
+            racetiger_token=saved_settings.racetiger_token,
+            racetiger_poll_interval_seconds=saved_settings.racetiger_poll_interval_seconds,
         )
         try:
             save_review_settings(config_path, settings)
@@ -222,6 +260,12 @@ def main(argv: list[str] | None = None) -> int:
             else saved_settings.camera_index
         ),
         high_speed_dir=saved_settings.high_speed_dir,
+        timing_provider=saved_settings.timing_provider,
+        racetiger_base_url=saved_settings.racetiger_base_url,
+        racetiger_pc=saved_settings.racetiger_pc,
+        racetiger_rid=saved_settings.racetiger_rid,
+        racetiger_token=saved_settings.racetiger_token,
+        racetiger_poll_interval_seconds=saved_settings.racetiger_poll_interval_seconds,
     )
 
     window = FinishReviewWindow(
@@ -231,6 +275,12 @@ def main(argv: list[str] | None = None) -> int:
         passage_port=settings.passage_port,
         camera_index=settings.camera_index,
         high_speed_dir=settings.high_speed_dir,
+        timing_provider=settings.timing_provider,
+        racetiger_base_url=settings.racetiger_base_url,
+        racetiger_pc=settings.racetiger_pc,
+        racetiger_rid=settings.racetiger_rid,
+        racetiger_token=settings.racetiger_token,
+        racetiger_poll_interval_seconds=settings.racetiger_poll_interval_seconds,
         ffmpeg_path=Path(ffmpeg_path) if ffmpeg_path else None,
         settings_saver=lambda updated: save_review_settings(config_path, updated),
     )
@@ -239,7 +289,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - the console remains usable for setup.
         QMessageBox.warning(
             window,
-            "CycleRace监听未启动",
+            (
+                "赛虎读取未启动"
+                if settings.timing_provider == "racetiger"
+                else "CycleRace监听未启动"
+            ),
             sanitize_recording_message(exc),
         )
     if args.auto_record and is_supported_review_source(settings.source):

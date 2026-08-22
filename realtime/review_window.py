@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QShortcut,
     QStyle,
+    QDoubleSpinBox,
     QVBoxLayout,
 )
 
@@ -49,6 +50,7 @@ try:
         RaceFocus,
     )
     from .passage_review import PassageReviewDialog, source_location
+    from .racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
     from .race_metadata import RaceMetadata, RaceMetadataStore
     from .review_recorder import (
         ArchiveTimelinePublisher,
@@ -87,6 +89,7 @@ except ImportError:
         RaceFocus,
     )
     from passage_review import PassageReviewDialog, source_location
+    from racetiger_source import RaceTigerClient, RaceTigerSource, RaceTigerStatus
     from race_metadata import RaceMetadata, RaceMetadataStore
     from review_recorder import (
         ArchiveTimelinePublisher,
@@ -134,6 +137,12 @@ class FinishReviewSettings:
     passage_port: int
     camera_index: int
     high_speed_dir: Path | None = None
+    timing_provider: str = "cyclerace"
+    racetiger_base_url: str = ""
+    racetiger_pc: str = ""
+    racetiger_rid: str = ""
+    racetiger_token: str = ""
+    racetiger_poll_interval_seconds: float = 2.0
 
 
 class FinishReviewLaunchDialog(QDialog):
@@ -158,13 +167,27 @@ class FinishReviewLaunchDialog(QDialog):
             if settings.high_speed_dir is not None
             else None
         )
+        self._timing_provider = (
+            str(settings.timing_provider or "cyclerace").strip().lower()
+            if str(settings.timing_provider or "cyclerace").strip().lower()
+            in {"cyclerace", "racetiger"}
+            else "cyclerace"
+        )
+        self._racetiger_base_url = str(settings.racetiger_base_url or "").strip()
+        self._racetiger_pc = str(settings.racetiger_pc or "").strip()
+        self._racetiger_rid = str(settings.racetiger_rid or "").strip()
+        self._racetiger_token = str(settings.racetiger_token or "").strip()
+        self._racetiger_poll_interval = max(
+            0.5,
+            float(settings.racetiger_poll_interval_seconds or 2.0),
+        )
         self._ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path else None
         self._detected_device_names: set[str] = set()
         self._device_provider = device_provider or (
             lambda: discover_directshow_video_devices(self._ffmpeg_path)
         )
         self.setWindowTitle("设备与赛事设置")
-        self.setMinimumWidth(680)
+        self.setMinimumWidth(760)
         self.setModal(True)
         self.setStyleSheet(
             "QDialog { background: #eef2f5; color: #17212b; }"
@@ -183,6 +206,53 @@ class FinishReviewLaunchDialog(QDialog):
         form = QFormLayout()
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(12)
+        self.timing_provider_combo = QComboBox(self)
+        self.timing_provider_combo.addItem("CycleRace", "cyclerace")
+        self.timing_provider_combo.addItem("赛虎计时", "racetiger")
+        self.timing_provider_combo.setCurrentIndex(
+            max(0, self.timing_provider_combo.findData(self._timing_provider))
+        )
+        self.timing_provider_combo.currentIndexChanged.connect(
+            self._refresh_timing_provider_fields
+        )
+        form.addRow("计时源", self.timing_provider_combo)
+
+        self.racetiger_base_url_edit = QLineEdit(self._racetiger_base_url, self)
+        self.racetiger_base_url_edit.setPlaceholderText(
+            "https://rqs.racetigertiming.com"
+        )
+        form.addRow("赛虎接口地址", self.racetiger_base_url_edit)
+
+        self.racetiger_pc_edit = QLineEdit(self._racetiger_pc, self)
+        self.racetiger_pc_edit.setPlaceholderText("赛事电脑标识 pc")
+        form.addRow("赛虎 PC", self.racetiger_pc_edit)
+
+        self.racetiger_rid_edit = QLineEdit(self._racetiger_rid, self)
+        self.racetiger_rid_edit.setPlaceholderText("赛事 RID")
+        form.addRow("赛虎赛事 RID", self.racetiger_rid_edit)
+
+        self.racetiger_token_edit = QLineEdit(self._racetiger_token, self)
+        self.racetiger_token_edit.setEchoMode(QLineEdit.Password)
+        self.racetiger_token_edit.setPlaceholderText("本机保存，不显示明文")
+        form.addRow("赛虎令牌", self.racetiger_token_edit)
+
+        self.racetiger_poll_interval_spin = QDoubleSpinBox(self)
+        self.racetiger_poll_interval_spin.setRange(0.5, 60.0)
+        self.racetiger_poll_interval_spin.setSingleStep(0.5)
+        self.racetiger_poll_interval_spin.setDecimals(1)
+        self.racetiger_poll_interval_spin.setSuffix(" 秒")
+        self.racetiger_poll_interval_spin.setValue(self._racetiger_poll_interval)
+        form.addRow("赛虎读取间隔", self.racetiger_poll_interval_spin)
+
+        racetiger_hint = QLabel(
+            "选择赛虎后，终点列表只读取赛虎 FINISH 记录；视频仍只用于人工复核，"
+            "不会回写赛虎或 CycleRace 正式成绩。",
+            self,
+        )
+        racetiger_hint.setWordWrap(True)
+        racetiger_hint.setStyleSheet("color: #667085;")
+        form.addRow("", racetiger_hint)
+
         device_row = QHBoxLayout()
         device_row.setSpacing(6)
         self.device_combo = QComboBox(self)
@@ -271,7 +341,19 @@ class FinishReviewLaunchDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._refresh_timing_provider_fields()
         self._refresh_devices()
+
+    def _refresh_timing_provider_fields(self) -> None:
+        enabled = self.timing_provider_combo.currentData() == "racetiger"
+        for control in (
+            self.racetiger_base_url_edit,
+            self.racetiger_pc_edit,
+            self.racetiger_rid_edit,
+            self.racetiger_token_edit,
+            self.racetiger_poll_interval_spin,
+        ):
+            control.setEnabled(enabled)
 
     def _refresh_devices(self) -> None:
         current_source = self._source
@@ -357,6 +439,7 @@ class FinishReviewLaunchDialog(QDialog):
                 framerate=self.framerate_combo.currentData(),
             )
         high_speed_value = self.high_speed_edit.text().strip()
+        timing_provider = str(self.timing_provider_combo.currentData() or "cyclerace")
         return FinishReviewSettings(
             source=source,
             output_dir=self._output_dir,
@@ -368,6 +451,14 @@ class FinishReviewLaunchDialog(QDialog):
                 if high_speed_value
                 else None
             ),
+            timing_provider=timing_provider,
+            racetiger_base_url=self.racetiger_base_url_edit.text().strip(),
+            racetiger_pc=self.racetiger_pc_edit.text().strip(),
+            racetiger_rid=self.racetiger_rid_edit.text().strip(),
+            racetiger_token=self.racetiger_token_edit.text(),
+            racetiger_poll_interval_seconds=(
+                self.racetiger_poll_interval_spin.value()
+            ),
         )
 
 
@@ -375,6 +466,7 @@ class _PassageSignalBridge(QObject):
     accepted = pyqtSignal(object)
     metadata_accepted = pyqtSignal(object)
     focus_accepted = pyqtSignal(object)
+    timing_status = pyqtSignal(object)
 
 
 class FinishReviewWindow(PassageReviewDialog):
@@ -390,6 +482,12 @@ class FinishReviewWindow(PassageReviewDialog):
         passage_port: int = DEFAULT_PORT,
         camera_index: int = 1,
         high_speed_dir: str | Path | None = None,
+        timing_provider: str = "cyclerace",
+        racetiger_base_url: str = "",
+        racetiger_pc: str = "",
+        racetiger_rid: str = "",
+        racetiger_token: str = "",
+        racetiger_poll_interval_seconds: float = 2.0,
         ffmpeg_path: Path | None = None,
         review_retention_seconds: int = 90,
         timing_error_ms: int = DEFAULT_TIMING_ERROR_MS,
@@ -410,6 +508,20 @@ class FinishReviewWindow(PassageReviewDialog):
             if high_speed_dir is not None and str(high_speed_dir).strip()
             else None
         )
+        self.timing_provider = (
+            str(timing_provider or "cyclerace").strip().lower()
+            if str(timing_provider or "cyclerace").strip().lower()
+            in {"cyclerace", "racetiger"}
+            else "cyclerace"
+        )
+        self.racetiger_base_url = str(racetiger_base_url or "").strip()
+        self.racetiger_pc = str(racetiger_pc or "").strip()
+        self.racetiger_rid = str(racetiger_rid or "").strip()
+        self.racetiger_token = str(racetiger_token or "").strip()
+        self.racetiger_poll_interval_seconds = max(
+            0.5,
+            float(racetiger_poll_interval_seconds or 2.0),
+        )
         self.ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path else None
         self.review_retention_seconds = max(6, int(review_retention_seconds))
         self.timing_error_ms = max(0, int(timing_error_ms))
@@ -418,10 +530,17 @@ class FinishReviewWindow(PassageReviewDialog):
         self._settings_saver = settings_saver
 
         passage_store = PassageEventStore(
-            self.output_dir / "cyclerace_passage_events.jsonl"
+            self.output_dir
+            / (
+                "racetiger_passage_events.jsonl"
+                if self.timing_provider == "racetiger"
+                else "cyclerace_passage_events.jsonl"
+            )
         )
-        metadata_store = RaceMetadataStore(
-            self.output_dir / "cyclerace_race_metadata.json"
+        metadata_store = (
+            None
+            if self.timing_provider == "racetiger"
+            else RaceMetadataStore(self.output_dir / "cyclerace_race_metadata.json")
         )
         timeline_store = VideoTimelineStore(self.output_dir / "video_timeline.jsonl")
         self._high_speed_catalog = AuyatRgbCatalog(
@@ -442,6 +561,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self.setMinimumSize(1180, 760)
         self._recorder: FfmpegReviewRecorder | None = None
         self._receiver: PassageEventReceiver | None = None
+        self._racetiger_source: RaceTigerSource | None = None
         self._ring_buffer: ReviewRingBuffer | None = None
         self._coordinator: PassageReviewCoordinator | None = None
         self._publisher: PassageReviewTimelinePublisher | None = None
@@ -455,6 +575,8 @@ class FinishReviewWindow(PassageReviewDialog):
         self._runtime_error = ""
         self._capture_error = ""
         self._receiver_error = ""
+        self._racetiger_status: RaceTigerStatus | None = None
+        self._racetiger_generation = 0
         self._started = False
         self._last_cleanup_at = 0.0
         self._recording_started_at = 0.0
@@ -468,6 +590,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._signal_bridge.accepted.connect(self._on_passage_received)
         self._signal_bridge.metadata_accepted.connect(self._on_metadata_received)
         self._signal_bridge.focus_accepted.connect(self._on_focus_received)
+        self._signal_bridge.timing_status.connect(self._on_racetiger_status)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(max(100, int(refresh_interval_ms)))
         self._refresh_timer.timeout.connect(self._refresh_capture_windows)
@@ -678,6 +801,12 @@ class FinishReviewWindow(PassageReviewDialog):
                 passage_port=self.passage_port,
                 camera_index=self.camera_index,
                 high_speed_dir=self.high_speed_dir,
+                timing_provider=self.timing_provider,
+                racetiger_base_url=self.racetiger_base_url,
+                racetiger_pc=self.racetiger_pc,
+                racetiger_rid=self.racetiger_rid,
+                racetiger_token=self.racetiger_token,
+                racetiger_poll_interval_seconds=self.racetiger_poll_interval_seconds,
             ),
             self,
             ffmpeg_path=self.ffmpeg_path,
@@ -689,7 +818,29 @@ class FinishReviewWindow(PassageReviewDialog):
     def _apply_settings(self, settings: FinishReviewSettings) -> None:
         output_dir = Path(settings.output_dir).expanduser().resolve()
         output_changed = output_dir != self.output_dir
-        if output_changed:
+        next_timing_provider = str(settings.timing_provider or "cyclerace").strip().lower()
+        if next_timing_provider not in {"cyclerace", "racetiger"}:
+            next_timing_provider = "cyclerace"
+        timing_changed = next_timing_provider != self.timing_provider
+        next_racetiger_values = (
+            str(settings.racetiger_base_url or "").strip(),
+            str(settings.racetiger_pc or "").strip(),
+            str(settings.racetiger_rid or "").strip(),
+            str(settings.racetiger_token or ""),
+            max(0.5, float(settings.racetiger_poll_interval_seconds or 2.0)),
+        )
+        racetiger_changed = next_racetiger_values != (
+            self.racetiger_base_url,
+            self.racetiger_pc,
+            self.racetiger_rid,
+            self.racetiger_token,
+            self.racetiger_poll_interval_seconds,
+        )
+        data_source_changed = output_changed or timing_changed
+        receiver_restart_needed = data_source_changed or (
+            self.timing_provider == "racetiger" and racetiger_changed
+        )
+        if receiver_restart_needed:
             self.stop_receiver()
             self._passage_batch_timer.stop()
             self._pending_passages.clear()
@@ -697,6 +848,14 @@ class FinishReviewWindow(PassageReviewDialog):
         self.passage_host = str(settings.passage_host).strip()
         self.passage_port = int(settings.passage_port)
         self.camera_index = max(1, int(settings.camera_index))
+        self.timing_provider = next_timing_provider
+        (
+            self.racetiger_base_url,
+            self.racetiger_pc,
+            self.racetiger_rid,
+            self.racetiger_token,
+            self.racetiger_poll_interval_seconds,
+        ) = next_racetiger_values
         next_high_speed_dir = (
             Path(settings.high_speed_dir).expanduser().absolute()
             if settings.high_speed_dir is not None
@@ -707,14 +866,21 @@ class FinishReviewWindow(PassageReviewDialog):
         if high_speed_changed:
             self.high_speed_dir = next_high_speed_dir
             self._high_speed_catalog.set_root(next_high_speed_dir)
-        if output_changed:
+        if data_source_changed:
             output_dir.mkdir(parents=True, exist_ok=True)
             self.output_dir = output_dir
             self.passage_store = PassageEventStore(
-                output_dir / "cyclerace_passage_events.jsonl"
+                output_dir
+                / (
+                    "racetiger_passage_events.jsonl"
+                    if self.timing_provider == "racetiger"
+                    else "cyclerace_passage_events.jsonl"
+                )
             )
-            self.metadata_store = RaceMetadataStore(
-                output_dir / "cyclerace_race_metadata.json"
+            self.metadata_store = (
+                None
+                if self.timing_provider == "racetiger"
+                else RaceMetadataStore(output_dir / "cyclerace_race_metadata.json")
             )
             self.timeline_store = VideoTimelineStore(
                 output_dir / "video_timeline.jsonl"
@@ -742,7 +908,11 @@ class FinishReviewWindow(PassageReviewDialog):
                 self._runtime_error = sanitize_recording_message(exc)
                 QMessageBox.warning(
                     self,
-                    "CycleRace监听未启动",
+                    (
+                        "赛虎读取未启动"
+                        if self.timing_provider == "racetiger"
+                        else "CycleRace监听未启动"
+                    ),
                     self._runtime_error,
                 )
             self._high_speed_catalog.set_cache_path(
@@ -751,9 +921,19 @@ class FinishReviewWindow(PassageReviewDialog):
             self._high_speed_catalog.set_target_dates(
                 _high_speed_target_dates(self.passage_store.events())
             )
-        if high_speed_changed or output_changed:
+        if high_speed_changed or data_source_changed:
             self.invalidate_external_locations()
             self._request_high_speed_scan()
+        if receiver_restart_needed and not data_source_changed:
+            try:
+                self.start_receiver()
+            except Exception as exc:  # noqa: BLE001 - settings remain applied.
+                self._runtime_error = sanitize_recording_message(exc)
+                QMessageBox.warning(
+                    self,
+                    "Timing source not started",
+                    self._runtime_error,
+                )
         if self._settings_saver is not None:
             try:
                 self._settings_saver(settings)
@@ -888,6 +1068,24 @@ class FinishReviewWindow(PassageReviewDialog):
         self._update_operator_controls()
 
     def start_receiver(self) -> None:
+        if self.timing_provider == "racetiger":
+            if self._receiver is not None:
+                self.stop_receiver()
+            if self._racetiger_source is not None and self._racetiger_source.is_running:
+                return
+            try:
+                self._start_racetiger_source()
+            except Exception as exc:
+                self._receiver_error = sanitize_recording_message(exc)
+                self._racetiger_status = RaceTigerStatus(
+                    "error",
+                    f"RaceTiger: {self._receiver_error}",
+                )
+                self._update_runtime_status()
+                raise
+            return
+        if self._racetiger_source is not None:
+            self.stop_receiver()
         if self._receiver is not None and self._receiver.is_running:
             return
         receiver_kwargs = {
@@ -936,7 +1134,76 @@ class FinishReviewWindow(PassageReviewDialog):
         self._refresh_timer.start()
         self._update_runtime_status()
 
+    def _start_racetiger_source(self) -> None:
+        missing = [
+            label
+            for label, value in (
+                ("接口地址", self.racetiger_base_url),
+                ("PC", self.racetiger_pc),
+                ("RID", self.racetiger_rid),
+                ("令牌", self.racetiger_token),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError("赛虎配置不完整，请填写：" + "、".join(missing))
+        client = RaceTigerClient(
+            self.racetiger_base_url,
+            self.racetiger_token,
+            pc=self.racetiger_pc,
+            rid=self.racetiger_rid,
+        )
+        generation = self._racetiger_generation
+
+        def emit_event(event: PassageEvent) -> None:
+            if generation == self._racetiger_generation:
+                self._signal_bridge.accepted.emit(event)
+
+        def emit_status(status: RaceTigerStatus) -> None:
+            if generation == self._racetiger_generation:
+                self._signal_bridge.timing_status.emit(status)
+
+        source = RaceTigerSource(
+            client,
+            self.passage_store,
+            race_id=self.racetiger_rid,
+            stage_id="finish",
+            poll_interval_seconds=self.racetiger_poll_interval_seconds,
+            on_event=emit_event,
+            on_status=emit_status,
+        )
+        try:
+            source.start()
+        except Exception:
+            try:
+                source.stop()
+            except Exception:  # noqa: BLE001 - startup rollback is best effort.
+                logger.exception("Failed to stop RaceTiger source after startup error")
+            raise
+        self._racetiger_source = source
+        self._receiver_error = ""
+        self._racetiger_status = RaceTigerStatus(
+            "starting",
+            "RaceTiger: polling started",
+        )
+        self._refresh_timer.start()
+        self._update_runtime_status()
+
     def _recheck_connections(self) -> None:
+        if self.timing_provider == "racetiger":
+            source = self._racetiger_source
+            if source is None or not source.is_running:
+                try:
+                    self.start_receiver()
+                except Exception as exc:  # noqa: BLE001 - retry remains operator-visible.
+                    QMessageBox.warning(
+                        self,
+                        "赛虎读取未启动",
+                        sanitize_recording_message(exc),
+                    )
+            self._high_speed_scan_worker.request_scan()
+            self._update_runtime_status()
+            return
         receiver = self._receiver
         if receiver is None or not receiver.is_running:
             try:
@@ -1098,9 +1365,13 @@ class FinishReviewWindow(PassageReviewDialog):
         if not pending_events:
             self._update_runtime_status()
             return
-        metadata = self.metadata_store.current()
+        metadata = (
+            self.metadata_store.current() if self.metadata_store is not None else None
+        )
 
         def belongs_to_current_context(event: PassageEvent) -> bool:
+            if metadata is None and self.timing_provider == "racetiger":
+                return not self.racetiger_rid or event.race_id == self.racetiger_rid
             return metadata is None or (
                 event.race_id == metadata.race_id
                 and event.stage_id == metadata.stage_id
@@ -1158,6 +1429,14 @@ class FinishReviewWindow(PassageReviewDialog):
         self._apply_pending_focus()
         self._update_runtime_status()
 
+    def _on_racetiger_status(self, status: RaceTigerStatus) -> None:
+        self._racetiger_status = status
+        if status.state == "error":
+            self._receiver_error = status.message
+        elif status.state == "ok":
+            self._receiver_error = ""
+        self._update_runtime_status()
+
     def _on_focus_received(self, focus: RaceFocus) -> None:
         self._pending_focus = focus
         self._apply_pending_focus()
@@ -1178,10 +1457,23 @@ class FinishReviewWindow(PassageReviewDialog):
         return applied
 
     def _current_archive_race_id(self) -> str:
-        metadata = self.metadata_store.current()
+        metadata = (
+            self.metadata_store.current() if self.metadata_store is not None else None
+        )
         if metadata is not None:
             return metadata.race_id
         return race_id_from_passage_store(self.passage_store)
+
+    def _events_for_current_metadata(
+        self,
+        events: tuple[PassageEvent, ...],
+    ) -> tuple[PassageEvent, ...]:
+        filtered = super()._events_for_current_metadata(events)
+        if self.timing_provider == "racetiger" and self.racetiger_rid:
+            filtered = tuple(
+                event for event in filtered if event.race_id == self.racetiger_rid
+            )
+        return filtered
 
     def _refresh_capture_windows(self) -> None:
         coordinator = self._coordinator
@@ -1316,7 +1608,11 @@ class FinishReviewWindow(PassageReviewDialog):
 
         receiver = self._receiver
         if receiver is not None and receiver.is_running:
-            metadata = self.metadata_store.current()
+            metadata = (
+                self.metadata_store.current()
+                if self.metadata_store is not None
+                else None
+            )
             pending_count = len(self._pending_passages)
             if pending_count:
                 self.receiver_status_label.setText(
@@ -1369,6 +1665,51 @@ class FinishReviewWindow(PassageReviewDialog):
             self.receiver_status_label.setToolTip(
                 self._receiver_error or "CycleRace接收服务未启动"
             )
+
+        if self.timing_provider == "racetiger":
+            source = self._racetiger_source
+            status = self._racetiger_status
+            if source is not None and source.is_running:
+                pending_count = len(self._pending_passages)
+                if status is not None and status.state == "error":
+                    self.receiver_status_label.setText("赛虎: API 错误")
+                    self.receiver_status_label.setStyleSheet("color: #b54747;")
+                    self.receiver_status_label.setToolTip(status.message)
+                elif pending_count:
+                    self.receiver_status_label.setText(
+                        "赛虎: 正在处理，"
+                        f"已读取 {self._received_passage_count}，待处理 {pending_count}"
+                    )
+                    self.receiver_status_label.setStyleSheet("color: #a56300;")
+                    self.receiver_status_label.setToolTip(
+                        "赛虎终点记录已写入本地只读日志，正在准备视频定位"
+                    )
+                elif status is not None and status.state == "ok":
+                    self.receiver_status_label.setText(f"赛虎: 已读取 {status.count} 条")
+                    self.receiver_status_label.setStyleSheet("color: #247a52;")
+                    self.receiver_status_label.setToolTip(status.message)
+                else:
+                    self.receiver_status_label.setText("赛虎: 正在读取")
+                    self.receiver_status_label.setStyleSheet("color: #a56300;")
+                    self.receiver_status_label.setToolTip("正在轮询赛虎 FINISH 记录")
+            else:
+                configured = all(
+                    (
+                        self.racetiger_base_url,
+                        self.racetiger_pc,
+                        self.racetiger_rid,
+                        self.racetiger_token,
+                    )
+                )
+                self.receiver_status_label.setText(
+                    "赛虎: 异常"
+                    if self._receiver_error
+                    else ("赛虎: 未启动" if configured else "赛虎: 未配置")
+                )
+                self.receiver_status_label.setStyleSheet("color: #b54747;")
+                self.receiver_status_label.setToolTip(
+                    self._receiver_error or "请在设备与赛事设置中填写赛虎接口参数"
+                )
 
         high_speed_result = self._high_speed_scan_result
         high_speed_root = self._high_speed_catalog.root
@@ -1488,6 +1829,7 @@ class FinishReviewWindow(PassageReviewDialog):
         self._update_runtime_status()
 
     def stop_receiver(self) -> None:
+        self._racetiger_generation += 1
         receiver = self._receiver
         self._receiver = None
         if receiver is not None:
@@ -1495,6 +1837,13 @@ class FinishReviewWindow(PassageReviewDialog):
                 receiver.stop()
             except Exception as exc:  # noqa: BLE001 - receiver factories may vary.
                 logger.warning("Failed to stop CycleRace receiver: %s", exc)
+        racetiger_source = self._racetiger_source
+        self._racetiger_source = None
+        if racetiger_source is not None:
+            try:
+                racetiger_source.stop()
+            except Exception as exc:  # noqa: BLE001 - shutdown is best effort.
+                logger.warning("Failed to stop RaceTiger source: %s", exc)
         self._update_runtime_status()
 
     def stop(self) -> bool:

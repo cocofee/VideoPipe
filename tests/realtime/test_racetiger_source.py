@@ -32,6 +32,8 @@ def test_parse_beijing_timestamp():
     value = parse_beijing_timestamp("10:00:01.250", __import__("datetime").date(2026, 8, 22))
     assert value == 1_787_364_001_250
     assert parse_beijing_timestamp("2026-08-22T10:00:01.250", None) == value
+    assert parse_beijing_timestamp(1_787_364_001.25, None) == value
+    assert parse_beijing_timestamp("1787364001250", None) == value
 
 
 def test_poll_once_keeps_finish_time_order_and_deduplicates(tmp_path):
@@ -185,6 +187,7 @@ def test_poll_once_increments_revision_when_identity_details_change(tmp_path):
 
     assert first[0].revision == 1
     assert second[0].revision == 2
+    assert second[0].sequence == first[0].sequence
     assert second[0].athlete_name == "After"
     assert second[0].team_name == "Team B"
 

@@ -70,7 +70,7 @@ def test_review_settings_round_trip_installed_usb_source(tmp_path):
     )
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 4
+    assert payload["schema_version"] == 5
     assert payload["high_speed_dir"] == str(settings.high_speed_dir)
     assert payload["output_dir"] == str(settings.output_dir)
     assert payload["camera_index"] == 1
@@ -80,6 +80,39 @@ def test_review_settings_round_trip_installed_usb_source(tmp_path):
     assert loaded.passage_port == 20000
     assert loaded.camera_index == 2
     assert loaded.high_speed_dir == settings.high_speed_dir
+
+
+def test_review_settings_round_trip_racetiger_configuration(tmp_path):
+    config_path = tmp_path / "finish_review_config.json"
+    settings = FinishReviewSettings(
+        source="rtsp://camera/live",
+        output_dir=tmp_path / "race",
+        passage_host="127.0.0.1",
+        passage_port=18765,
+        camera_index=1,
+        timing_provider="racetiger",
+        racetiger_base_url="https://rqs.racetigertiming.com",
+        racetiger_pc="finish-pc",
+        racetiger_rid="RID-2026",
+        racetiger_token="local-test-token",
+        racetiger_poll_interval_seconds=3.5,
+    )
+
+    save_review_settings(config_path, settings)
+    loaded = load_review_settings(
+        config_path,
+        output_dir=None,
+        passage_host="0.0.0.0",
+        passage_port=20000,
+        camera_index=2,
+    )
+
+    assert loaded.timing_provider == "racetiger"
+    assert loaded.racetiger_base_url == settings.racetiger_base_url
+    assert loaded.racetiger_pc == settings.racetiger_pc
+    assert loaded.racetiger_rid == settings.racetiger_rid
+    assert loaded.racetiger_token == settings.racetiger_token
+    assert loaded.racetiger_poll_interval_seconds == 3.5
 
 
 def test_review_settings_keep_legacy_rtsp_configuration(tmp_path):

@@ -290,6 +290,21 @@ class EvidenceImageView(QGraphicsView):
         self._mouse_press_position: Optional[QPoint] = None
         self._mouse_dragged = False
         self._marker_dragging = False
+        self._identity_badge = QLabel(self.viewport())
+        self._identity_badge.setObjectName("evidenceIdentityBadge")
+        self._identity_badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._identity_badge.setStyleSheet(
+            "QLabel#evidenceIdentityBadge {"
+            " background: rgba(15, 23, 32, 225);"
+            " color: #ffffff;"
+            " border: 2px solid #ffb020;"
+            " border-radius: 3px;"
+            " padding: 7px 13px;"
+            " font-size: 24px;"
+            " font-weight: 700;"
+            "}"
+        )
+        self._identity_badge.hide()
         self.setFocusPolicy(Qt.StrongFocus)
 
     @property
@@ -343,8 +358,37 @@ class EvidenceImageView(QGraphicsView):
         self._message_item.setPlainText(str(message or ""))
         self._message_item.show()
         self._position_message()
+        self.clear_identity_cue()
         self.zoom_changed.emit(100)
         self.viewport().update()
+
+    def set_identity_cue(self, identity: str, status: str) -> None:
+        identity = str(identity).strip()
+        if not identity or not self.has_frame:
+            self.clear_identity_cue()
+            return
+        status = str(status).strip()
+        self._identity_badge.setText(f"{status}  {identity}" if status else identity)
+        border_color = "#1bbf83" if status == "已确认" else "#ffb020"
+        self._identity_badge.setStyleSheet(
+            "QLabel#evidenceIdentityBadge {"
+            " background: rgba(15, 23, 32, 225);"
+            " color: #ffffff;"
+            f" border: 2px solid {border_color};"
+            " border-radius: 3px;"
+            " padding: 7px 13px;"
+            " font-size: 24px;"
+            " font-weight: 700;"
+            "}"
+        )
+        self._identity_badge.adjustSize()
+        self._position_identity_badge()
+        self._identity_badge.show()
+        self._identity_badge.raise_()
+
+    def clear_identity_cue(self) -> None:
+        self._identity_badge.clear()
+        self._identity_badge.hide()
 
     def set_marker_mode(self, enabled: bool) -> None:
         self._marker_mode = bool(enabled) and self.has_frame
@@ -566,6 +610,7 @@ class EvidenceImageView(QGraphicsView):
         if self._fit_mode and self.has_frame:
             self.fit_to_window()
         self._position_message()
+        self._position_identity_badge()
 
     def _position_message(self) -> None:
         rect = self._message_item.boundingRect()
@@ -574,6 +619,9 @@ class EvidenceImageView(QGraphicsView):
             scene_rect.center().x() - rect.width() / 2.0,
             scene_rect.center().y() - rect.height() / 2.0,
         )
+
+    def _position_identity_badge(self) -> None:
+        self._identity_badge.move(12, 12)
 
 
 class PassageEvidencePane(QFrame):
@@ -808,6 +856,13 @@ class PassageEvidencePane(QFrame):
 
     def _render_marker(self) -> None:
         marker = self._pending_marker
+        if marker is not None:
+            cue_status = "待确认"
+        elif self._association is not None:
+            cue_status = "已确认"
+        else:
+            cue_status = "待判读"
+        self.video_view.set_identity_cue(self._identity, cue_status)
         if marker is not None:
             self.video_view.set_marker(
                 marker[0],

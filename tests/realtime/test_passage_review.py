@@ -857,12 +857,16 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
     qapp.processEvents()
 
     regular_view = dialog.regular_pane.video_view
+    assert regular_view._identity_badge.isVisible()
+    assert regular_view._identity_badge.text() == "待判读  15"
+    assert regular_view._marker is None
     QTest.mouseClick(
         regular_view.viewport(),
         Qt.LeftButton,
         pos=regular_view.viewport().rect().center(),
     )
     assert dialog.regular_pane.has_pending_marker
+    assert regular_view._identity_badge.text() == "待确认  15"
     pending_marker = regular_view._marker
     assert pending_marker is not None
     assert pending_marker[2:] == ("15", False)
@@ -876,6 +880,7 @@ def test_manual_marker_uses_enter_while_space_keeps_linked_playback(
     assert regular_association.position_ms == 10_050
     assert regular_association.marker_x_normalized == pytest.approx(pending_marker[0])
     assert regular_association.marker_y_normalized == pytest.approx(pending_marker[1])
+    assert regular_view._identity_badge.text() == "已确认  15"
     assert dialog.table.item(0, 6).text() == "已确认"
     assert dialog.table.item(0, 8).text() == "录像确认"
 

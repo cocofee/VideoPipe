@@ -1,0 +1,15 @@
+{
+  "video_path": "provide-path-to-original-recording.mkv",
+  "start_ms": 48000,
+  "end_ms": 53000,
+  "group_start_ms": 50000,
+  "group_end_ms": 51500,
+  "allowed_classes": [
+    1
+  ],
+  "anchor": "center",
+  "side_observations": 1,
+  "model": "yolo26n.pt",
+  "visible_lower_bound": 6,
+  "annotation": "At least six distinct riders visibly cross during the dense group in independent_sprint_contact.jpg. Full rider-by-rider ground truth is not yet frozen. This lower bound only proves failure; it cannot prove acceptance."
+}

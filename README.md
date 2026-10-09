@@ -205,6 +205,11 @@ int main() {
 A total of over 40 prototype examples are available. [Click here](./SAMPLES.md) to view more.
 
 ## Read More
+
+### Independent camera crossing counts
+
+The Python prototype produces observed crossing events without waiting for OCR, reconciles chip revisions by group, and replays anomaly windows asynchronously. See the [setup and limitations](docs/INDEPENDENT_COUNTING.md) and [validation record](validation/README.md). Dense sprint accuracy has not passed field acceptance.
+
 - [Sample Code](./samples)
 - [Node Table](./nodes/README.md)
 - [How VideoPipe Works](./doc/about.md)

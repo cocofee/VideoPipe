@@ -1,0 +1,15 @@
+{
+  "video_path": "provide-path-to-original-recording.mkv",
+  "start_ms": 48000,
+  "end_ms": 49300,
+  "group_start_ms": 48600,
+  "group_end_ms": 48950,
+  "allowed_classes": [
+    1
+  ],
+  "anchor": "center",
+  "side_observations": 1,
+  "model": "yolo26n.pt",
+  "expected_count": 3,
+  "annotation": "Three visually distinct riders traced across the line in independent_sprint_clear_contact.jpg; expected total frozen before inference."
+}

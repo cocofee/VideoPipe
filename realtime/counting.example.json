@@ -1,0 +1,46 @@
+{
+  "source": 0,
+  "model_path": "../yolo26n.pt",
+  "chip_journal": "../../FinishReview/output/cyclerace_passage_events.jsonl",
+  "output_dir": "../output/independent_counting_example",
+  "imgsz": 640,
+  "replay_imgsz": 1280,
+  "confidence": 0.06,
+  "buffer_bytes": 1610612736,
+  "buffer_retention_ms": 15000,
+  "replay_timeout_seconds": 20,
+  "rules": {
+    "session_id": "configure-session-id",
+    "race_id": "configure-race-id",
+    "stage_id": "configure-stage-id",
+    "timing_position": "finish",
+    "source_id": "camera-1",
+    "version": "1",
+    "line": [[995, 0], [995, 1080]],
+    "direction": "pos_to_neg",
+    "allowed_classes": [1],
+    "roi": [],
+    "anchor": "center",
+    "side_observations": 1,
+    "deadband_px": 3,
+    "max_gap_ms": 400,
+    "max_frame_gap": 5,
+    "track_timeout_ms": 2000,
+    "duplicate_identity_ms": 500
+  },
+  "reconciliation": {
+    "chip_source": "cyclerace",
+    "group_gap_ms": 1000,
+    "max_group_ms": 10000,
+    "context_ms": 700,
+    "late_budget_ms": 2000
+  },
+  "clock": {
+    "offset_ms": 0,
+    "anchor_ms": 0,
+    "drift_ppm": 0,
+    "error_ms": 0,
+    "version": "uncalibrated-example",
+    "calibrated": false
+  }
+}

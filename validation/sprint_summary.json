@@ -1,0 +1,35 @@
+{
+  "clear_group": {
+    "imgsz": 1280,
+    "frames": 33,
+    "elapsed_seconds": 2.687000000005355,
+    "video_count": 3,
+    "pending_count": 0,
+    "quality_reasons": {
+      "overlapping_detections": 4,
+      "untracked_detection": 1
+    },
+    "expected_count": 3,
+    "visible_lower_bound": null,
+    "meets_visible_lower_bound": null,
+    "passed": true,
+    "tracker_config": "# Independent count tracking uses the existing ByteTrack implementation.\n# Low-confidence rider boxes must remain associable in a dense sprint.\ntracker_type: bytetrack\ntrack_high_thresh: 0.16\ntrack_low_thresh: 0.06\nnew_track_thresh: 0.16\ntrack_buffer: 30\nmatch_thresh: 0.7\nfuse_score: False\n"
+  },
+  "dense_group": {
+    "imgsz": 1280,
+    "frames": 126,
+    "elapsed_seconds": 3.5310000000026776,
+    "video_count": 3,
+    "pending_count": 0,
+    "quality_reasons": {
+      "overlapping_detections": 22,
+      "untracked_detection": 10,
+      "first_observed_after_line": 5
+    },
+    "expected_count": null,
+    "visible_lower_bound": 6,
+    "meets_visible_lower_bound": false,
+    "passed": false,
+    "tracker_config": "# Independent count tracking uses the existing ByteTrack implementation.\n# Low-confidence rider boxes must remain associable in a dense sprint.\ntracker_type: bytetrack\ntrack_high_thresh: 0.16\ntrack_low_thresh: 0.06\nnew_track_thresh: 0.16\ntrack_buffer: 30\nmatch_thresh: 0.7\nfuse_score: False\n"
+  }
+}
